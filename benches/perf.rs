@@ -1,9 +1,9 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use disk_lens::scanner::{
+use disk_map::scanner::{
     CacheMode, DiscoveredNode, PerfStats, ProgressSnapshot, ScanBatch, ScanOptions,
 };
-use disk_lens::tree::{NodeKind, NodeRecord, TreeStore};
-use disk_lens::treemap::{layout_treemap, Camera, SearchState};
+use disk_map::tree::{NodeKind, NodeRecord, TreeStore};
+use disk_map::treemap::{layout_treemap, Camera, SearchState};
 use egui::Rect;
 use std::hint::black_box;
 use std::path::PathBuf;

@@ -16,7 +16,7 @@ const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
 
-pub struct DiskLensApp {
+pub struct DiskMapApp {
     path_input: String,
     search_input: String,
     tx: Sender<ScanMessage>,
@@ -57,7 +57,7 @@ struct ProgressSummary {
     current_path: String,
 }
 
-impl Default for DiskLensApp {
+impl Default for DiskMapApp {
     fn default() -> Self {
         let (tx, rx) = unbounded();
         Self {
@@ -95,7 +95,7 @@ impl Default for DiskLensApp {
     }
 }
 
-impl eframe::App for DiskLensApp {
+impl eframe::App for DiskMapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_keyboard(ctx);
         self.handle_scan_messages();
@@ -119,7 +119,7 @@ impl eframe::App for DiskLensApp {
     }
 }
 
-impl DiskLensApp {
+impl DiskMapApp {
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Path:");
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn incremental_messages_build_tree_correctly() {
-        let mut app = DiskLensApp {
+        let mut app = DiskMapApp {
             active_scan_id: 1,
             ..Default::default()
         };
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn stale_scan_messages_are_ignored() {
-        let mut app = DiskLensApp {
+        let mut app = DiskMapApp {
             active_scan_id: 2,
             ..Default::default()
         };
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn cancel_like_new_scan_keeps_old_events_out() {
-        let mut app = DiskLensApp {
+        let mut app = DiskMapApp {
             active_scan_id: 2,
             ..Default::default()
         };
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     fn search_rebuild_marks_matches_in_current_root() {
-        let mut app = DiskLensApp {
+        let mut app = DiskMapApp {
             active_scan_id: 1,
             ..Default::default()
         };

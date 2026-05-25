@@ -1,8 +1,8 @@
-# DiskLens MVP Specification
+# DiskMap MVP Specification
 
 ## 1. Overview
 
-**Project Name:** DiskLens
+**Project Name:** DiskMap
 **Type:** Native desktop disk analysis tool
 **Core Feature:** Scan directories and visualize space usage with Treemap
 **Target:** macOS (primary), similar to SpaceSniffer
@@ -70,7 +70,7 @@ egui Painter
 
 ### 4.3 File Structure
 ```
-disk-lens/
+disk-map/
 ├── Cargo.toml
 └── src/
     ├── main.rs
@@ -137,7 +137,7 @@ struct TreeStore {
 ┌─────────────────────────────────────────────────────┐
 │ Path: [_______________] [Scan] [Root]  Status      │ <- TopPanel
 ├────────────┬──────────────────────────────────────┤
-│ DiskLens  │                                      │
+│ DiskMap  │                                      │
 │ Current:  │                                      │
 │ Size:     │         TREEMAP CANVAS                │
 │ [Open]    │         (egui::Painter)               │

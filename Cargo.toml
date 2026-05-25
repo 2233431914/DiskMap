@@ -1,5 +1,5 @@
 [package]
-name = "disk-lens"
+name = "disk-map"
 version = "0.1.0"
 edition = "2021"
 

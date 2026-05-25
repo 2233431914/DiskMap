@@ -248,7 +248,7 @@ fn run_scan(
 
     let mut db = match options.cache_mode {
         CacheMode::Disabled => None,
-        CacheMode::Enabled => ScanDb::new(&std::env::temp_dir().join("disk-lens.db")).ok(),
+        CacheMode::Enabled => ScanDb::new(&std::env::temp_dir().join("disk-map.db")).ok(),
     };
     let mut files_scanned = 0_u64;
     let mut dirs_scanned = 0_u64;
@@ -696,7 +696,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("disk-lens-{label}-{nanos}"))
+        std::env::temp_dir().join(format!("disk-map-{label}-{nanos}"))
     }
 
     #[test]
@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn size_on_disk_should_follow_allocated_block_count() {
         let path = temp_path("allocated-blocks");
-        write(&path, b"disk-lens").unwrap();
+        write(&path, b"disk-map").unwrap();
 
         let metadata = std::fs::metadata(&path).unwrap();
         let measured = size_on_disk_bytes(&metadata);

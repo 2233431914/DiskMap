@@ -101,7 +101,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("disk-lens-{label}-{nanos}.db"))
+        std::env::temp_dir().join(format!("disk-map-{label}-{nanos}.db"))
     }
 
     #[test]
