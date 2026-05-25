@@ -1,4 +1,4 @@
-use disk_map::DiskMapApp;
+use disk_map::{configure_theme, DiskMapApp};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -11,6 +11,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "DiskMap",
         options,
-        Box::new(|_cc| Ok(Box::<DiskMapApp>::default())),
+        Box::new(|cc| {
+            configure_theme(&cc.egui_ctx);
+            Ok(Box::<DiskMapApp>::default())
+        }),
     )
 }

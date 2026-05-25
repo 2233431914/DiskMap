@@ -6,4 +6,4 @@ pub mod scanner;
 pub mod tree;
 pub mod treemap;
 
-pub use app::DiskMapApp;
+pub use app::{configure_theme, DiskMapApp};

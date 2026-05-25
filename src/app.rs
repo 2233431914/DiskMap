@@ -8,13 +8,58 @@ use crate::treemap::{layout_treemap, Camera, LayoutScratch, SearchState, VisualK
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::time::{Duration, Instant};
 
 const SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
 const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
+const SURFACE_BG: Color32 = Color32::from_rgb(24, 24, 24);
+const PANEL_BG: Color32 = Color32::from_rgb(32, 32, 32);
+const PANEL_BG_ELEVATED: Color32 = Color32::from_rgb(38, 38, 38);
+const PANEL_STROKE: Color32 = Color32::from_rgb(64, 64, 64);
+const PANEL_STROKE_STRONG: Color32 = Color32::from_rgb(92, 92, 92);
+const ACCENT: Color32 = Color32::from_rgb(76, 132, 196);
+const ACCENT_WARM: Color32 = Color32::from_rgb(214, 176, 88);
+const DANGER: Color32 = Color32::from_rgb(190, 92, 92);
+const TEXT_MUTED: Color32 = Color32::from_rgb(170, 170, 170);
+
+pub fn configure_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = SURFACE_BG;
+    visuals.window_fill = SURFACE_BG;
+    visuals.extreme_bg_color = Color32::from_rgb(20, 20, 20);
+    visuals.faint_bg_color = PANEL_BG;
+    visuals.override_text_color = Some(Color32::from_rgb(230, 230, 230));
+    visuals.widgets.noninteractive.bg_fill = PANEL_BG;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, PANEL_STROKE);
+    visuals.widgets.inactive.bg_fill = PANEL_BG;
+    visuals.widgets.inactive.weak_bg_fill = PANEL_BG_ELEVATED;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, PANEL_STROKE);
+    visuals.widgets.hovered.bg_fill = PANEL_BG_ELEVATED;
+    visuals.widgets.hovered.weak_bg_fill = PANEL_BG_ELEVATED;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, PANEL_STROKE_STRONG);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(48, 48, 48);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(48, 48, 48);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.bg_fill = Color32::from_rgb(62, 98, 142);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.hyperlink_color = ACCENT;
+    visuals.widgets.open.bg_fill = PANEL_BG_ELEVATED;
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.global_style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(8.0, 6.0);
+    style.spacing.menu_margin = egui::Margin::same(8);
+    style.spacing.window_margin = egui::Margin::same(10);
+    style.text_styles.insert(egui::TextStyle::Heading, FontId::proportional(20.0));
+    style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(14.0));
+    style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(14.0));
+    style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(12.0));
+    ctx.set_global_style(style);
+}
 
 pub struct DiskMapApp {
     path_input: String,
@@ -56,7 +101,6 @@ struct ProgressSummary {
     files_scanned: u64,
     dirs_scanned: u64,
     bytes_seen: u64,
-    current_path: String,
 }
 
 impl Default for DiskMapApp {
@@ -129,9 +173,13 @@ impl eframe::App for DiskMapApp {
 
 impl DiskMapApp {
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.label("Path:");
-            let path_edit = ui.text_edit_singleline(&mut self.path_input);
+            let path_width = ui.available_width().clamp(260.0, 360.0);
+            let path_edit = ui.add_sized(
+                [path_width, 28.0],
+                egui::TextEdit::singleline(&mut self.path_input),
+            );
             if path_edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.start_scan();
             }
@@ -171,7 +219,10 @@ impl DiskMapApp {
 
             ui.separator();
             ui.label("Search:");
-            if ui.text_edit_singleline(&mut self.search_input).changed() {
+            if ui
+                .add_sized([180.0, 28.0], egui::TextEdit::singleline(&mut self.search_input))
+                .changed()
+            {
                 self.mark_search_dirty();
             }
             if !self.search_input.is_empty() && ui.button("Clear").clicked() {
@@ -183,15 +234,16 @@ impl DiskMapApp {
 
             ui.separator();
             ui.label("Depth:");
-            if ui.add(egui::Slider::new(&mut self.max_depth, 1..=10).text("")).changed() {
+            if ui
+                .add_sized([96.0, 18.0], egui::Slider::new(&mut self.max_depth, 1..=10).text(""))
+                .changed()
+            {
                 self.layout_dirty = true;
                 self.last_layout_refresh = Instant::now()
                     .checked_sub(LAYOUT_REFRESH_INTERVAL)
                     .unwrap_or_else(Instant::now);
             }
 
-            ui.separator();
-            ui.label(&self.status);
         });
     }
 
@@ -203,37 +255,30 @@ impl DiskMapApp {
         if let Some(node_id) = subject_id {
             let node_path = self.tree.node_real_path(node_id);
             let node = self.tree.node(node_id);
-            let root_size = self
-                .focused_root
-                .map(|root_id| self.tree.node(root_id).size.max(1))
-                .unwrap_or(1);
             let matched = self.search_state.is_match(node_id);
-
             ui.label(format!("Name: {}", node.name));
             ui.label(format!("Size: {}", format_bytes(node.size)));
-            let parent_share = if let Some(parent_id) = node.parent {
-                let parent_size = self.tree.node(parent_id).size.max(1);
-                (node.size as f32 / parent_size as f32) * 100.0
-            } else {
-                100.0
-            };
-            ui.label(format!("Share of root: {:.1}%", (node.size as f32 / root_size as f32) * 100.0));
-            ui.label(format!("Share of parent: {:.1}%", parent_share));
-            ui.label(format!("Type: {}", describe_node_kind(node.kind, !node.children.is_empty())));
-            ui.label(format!("Scanned: {}", if node.scanned { "yes" } else { "in progress" }));
-            if let Some(error) = &node.error {
-                ui.label(format!("Error: {error}"));
-            }
             ui.label(format!(
-                "Path: {}",
-                node_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "Aggregated small files".to_string())
+                "Type: {}",
+                describe_node_kind(node.kind, !node.children.is_empty())
+            ));
+            ui.label(format!(
+                "Scanned: {}",
+                if node.scanned { "yes" } else { "in progress" }
             ));
             if !self.search_input.is_empty() {
-                ui.label(format!("Search match: {}", if matched { "yes" } else { "no" }));
-                ui.label(format!("Matches in view: {}", self.search_state.match_count()));
+                ui.label(format!(
+                    "Search match: {}",
+                    if matched { "yes" } else { "no" }
+                ));
+            }
+            let path_text = node_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "Aggregated small files".to_string());
+            ui.label(format!("Path: {path_text}"));
+            if let Some(error) = &node.error {
+                ui.colored_label(DANGER, format!("Error: {error}"));
             }
 
             ui.separator();
@@ -282,29 +327,6 @@ impl DiskMapApp {
                 }
             }
 
-            if !node.children.is_empty() {
-                ui.separator();
-                ui.label("Largest Children");
-                self.tree.ensure_sorted_children(node_id);
-                let child_ids: Vec<NodeId> = self
-                    .tree
-                    .sorted_children(node_id)
-                    .iter()
-                    .take(12)
-                    .copied()
-                    .collect();
-                for child_id in child_ids {
-                    let child = self.tree.node(child_id);
-                    let label = format!("{}  {}", child.name, format_bytes(child.size));
-                    let response = ui.selectable_label(self.selected_id == Some(child_id), label);
-                    if response.clicked() {
-                        self.selected_id = Some(child_id);
-                    }
-                    if response.double_clicked() && !child.children.is_empty() {
-                        self.enter_root(child_id, true);
-                    }
-                }
-            }
         } else {
             ui.label("Run a scan to populate the treemap.");
         }
@@ -315,7 +337,21 @@ impl DiskMapApp {
             ui.label(format!("Files: {}", progress.files_scanned));
             ui.label(format!("Dirs: {}", progress.dirs_scanned));
             ui.label(format!("Seen: {}", format_bytes(progress.bytes_seen)));
-            ui.label(format!("Current: {}", progress.current_path));
+        }
+
+        if !self.search_input.trim().is_empty() {
+            ui.separator();
+            ui.heading("Search");
+            ui.label(format!("Query: {}", self.search_input.trim()));
+            ui.label(format!("Matches in view: {}", self.search_state.match_count()));
+            ui.label(format!(
+                "Status: {}",
+                if self.search_dirty {
+                    "Updating..."
+                } else {
+                    "Ready"
+                }
+            ));
         }
     }
 
@@ -401,8 +437,6 @@ impl DiskMapApp {
         for visual in &self.cached_visuals {
             self.paint_visual(ui, &painter, visual);
         }
-        self.paint_breadcrumb_overlay(ui, &painter, available);
-
         if response.double_clicked() {
             if let Some(node_id) = self.hovered_id {
                 if !self.tree.node(node_id).children.is_empty() {
@@ -493,44 +527,28 @@ impl DiskMapApp {
             .fixed_pos(pos + egui::vec2(16.0, 16.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::default()
-                    .fill(Color32::from_rgb(40, 40, 40))
+                    .fill(PANEL_BG_ELEVATED)
+                    .stroke(Stroke::new(1.0, PANEL_STROKE))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
-                        ui.label(&node.name);
-                        ui.label(format_bytes(node.size));
+                        ui.label(RichText::new(&node.name).strong());
+                        ui.label(RichText::new(format_bytes(node.size)).color(ACCENT_WARM));
                         if let Some(path) = &node_path {
-                            ui.label(path.display().to_string());
+                            ui.label(RichText::new(path.display().to_string()).small().monospace());
                         } else {
-                            ui.label("Aggregated small files");
+                            ui.label(RichText::new("Aggregated small files").small().color(TEXT_MUTED));
                         }
                         if let Some(error) = &node.error {
-                            ui.label(error);
+                            ui.label(RichText::new(error).small().color(DANGER));
                         }
-                        ui.label(if node.scanned { "Scanned" } else { "Scanning..." });
+                        ui.label(
+                            RichText::new(if node.scanned { "Scanned" } else { "Scanning..." })
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
                     });
             });
-    }
-
-    fn paint_breadcrumb_overlay(&self, ui: &egui::Ui, painter: &egui::Painter, available: Rect) {
-        if self.breadcrumb_cache.is_empty() {
-            return;
-        }
-
-        let overlay_rect = Rect::from_min_max(
-            available.left_top() + egui::vec2(12.0, 12.0),
-            available.left_top() + egui::vec2((available.width() * 0.6).min(680.0), 40.0),
-        );
-        painter.rect_filled(
-            overlay_rect,
-            6.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 160),
-        );
-        painter.text(
-            overlay_rect.left_center() + egui::vec2(10.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            &self.breadcrumb_cache,
-            egui::TextStyle::Body.resolve(ui.style()),
-            Color32::WHITE,
-        );
     }
 
     fn paint_visual(&self, ui: &egui::Ui, painter: &egui::Painter, visual: &VisualNode) {
@@ -717,14 +735,8 @@ impl DiskMapApp {
             files_scanned: progress.files_scanned,
             dirs_scanned: progress.dirs_scanned,
             bytes_seen: progress.bytes_seen,
-            current_path: progress.current_path.display().to_string(),
         });
-        self.status = format!(
-            "Scanning {} files, {} dirs, {}",
-            progress.files_scanned,
-            progress.dirs_scanned,
-            format_bytes(progress.bytes_seen)
-        );
+        self.status = "Scanning...".to_string();
     }
 
     fn merge_scan_perf_stats(&mut self, perf_stats: PerfStats) {
@@ -981,14 +993,14 @@ fn find_hovered_visual(visuals: &[VisualNode], pos: Option<Pos2>) -> Option<&Vis
 fn fill_color_for_visual(visual: &VisualNode, hovered: bool, selected: bool) -> Color32 {
     let mut color = if visual.is_dir {
         match visual.depth % 5 {
-            0 => Color32::from_rgb(45, 101, 168),
-            1 => Color32::from_rgb(56, 128, 91),
-            2 => Color32::from_rgb(145, 112, 56),
-            3 => Color32::from_rgb(120, 79, 137),
-            _ => Color32::from_rgb(67, 132, 140),
+            0 => Color32::from_rgb(48, 109, 181),
+            1 => Color32::from_rgb(55, 139, 106),
+            2 => Color32::from_rgb(171, 124, 52),
+            3 => Color32::from_rgb(138, 88, 159),
+            _ => Color32::from_rgb(71, 142, 152),
         }
     } else {
-        Color32::from_rgb(112, 112, 118)
+        Color32::from_rgb(112, 118, 128)
     };
 
     if visual.hidden_by_search {
@@ -1013,9 +1025,9 @@ fn stroke_for_visual(visual: &VisualNode, hovered: bool, selected: bool) -> Stro
     if selected {
         Stroke::new(2.5, Color32::WHITE)
     } else if hovered {
-        Stroke::new(2.0, Color32::from_rgb(255, 233, 171))
+        Stroke::new(2.0, ACCENT_WARM)
     } else if visual.matched {
-        Stroke::new(1.8, Color32::from_rgb(255, 214, 82))
+        Stroke::new(1.8, ACCENT_WARM)
     } else if visual.is_dir {
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 42))
     } else {
