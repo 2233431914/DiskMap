@@ -3,15 +3,16 @@ use disk_map::scanner::{
     CacheMode, DiscoveredNode, PerfStats, ProgressSnapshot, ScanBatch, ScanOptions,
 };
 use disk_map::tree::{NodeKind, NodeRecord, TreeStore};
-use disk_map::treemap::{layout_treemap, Camera, SearchState};
+use disk_map::treemap::{layout_treemap, Camera, LayoutScratch, SearchState};
 use egui::Rect;
+use rustc_hash::FxHashMap;
 use std::hint::black_box;
-use std::path::PathBuf;
 use std::time::Duration;
 
 fn build_tree(node_count: usize) -> (TreeStore, usize) {
     let mut tree = TreeStore::new();
-    let root = tree.add_node(None, "root".into(), PathBuf::from("/"), NodeKind::Dir, 0);
+    let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+    tree.set_root_path("/".into());
     let mut total = 0u64;
 
     for index in 0..node_count {
@@ -19,7 +20,6 @@ fn build_tree(node_count: usize) -> (TreeStore, usize) {
         tree.add_node(
             Some(root),
             format!("file-{index}"),
-            PathBuf::from(format!("/file-{index}")),
             NodeKind::File,
             size,
         );
@@ -35,14 +35,13 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
     c.bench_function("scan_batch_aggregation_bench", |b| {
         b.iter(|| {
             let mut batch = ScanBatch::default();
-            let mut size_map = std::collections::HashMap::<usize, u64>::new();
+            let mut size_map = FxHashMap::<usize, u64>::default();
             for index in 0..4096usize {
                 batch.discovered_nodes.push(DiscoveredNode {
                     node_id: index + 1,
                     parent_id: 0,
                     node: NodeRecord {
                         name: format!("node-{index}"),
-                        path: PathBuf::from(format!("/node-{index}")),
                         kind: NodeKind::File,
                         size: 1,
                         scanned: true,
@@ -56,7 +55,7 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                 files_scanned: 4096,
                 dirs_scanned: 16,
                 bytes_seen: 4096,
-                current_path: PathBuf::from("/tmp"),
+                current_path: "/tmp".into(),
             });
 
             let stats = PerfStats {
@@ -64,11 +63,17 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                 batches_sent: 1,
                 entries_seen: 4096,
                 nodes_discovered: 4096,
+                files_scanned: 4096,
+                dirs_scanned: 16,
                 size_delta_merges: 4080,
+                ancestor_size_delta_total_ms: 0.0,
                 parent_stack_hits: 4096,
                 parent_lookup_fallbacks: 0,
                 progress_snapshots_sent: 1,
+                prefetched_files: 4096,
+                metadata_fallback_files: 0,
                 metadata_total_ms: 0.0,
+                mtime_total_ms: 0.0,
                 size_measure_total_ms: 0.0,
                 batch_flush_total_ms: 0.0,
                 scan_elapsed_ms: 0.0,
@@ -134,15 +139,20 @@ fn treemap_layout_bench(c: &mut Criterion) {
         let canvas = Rect::from_min_max((0.0, 0.0).into(), (1400.0, 900.0).into());
         group.bench_with_input(format!("nodes_{count}"), &count, |b, _| {
             let mut tree = tree.clone();
+            let mut visuals = Vec::new();
+            let mut scratch = LayoutScratch::default();
             b.iter(|| {
-                black_box(layout_treemap(
+                layout_treemap(
                     &mut tree,
                     root,
                     canvas,
                     Camera::default(),
                     2,
                     &search_state,
-                ))
+                    &mut visuals,
+                    &mut scratch,
+                );
+                black_box(visuals.len())
             })
         });
     }

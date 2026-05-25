@@ -1,3 +1,5 @@
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 pub type NodeId = usize;
@@ -8,6 +10,7 @@ pub enum NodeKind {
     Dir,
     Symlink,
     Error,
+    Aggregate,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +29,6 @@ pub struct Node {
 #[derive(Debug, Clone)]
 pub struct NodeRecord {
     pub name: String,
-    pub path: PathBuf,
     pub kind: NodeKind,
     pub size: u64,
     pub scanned: bool,
@@ -39,6 +41,7 @@ pub struct TreeStore {
     pub root: Option<NodeId>,
     pub hidden_root: bool,
     root_path: PathBuf,
+    path_cache: LruCache<NodeId, PathBuf>,
 }
 
 impl Default for TreeStore {
@@ -54,6 +57,7 @@ impl TreeStore {
             root: None,
             hidden_root: false,
             root_path: PathBuf::new(),
+            path_cache: LruCache::new(NonZeroUsize::new(256).expect("non-zero")),
         }
     }
 
@@ -62,6 +66,7 @@ impl TreeStore {
         self.root = None;
         self.hidden_root = false;
         self.root_path.clear();
+        self.path_cache.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -76,13 +81,11 @@ impl TreeStore {
         &mut self,
         parent: Option<NodeId>,
         name: String,
-        path: PathBuf,
         kind: NodeKind,
         size: u64,
     ) -> NodeId {
         let record = NodeRecord {
             name,
-            path,
             kind,
             size,
             scanned: false,
@@ -117,8 +120,9 @@ impl TreeStore {
             self.nodes[parent_id].sort_dirty = true;
         } else {
             self.root = Some(id);
-            self.root_path = record.path;
+            self.root_path.clear();
         }
+        self.path_cache.pop(&id);
     }
 
     pub fn node(&self, id: NodeId) -> &Node {
@@ -202,7 +206,16 @@ impl TreeStore {
         self.nodes[id].sort_dirty = false;
     }
 
-    pub fn node_path(&self, id: NodeId) -> PathBuf {
+    pub fn set_root_path(&mut self, path: PathBuf) {
+        self.root_path = path;
+        self.path_cache.clear();
+    }
+
+    pub fn node_path(&mut self, id: NodeId) -> PathBuf {
+        if let Some(cached) = self.path_cache.get(&id) {
+            return cached.clone();
+        }
+
         let Some(root_id) = self.root else {
             return PathBuf::new();
         };
@@ -225,7 +238,16 @@ impl TreeStore {
         for component in components.iter().rev() {
             path.push(component);
         }
+        self.path_cache.put(id, path.clone());
         path
+    }
+
+    pub fn node_real_path(&mut self, id: NodeId) -> Option<PathBuf> {
+        if matches!(self.node(id).kind, NodeKind::Aggregate) {
+            None
+        } else {
+            Some(self.node_path(id))
+        }
     }
 
     pub fn is_descendant_or_same(&self, node_id: NodeId, ancestor_id: NodeId) -> bool {
@@ -239,14 +261,33 @@ impl TreeStore {
         false
     }
 
-    pub fn root_record(path: PathBuf, name: String) -> NodeRecord {
+    pub fn root_record(name: String) -> NodeRecord {
         NodeRecord {
             name,
-            path,
             kind: NodeKind::Dir,
             size: 0,
             scanned: false,
             error: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_path_rebuilds_from_root_path_and_uses_cache() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/root".into());
+        let child = tree.add_node(Some(root), "child".into(), NodeKind::Dir, 0);
+        let file = tree.add_node(Some(child), "file.txt".into(), NodeKind::File, 1);
+
+        let first = tree.node_path(file);
+        let second = tree.node_path(file);
+
+        assert_eq!(first, PathBuf::from("/root/child/file.txt"));
+        assert_eq!(second, first);
     }
 }

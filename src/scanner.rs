@@ -2,8 +2,8 @@ use crate::db::ScanDb;
 use crate::tree::{NodeId, NodeKind, NodeRecord, TreeStore};
 
 use crossbeam_channel::Sender;
+use rustc_hash::FxHashMap;
 use jwalk::{ClientState, WalkDirGeneric};
-use std::collections::HashMap;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,11 +45,17 @@ pub struct PerfStats {
     pub batches_sent: u64,
     pub entries_seen: u64,
     pub nodes_discovered: u64,
+    pub files_scanned: u64,
+    pub dirs_scanned: u64,
     pub size_delta_merges: u64,
+    pub ancestor_size_delta_total_ms: f64,
     pub parent_stack_hits: u64,
     pub parent_lookup_fallbacks: u64,
     pub progress_snapshots_sent: u64,
+    pub prefetched_files: u64,
+    pub metadata_fallback_files: u64,
     pub metadata_total_ms: f64,
+    pub mtime_total_ms: f64,
     pub size_measure_total_ms: f64,
     pub batch_flush_total_ms: f64,
     pub scan_elapsed_ms: f64,
@@ -133,18 +139,74 @@ struct EntryClientState {
 #[derive(Debug)]
 struct PrefetchedFileInfo {
     metadata: Metadata,
-    mtime: u64,
+    cached_mtime: Option<u64>,
     measured_size: u64,
 }
 
 #[derive(Debug, Default)]
 struct PrefetchPerfCounters {
     metadata_ns: AtomicU64,
+    mtime_ns: AtomicU64,
     size_ns: AtomicU64,
 }
 
-const PREFETCH_MAX_FILES_PER_DIR: usize = 256;
-const PREFETCH_MAX_TIME_PER_DIR: Duration = Duration::from_millis(8);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefetchBudget {
+    max_files: usize,
+    max_time: Duration,
+}
+
+const PREFETCH_SMALL_DIR_FILE_THRESHOLD: usize = 512;
+const PREFETCH_MEDIUM_DIR_FILE_THRESHOLD: usize = 4_096;
+const PREFETCH_LARGE_DIR_FILE_THRESHOLD: usize = 16_384;
+const PREFETCH_HUGE_DIR_FILE_THRESHOLD: usize = 65_536;
+const PREFETCH_MEDIUM_DIR_FILE_CAP: usize = 4_096;
+const PREFETCH_LARGE_DIR_FILE_CAP: usize = 16_384;
+const PREFETCH_HUGE_DIR_FILE_CAP: usize = 49_152;
+const PREFETCH_GIANT_DIR_FILE_CAP: usize = 65_536;
+const PREFETCH_SMALL_DIR_TIME_BUDGET: Duration = Duration::from_millis(12);
+const PREFETCH_MEDIUM_DIR_TIME_BUDGET: Duration = Duration::from_millis(45);
+const PREFETCH_LARGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(110);
+const PREFETCH_HUGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(260);
+const PREFETCH_GIANT_DIR_TIME_BUDGET: Duration = Duration::from_millis(380);
+const AGGREGATE_SMALL_FILE_THRESHOLD_BYTES: u64 = 16 * 1024;
+const AGGREGATE_LABEL: &str = "Other Files";
+
+fn prefetch_budget_for_dir(file_count: usize) -> PrefetchBudget {
+    if file_count == 0 {
+        return PrefetchBudget {
+            max_files: 0,
+            max_time: Duration::ZERO,
+        };
+    }
+
+    if file_count <= PREFETCH_SMALL_DIR_FILE_THRESHOLD {
+        PrefetchBudget {
+            max_files: file_count,
+            max_time: PREFETCH_SMALL_DIR_TIME_BUDGET,
+        }
+    } else if file_count <= PREFETCH_MEDIUM_DIR_FILE_THRESHOLD {
+        PrefetchBudget {
+            max_files: file_count.min(PREFETCH_MEDIUM_DIR_FILE_CAP),
+            max_time: PREFETCH_MEDIUM_DIR_TIME_BUDGET,
+        }
+    } else if file_count <= PREFETCH_LARGE_DIR_FILE_THRESHOLD {
+        PrefetchBudget {
+            max_files: file_count.min(PREFETCH_LARGE_DIR_FILE_CAP),
+            max_time: PREFETCH_LARGE_DIR_TIME_BUDGET,
+        }
+    } else if file_count <= PREFETCH_HUGE_DIR_FILE_THRESHOLD {
+        PrefetchBudget {
+            max_files: file_count.min(PREFETCH_HUGE_DIR_FILE_CAP),
+            max_time: PREFETCH_HUGE_DIR_TIME_BUDGET,
+        }
+    } else {
+        PrefetchBudget {
+            max_files: file_count.min(PREFETCH_GIANT_DIR_FILE_CAP),
+            max_time: PREFETCH_GIANT_DIR_TIME_BUDGET,
+        }
+    }
+}
 
 impl ScanHandle {
     pub fn cancel(&self) {
@@ -155,16 +217,42 @@ impl ScanHandle {
 #[derive(Debug, Default)]
 struct BatchAccumulator {
     discovered_nodes: Vec<DiscoveredNode>,
-    size_deltas: HashMap<NodeId, u64>,
+    size_deltas: FxHashMap<NodeId, u64>,
     scanned_nodes: Vec<NodeId>,
     progress: Option<ProgressSnapshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AggregateBucket {
+    total_size: u64,
+    file_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct AggregateState {
+    buckets: FxHashMap<NodeId, AggregateBucket>,
+}
+
+impl AggregateState {
+    fn add_file(&mut self, parent_id: NodeId, size: u64) {
+        let bucket = self.buckets.entry(parent_id).or_default();
+        bucket.total_size += size;
+        bucket.file_count += 1;
+    }
+
+    fn take_bucket(&mut self, parent_id: NodeId) -> Option<AggregateBucket> {
+        self.buckets.remove(&parent_id)
+    }
 }
 
 impl BatchAccumulator {
     fn new(options: ScanOptions) -> Self {
         Self {
             discovered_nodes: Vec::with_capacity(options.max_pending_nodes.min(256)),
-            size_deltas: HashMap::with_capacity(options.max_pending_size_deltas.min(512)),
+            size_deltas: FxHashMap::with_capacity_and_hasher(
+                options.max_pending_size_deltas.min(512),
+                Default::default(),
+            ),
             scanned_nodes: Vec::with_capacity(options.max_pending_nodes.min(256)),
             progress: None,
         }
@@ -233,7 +321,7 @@ fn run_scan(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
-    let root_node = TreeStore::root_record(path.clone(), root_name);
+    let root_node = TreeStore::root_record(root_name);
     perf_stats.messages_sent += 1;
     let _ = tx.send(ScanMessage::Started {
         scan_id,
@@ -243,6 +331,7 @@ fn run_scan(
 
     let mut shadow_tree = TreeStore::new();
     let root_id = shadow_tree.push_node(None, root_node);
+    shadow_tree.set_root_path(path.clone());
 
     let mut parent_lookup = ParentLookup::new(path.clone(), root_id);
 
@@ -254,21 +343,31 @@ fn run_scan(
     let mut dirs_scanned = 0_u64;
     let mut bytes_seen = 0_u64;
     let mut batch = BatchAccumulator::new(options);
+    let mut aggregate_state = AggregateState::default();
     let mut last_flush = Instant::now();
     let mut last_seen_path = path.clone();
 
     let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
     let walker_prefetch_perf = Arc::clone(&prefetch_perf);
+    let cache_enabled = matches!(options.cache_mode, CacheMode::Enabled);
     let walker = WalkDirGeneric::<ScanWalkState>::new(&path)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_depth, _path, _state, children| {
+            let file_count = children
+                .iter()
+                .filter_map(|child| child.as_ref().ok())
+                .filter(|entry| entry.file_type().is_file())
+                .count();
+            let budget = prefetch_budget_for_dir(file_count);
+            if budget.max_files == 0 {
+                return;
+            }
+
             let dir_prefetch_start = Instant::now();
             let mut prefetched_files = 0usize;
             for child in children.iter_mut() {
-                if prefetched_files >= PREFETCH_MAX_FILES_PER_DIR
-                    || dir_prefetch_start.elapsed() >= PREFETCH_MAX_TIME_PER_DIR
-                {
+                if prefetched_files >= budget.max_files || dir_prefetch_start.elapsed() >= budget.max_time {
                     break;
                 }
                 let Ok(dir_entry) = child.as_mut() else {
@@ -296,12 +395,22 @@ fn run_scan(
                     Ordering::Relaxed,
                 );
 
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let cached_mtime = if cache_enabled {
+                    let mtime_start = Instant::now();
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    walker_prefetch_perf.mtime_ns.fetch_add(
+                        mtime_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    Some(mtime)
+                } else {
+                    None
+                };
 
                 let size_start = Instant::now();
                 let measured_size = size_on_disk_bytes(&metadata);
@@ -312,7 +421,7 @@ fn run_scan(
 
                 dir_entry.client_state.prefetched_file = Some(Ok(PrefetchedFileInfo {
                     metadata,
-                    mtime,
+                    cached_mtime,
                     measured_size,
                 }));
             }
@@ -369,11 +478,12 @@ fn run_scan(
         let size = if kind == NodeKind::File {
             match entry.client_state.prefetched_file {
                 Some(Ok(prefetched)) => {
+                    perf_stats.prefetched_files += 1;
                     let size_start = Instant::now();
                     let size = measured_size_for_file(
                         &entry_path,
                         &prefetched.metadata,
-                        prefetched.mtime,
+                        prefetched.cached_mtime,
                         prefetched.measured_size,
                         db.as_mut(),
                         &mut perf_stats,
@@ -386,6 +496,7 @@ fn run_scan(
                     0
                 }
                 None => {
+                    perf_stats.metadata_fallback_files += 1;
                     let metadata_start = Instant::now();
                     let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
@@ -395,7 +506,6 @@ fn run_scan(
                             let node_id = shadow_tree.len();
                             let node = NodeRecord {
                                 name,
-                                path: entry_path.to_path_buf(),
                                 kind: NodeKind::Error,
                                 size: 0,
                                 scanned: true,
@@ -427,18 +537,13 @@ fn run_scan(
                         }
                     };
                     perf_stats.metadata_total_ms += metadata_start.elapsed().as_secs_f64() * 1000.0;
-                    let mtime = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                    let cached_mtime = cached_mtime_for_metadata(&metadata, db.is_some(), &mut perf_stats);
                     let measured_size = size_on_disk_bytes(&metadata);
                     let size_start = Instant::now();
                     let size = measured_size_for_file(
                         &entry_path,
                         &metadata,
-                        mtime,
+                        cached_mtime,
                         measured_size,
                         db.as_mut(),
                         &mut perf_stats,
@@ -452,24 +557,21 @@ fn run_scan(
         };
 
         let node_id = shadow_tree.len();
-        let node = NodeRecord {
-            name,
-            path: entry_path.to_path_buf(),
-            kind: if node_error.is_some() { NodeKind::Error } else { kind },
-            size,
-            scanned: matches!(kind, NodeKind::File | NodeKind::Symlink | NodeKind::Error) || node_error.is_some(),
-            error: node_error,
-        };
-
-        shadow_tree.insert_node(node_id, Some(parent_id), node.clone());
-        perf_stats.nodes_discovered += 1;
-        batch.discovered_nodes.push(DiscoveredNode {
-            node_id,
-            parent_id,
-            node,
-        });
-
         if kind == NodeKind::Dir {
+            let node = NodeRecord {
+                name,
+                kind: if node_error.is_some() { NodeKind::Error } else { kind },
+                size,
+                scanned: false,
+                error: node_error,
+            };
+            shadow_tree.insert_node(node_id, Some(parent_id), node.clone());
+            perf_stats.nodes_discovered += 1;
+            batch.discovered_nodes.push(DiscoveredNode {
+                node_id,
+                parent_id,
+                node,
+            });
             parent_lookup.record_directory(
                 entry_depth,
                 entry.read_children_path.as_deref(),
@@ -481,6 +583,7 @@ fn run_scan(
             files_scanned += 1;
             bytes_seen += size;
             shadow_tree.apply_size_delta(parent_id, size);
+            let ancestor_delta_start = Instant::now();
             let mut current = Some(parent_id);
             while let Some(ancestor_id) = current {
                 let entry = batch.size_deltas.entry(ancestor_id).or_insert(0);
@@ -490,9 +593,43 @@ fn run_scan(
                 *entry += size;
                 current = shadow_tree.node(ancestor_id).parent;
             }
-        }
+            perf_stats.ancestor_size_delta_total_ms +=
+                ancestor_delta_start.elapsed().as_secs_f64() * 1000.0;
 
-        if matches!(kind, NodeKind::File | NodeKind::Symlink | NodeKind::Error) {
+            if node_error.is_none() && size <= AGGREGATE_SMALL_FILE_THRESHOLD_BYTES {
+                aggregate_state.add_file(parent_id, size);
+            } else {
+                let node = NodeRecord {
+                    name,
+                    kind: if node_error.is_some() { NodeKind::Error } else { kind },
+                    size,
+                    scanned: true,
+                    error: node_error,
+                };
+                shadow_tree.insert_node(node_id, Some(parent_id), node.clone());
+                perf_stats.nodes_discovered += 1;
+                batch.discovered_nodes.push(DiscoveredNode {
+                    node_id,
+                    parent_id,
+                    node,
+                });
+                batch.scanned_nodes.push(node_id);
+            }
+        } else {
+            let node = NodeRecord {
+                name,
+                kind: if node_error.is_some() { NodeKind::Error } else { kind },
+                size,
+                scanned: true,
+                error: node_error,
+            };
+            shadow_tree.insert_node(node_id, Some(parent_id), node.clone());
+            perf_stats.nodes_discovered += 1;
+            batch.discovered_nodes.push(DiscoveredNode {
+                node_id,
+                parent_id,
+                node,
+            });
             batch.scanned_nodes.push(node_id);
         }
 
@@ -512,6 +649,13 @@ fn run_scan(
             );
         }
     }
+
+    emit_aggregate_nodes(
+        &mut shadow_tree,
+        &mut aggregate_state,
+        &mut batch,
+        &mut perf_stats,
+    );
 
     for node_id in 0..shadow_tree.len() {
         if matches!(shadow_tree.node(node_id).kind, NodeKind::Dir) {
@@ -538,7 +682,10 @@ fn run_scan(
     );
 
     let elapsed = start.elapsed();
+    perf_stats.files_scanned = files_scanned;
+    perf_stats.dirs_scanned = dirs_scanned;
     perf_stats.metadata_total_ms += prefetch_perf.metadata_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    perf_stats.mtime_total_ms += prefetch_perf.mtime_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     perf_stats.size_measure_total_ms += prefetch_perf.size_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     perf_stats.scan_elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     eprintln!("Scan {scan_id} completed in {:?}", elapsed);
@@ -555,12 +702,12 @@ fn run_scan(
 struct ParentLookup {
     root_id: NodeId,
     directory_stack: Vec<NodeId>,
-    directory_ids: HashMap<PathBuf, NodeId>,
+    directory_ids: FxHashMap<PathBuf, NodeId>,
 }
 
 impl ParentLookup {
     fn new(root_path: PathBuf, root_id: NodeId) -> Self {
-        let mut directory_ids = HashMap::with_capacity(1024);
+        let mut directory_ids = FxHashMap::with_capacity_and_hasher(1024, Default::default());
         directory_ids.insert(root_path.clone(), root_id);
         Self {
             root_id,
@@ -652,15 +799,54 @@ fn flush_batch(
     *last_flush = Instant::now();
 }
 
+fn emit_aggregate_nodes(
+    shadow_tree: &mut TreeStore,
+    aggregate_state: &mut AggregateState,
+    batch: &mut BatchAccumulator,
+    perf_stats: &mut PerfStats,
+) {
+    let parent_ids: Vec<NodeId> = aggregate_state.buckets.keys().copied().collect();
+    for parent_id in parent_ids {
+        let Some(bucket) = aggregate_state.take_bucket(parent_id) else {
+            continue;
+        };
+        if bucket.file_count == 0 || bucket.total_size == 0 {
+            continue;
+        }
+
+        let node_id = shadow_tree.len();
+        let node = NodeRecord {
+            name: format!("{AGGREGATE_LABEL} ({})", bucket.file_count),
+            kind: NodeKind::Aggregate,
+            size: bucket.total_size,
+            scanned: true,
+            error: None,
+        };
+        shadow_tree.insert_node(node_id, Some(parent_id), node.clone());
+        perf_stats.nodes_discovered += 1;
+        batch.discovered_nodes.push(DiscoveredNode {
+            node_id,
+            parent_id,
+            node,
+        });
+        batch.scanned_nodes.push(node_id);
+    }
+}
+
 fn measured_size_for_file(
     path: &Path,
     _metadata: &Metadata,
-    mtime: u64,
+    cached_mtime: Option<u64>,
     measured_size: u64,
     db: Option<&mut ScanDb>,
     perf_stats: &mut PerfStats,
 ) -> u64 {
     if let Some(db) = db {
+        let Some(mtime) = cached_mtime else {
+            perf_stats.db_cache_misses += 1;
+            let _ = db.insert(path, measured_size, 0);
+            return measured_size;
+        };
         if let Some(cached_size) = db.get_cached(path, mtime) {
             perf_stats.db_cache_hits += 1;
             return cached_size;
@@ -669,6 +855,26 @@ fn measured_size_for_file(
         let _ = db.insert(path, measured_size, mtime);
     }
     measured_size
+}
+
+fn cached_mtime_for_metadata(
+    metadata: &Metadata,
+    cache_enabled: bool,
+    perf_stats: &mut PerfStats,
+) -> Option<u64> {
+    if !cache_enabled {
+        return None;
+    }
+
+    let mtime_start = Instant::now();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    perf_stats.mtime_total_ms += mtime_start.elapsed().as_secs_f64() * 1000.0;
+    Some(mtime)
 }
 
 fn size_on_disk_bytes(metadata: &Metadata) -> u64 {
@@ -701,7 +907,7 @@ mod tests {
 
     #[test]
     fn started_to_finished_messages_describe_incremental_tree() {
-        let root = TreeStore::root_record(PathBuf::from("/root"), "root".into());
+        let root = TreeStore::root_record("root".into());
         let messages = [
             ScanMessage::Started {
                 scan_id: 1,
@@ -716,7 +922,6 @@ mod tests {
                         parent_id: 0,
                         node: NodeRecord {
                             name: "child".into(),
-                            path: PathBuf::from("/root/child"),
                             kind: NodeKind::File,
                             size: 42,
                             scanned: true,
@@ -749,9 +954,10 @@ mod tests {
     #[test]
     fn tree_size_delta_updates_all_ancestors() {
         let mut tree = TreeStore::new();
-        let root = tree.add_node(None, "root".into(), PathBuf::from("/root"), NodeKind::Dir, 0);
-        let child = tree.add_node(Some(root), "child".into(), PathBuf::from("/root/child"), NodeKind::Dir, 0);
-        tree.add_node(Some(child), "file".into(), PathBuf::from("/root/child/file"), NodeKind::File, 42);
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path(PathBuf::from("/root"));
+        let child = tree.add_node(Some(root), "child".into(), NodeKind::Dir, 0);
+        tree.add_node(Some(child), "file".into(), NodeKind::File, 42);
 
         tree.apply_size_delta(child, 42);
 
@@ -769,7 +975,7 @@ mod tests {
         *batch.size_deltas.entry(2).or_insert(0) += 5;
 
         let outgoing = batch.into_batch();
-        let deltas: HashMap<NodeId, u64> = outgoing.size_deltas.into_iter().collect();
+        let deltas: FxHashMap<NodeId, u64> = outgoing.size_deltas.into_iter().collect();
 
         assert_eq!(deltas.get(&1), Some(&42));
         assert_eq!(deltas.get(&2), Some(&5));
@@ -787,5 +993,79 @@ mod tests {
         assert_eq!(measured, metadata.blocks().saturating_mul(512));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prefetch_budget_prefetches_all_small_directories() {
+        let budget = prefetch_budget_for_dir(128);
+
+        assert_eq!(
+            budget,
+            PrefetchBudget {
+                max_files: 128,
+                max_time: PREFETCH_SMALL_DIR_TIME_BUDGET,
+            }
+        );
+    }
+
+    #[test]
+    fn prefetch_budget_scales_up_for_large_directories() {
+        let budget = prefetch_budget_for_dir(10_000);
+
+        assert_eq!(
+            budget,
+            PrefetchBudget {
+                max_files: 10_000,
+                max_time: PREFETCH_LARGE_DIR_TIME_BUDGET,
+            }
+        );
+    }
+
+    #[test]
+    fn prefetch_budget_expands_for_huge_directories() {
+        let budget = prefetch_budget_for_dir(40_000);
+
+        assert_eq!(
+            budget,
+            PrefetchBudget {
+                max_files: 40_000,
+                max_time: PREFETCH_HUGE_DIR_TIME_BUDGET,
+            }
+        );
+    }
+
+    #[test]
+    fn prefetch_budget_caps_giant_directories() {
+        let budget = prefetch_budget_for_dir(100_000);
+
+        assert_eq!(
+            budget,
+            PrefetchBudget {
+                max_files: PREFETCH_GIANT_DIR_FILE_CAP,
+                max_time: PREFETCH_GIANT_DIR_TIME_BUDGET,
+            }
+        );
+    }
+
+    #[test]
+    fn aggregate_small_files_emits_single_virtual_node() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/root".into());
+        let mut aggregate_state = AggregateState::default();
+        let mut batch = BatchAccumulator::default();
+        let mut stats = PerfStats::default();
+
+        aggregate_state.add_file(root, 10);
+        aggregate_state.add_file(root, 20);
+        emit_aggregate_nodes(&mut tree, &mut aggregate_state, &mut batch, &mut stats);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(stats.nodes_discovered, 1);
+        assert_eq!(batch.discovered_nodes.len(), 1);
+        let aggregate = &batch.discovered_nodes[0].node;
+        assert_eq!(aggregate.kind, NodeKind::Aggregate);
+        assert_eq!(aggregate.size, 30);
+        assert!(aggregate.name.starts_with(AGGREGATE_LABEL));
     }
 }

@@ -1,8 +1,10 @@
+use lru::LruCache;
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 const FLUSH_THRESHOLD: usize = 512;
+const HOT_CACHE_CAPACITY: usize = 16_384;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -12,13 +14,16 @@ struct CacheEntry {
 
 pub struct ScanDb {
     conn: Connection,
-    hot_cache: HashMap<PathBuf, CacheEntry>,
+    hot_cache: LruCache<PathBuf, CacheEntry>,
     pending: Vec<(PathBuf, CacheEntry)>,
 }
 
 impl ScanDb {
     pub fn new(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS file_cache (
                 path TEXT PRIMARY KEY,
@@ -30,7 +35,7 @@ impl ScanDb {
 
         Ok(Self {
             conn,
-            hot_cache: HashMap::new(),
+            hot_cache: LruCache::new(NonZeroUsize::new(HOT_CACHE_CAPACITY).expect("non-zero")),
             pending: Vec::with_capacity(FLUSH_THRESHOLD),
         })
     }
@@ -54,13 +59,13 @@ impl ScanDb {
             mtime: cached_mtime,
             size,
         };
-        self.hot_cache.insert(path.to_path_buf(), entry.clone());
+        self.hot_cache.put(path.to_path_buf(), entry.clone());
         (cached_mtime == mtime).then_some(size)
     }
 
     pub fn insert(&mut self, path: &Path, size: u64, mtime: u64) -> anyhow::Result<()> {
         let entry = CacheEntry { mtime, size };
-        self.hot_cache.insert(path.to_path_buf(), entry.clone());
+        self.hot_cache.put(path.to_path_buf(), entry.clone());
         self.pending.push((path.to_path_buf(), entry));
 
         if self.pending.len() >= FLUSH_THRESHOLD {
@@ -131,6 +136,21 @@ mod tests {
         let mut db = ScanDb::new(&path).unwrap();
         assert_eq!(db.get_cached(Path::new("/tmp/a"), 1), Some(11));
         assert_eq!(db.get_cached(Path::new("/tmp/b"), 2), Some(22));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hot_cache_is_bounded() {
+        let path = temp_db_path("bounded-hot-cache");
+        let mut db = ScanDb::new(&path).unwrap();
+
+        for index in 0..(HOT_CACHE_CAPACITY + 32) {
+            let file = PathBuf::from(format!("/tmp/{index}"));
+            db.insert(&file, index as u64, 1).unwrap();
+        }
+
+        assert!(db.hot_cache.len() <= HOT_CACHE_CAPACITY);
 
         let _ = std::fs::remove_file(path);
     }

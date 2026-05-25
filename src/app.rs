@@ -4,7 +4,7 @@ use crate::scanner::{
     self, CacheMode, PerfStats, ProgressSnapshot, ScanBatch, ScanHandle, ScanMessage, ScanOptions,
 };
 use crate::tree::{NodeId, NodeKind, TreeStore};
-use crate::treemap::{layout_treemap, Camera, SearchState, VisualKind, VisualNode};
+use crate::treemap::{layout_treemap, Camera, LayoutScratch, SearchState, VisualKind, VisualNode};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
@@ -19,6 +19,7 @@ const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
 pub struct DiskMapApp {
     path_input: String,
     search_input: String,
+    initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
     tree: TreeStore,
@@ -39,6 +40,7 @@ pub struct DiskMapApp {
     back_history: Vec<NodeId>,
     forward_history: Vec<NodeId>,
     cached_visuals: Vec<VisualNode>,
+    layout_scratch: LayoutScratch,
     last_canvas_rect: Option<Rect>,
     layout_dirty: bool,
     search_dirty: bool,
@@ -63,6 +65,7 @@ impl Default for DiskMapApp {
         Self {
             path_input: dirs_home_fallback(),
             search_input: String::new(),
+            initial_scan_pending: true,
             tx,
             rx,
             tree: TreeStore::new(),
@@ -83,6 +86,7 @@ impl Default for DiskMapApp {
             back_history: Vec::new(),
             forward_history: Vec::new(),
             cached_visuals: Vec::new(),
+            layout_scratch: LayoutScratch::default(),
             last_canvas_rect: None,
             layout_dirty: true,
             search_dirty: false,
@@ -97,6 +101,10 @@ impl Default for DiskMapApp {
 
 impl eframe::App for DiskMapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.initial_scan_pending {
+            self.initial_scan_pending = false;
+            self.start_scan();
+        }
         self.handle_keyboard(ctx);
         self.handle_scan_messages();
         self.maybe_refresh_search(ctx);
@@ -128,19 +136,21 @@ impl DiskMapApp {
                 self.start_scan();
             }
 
-            if ui.button("Scan").clicked() {
-                self.start_scan();
+            let scan_button_label = if self.scanning { "Cancel" } else { "Scan" };
+            if ui.button(scan_button_label).clicked() {
+                if self.scanning {
+                    self.cancel_scan();
+                } else {
+                    self.start_scan();
+                }
             }
 
-            if ui
-                .add_enabled(!self.back_history.is_empty(), egui::Button::new("Back"))
-                .clicked()
+            if arrow_toolbar_button(ui, !self.back_history.is_empty(), ArrowDirection::Left).clicked()
             {
                 self.navigate_back();
             }
 
-            if ui
-                .add_enabled(!self.forward_history.is_empty(), egui::Button::new("Forward"))
+            if arrow_toolbar_button(ui, !self.forward_history.is_empty(), ArrowDirection::Right)
                 .clicked()
             {
                 self.navigate_forward();
@@ -191,8 +201,8 @@ impl DiskMapApp {
 
         let subject_id = self.selected_id.or(self.focused_root);
         if let Some(node_id) = subject_id {
+            let node_path = self.tree.node_real_path(node_id);
             let node = self.tree.node(node_id);
-            let node_path = self.tree.node_path(node_id);
             let root_size = self
                 .focused_root
                 .map(|root_id| self.tree.node(root_id).size.max(1))
@@ -214,7 +224,13 @@ impl DiskMapApp {
             if let Some(error) = &node.error {
                 ui.label(format!("Error: {error}"));
             }
-            ui.label(format!("Path: {}", node_path.display()));
+            ui.label(format!(
+                "Path: {}",
+                node_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Aggregated small files".to_string())
+            ));
             if !self.search_input.is_empty() {
                 ui.label(format!("Search match: {}", if matched { "yes" } else { "no" }));
                 ui.label(format!("Matches in view: {}", self.search_state.match_count()));
@@ -222,19 +238,39 @@ impl DiskMapApp {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Open").clicked() {
-                    open_path(&node_path);
+                if ui
+                    .add_enabled(node_path.is_some(), egui::Button::new("Open"))
+                    .clicked()
+                {
+                    if let Some(path) = &node_path {
+                        open_path(path);
+                    }
                 }
-                if ui.button("Reveal").clicked() {
-                    reveal_in_finder(&node_path);
+                if ui
+                    .add_enabled(node_path.is_some(), egui::Button::new("Reveal"))
+                    .clicked()
+                {
+                    if let Some(path) = &node_path {
+                        reveal_in_finder(path);
+                    }
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("Copy Path").clicked() {
-                    ui.ctx().copy_text(node_path.display().to_string());
+                if ui
+                    .add_enabled(node_path.is_some(), egui::Button::new("Copy Path"))
+                    .clicked()
+                {
+                    if let Some(path) = &node_path {
+                        ui.ctx().copy_text(path.display().to_string());
+                    }
                 }
-                if ui.button("Trash").clicked() {
-                    let _ = move_to_trash(&node_path);
+                if ui
+                    .add_enabled(node_path.is_some(), egui::Button::new("Trash"))
+                    .clicked()
+                {
+                    if let Some(path) = &node_path {
+                        let _ = move_to_trash(path);
+                    }
                 }
             });
 
@@ -314,13 +350,15 @@ impl DiskMapApp {
 
         if should_refresh_layout {
             let layout_start = Instant::now();
-            self.cached_visuals = layout_treemap(
+            layout_treemap(
                 &mut self.tree,
                 root_id,
                 available,
                 self.camera,
                 self.max_depth,
                 &self.search_state,
+                &mut self.cached_visuals,
+                &mut self.layout_scratch,
             );
             self.layout_dirty = false;
             self.last_layout_refresh = Instant::now();
@@ -385,27 +423,47 @@ impl DiskMapApp {
 
         response.context_menu(|ui| {
             if let Some(node_id) = self.context_menu_target_id {
+                let node_path = self.tree.node_real_path(node_id);
                 let node = self.tree.node(node_id);
-                let node_path = self.tree.node_path(node_id);
                 ui.set_min_width(CONTEXT_MENU_MIN_WIDTH);
                 ui.vertical(|ui| {
                     ui.label(RichText::new(truncate_middle(&node.name, CONTEXT_MENU_MAX_TITLE_CHARS)).strong());
                     ui.label(RichText::new(format_bytes(node.size)).small().weak());
                     ui.separator();
-                    if ui.button("Open").clicked() {
-                        open_path(&node_path);
+                    if ui
+                        .add_enabled(node_path.is_some(), egui::Button::new("Open"))
+                        .clicked()
+                    {
+                        if let Some(path) = &node_path {
+                            open_path(path);
+                        }
                         ui.close();
                     }
-                    if ui.button("Reveal in Finder").clicked() {
-                        reveal_in_finder(&node_path);
+                    if ui
+                        .add_enabled(node_path.is_some(), egui::Button::new("Reveal in Finder"))
+                        .clicked()
+                    {
+                        if let Some(path) = &node_path {
+                            reveal_in_finder(path);
+                        }
                         ui.close();
                     }
-                    if ui.button("Copy Path").clicked() {
-                        ui.ctx().copy_text(node_path.display().to_string());
+                    if ui
+                        .add_enabled(node_path.is_some(), egui::Button::new("Copy Path"))
+                        .clicked()
+                    {
+                        if let Some(path) = &node_path {
+                            ui.ctx().copy_text(path.display().to_string());
+                        }
                         ui.close();
                     }
-                    if ui.button("Move to Trash").clicked() {
-                        let _ = move_to_trash(&node_path);
+                    if ui
+                        .add_enabled(node_path.is_some(), egui::Button::new("Move to Trash"))
+                        .clicked()
+                    {
+                        if let Some(path) = &node_path {
+                            let _ = move_to_trash(path);
+                        }
                         ui.close();
                     }
                 });
@@ -427,9 +485,9 @@ impl DiskMapApp {
         }
     }
 
-    fn show_hover_tooltip(&self, ui: &egui::Ui, node_id: NodeId, pos: Pos2) {
+    fn show_hover_tooltip(&mut self, ui: &egui::Ui, node_id: NodeId, pos: Pos2) {
+        let node_path = self.tree.node_real_path(node_id);
         let node = self.tree.node(node_id);
-        let node_path = self.tree.node_path(node_id);
         egui::Area::new(egui::Id::new("hover_tooltip"))
             .order(egui::Order::Tooltip)
             .fixed_pos(pos + egui::vec2(16.0, 16.0))
@@ -439,7 +497,11 @@ impl DiskMapApp {
                     .show(ui, |ui| {
                         ui.label(&node.name);
                         ui.label(format_bytes(node.size));
-                        ui.label(node_path.display().to_string());
+                        if let Some(path) = &node_path {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.label("Aggregated small files");
+                        }
                         if let Some(error) = &node.error {
                             ui.label(error);
                         }
@@ -538,6 +600,7 @@ impl DiskMapApp {
                     self.status = format!("Scanning {}", path.display());
                     self.tree.clear();
                     self.tree.push_node(None, root_node);
+                    self.tree.set_root_path(path);
                     self.focused_root = self.tree.root;
                     self.layout_dirty = true;
                     self.mark_search_dirty();
@@ -553,6 +616,7 @@ impl DiskMapApp {
                     ..
                 } => {
                     self.scanning = false;
+                    self.scan_handle = None;
                     self.merge_scan_perf_stats(perf_stats);
                     self.prune_invalid_selection();
                     self.refresh_search_matches();
@@ -563,6 +627,7 @@ impl DiskMapApp {
                 }
                 ScanMessage::Cancelled { perf_stats, .. } => {
                     self.scanning = false;
+                    self.scan_handle = None;
                     self.merge_scan_perf_stats(perf_stats);
                     self.status = "Scan cancelled".to_string();
                     self.pending_repaint = true;
@@ -574,6 +639,7 @@ impl DiskMapApp {
                     ..
                 } => {
                     self.scanning = false;
+                    self.scan_handle = None;
                     self.merge_scan_perf_stats(perf_stats);
                     self.status = format!("Error: {message}");
                     self.pending_repaint = true;
@@ -620,6 +686,14 @@ impl DiskMapApp {
 
         dirty_nodes.sort_unstable();
         dirty_nodes.dedup();
+        let visible_dirty_nodes: Vec<NodeId> = dirty_nodes
+            .iter()
+            .copied()
+            .filter(|&node_id| self.batch_touches_visible_subtree(node_id))
+            .collect();
+        if !visible_dirty_nodes.is_empty() {
+            self.tree.repair_sorted_children(&visible_dirty_nodes);
+        }
         let touched_visible_subtree = dirty_nodes
             .iter()
             .copied()
@@ -658,11 +732,17 @@ impl DiskMapApp {
         self.perf_stats.batches_sent = perf_stats.batches_sent;
         self.perf_stats.entries_seen = perf_stats.entries_seen;
         self.perf_stats.nodes_discovered = perf_stats.nodes_discovered;
+        self.perf_stats.files_scanned = perf_stats.files_scanned;
+        self.perf_stats.dirs_scanned = perf_stats.dirs_scanned;
         self.perf_stats.size_delta_merges = perf_stats.size_delta_merges;
+        self.perf_stats.ancestor_size_delta_total_ms = perf_stats.ancestor_size_delta_total_ms;
         self.perf_stats.parent_stack_hits = perf_stats.parent_stack_hits;
         self.perf_stats.parent_lookup_fallbacks = perf_stats.parent_lookup_fallbacks;
         self.perf_stats.progress_snapshots_sent = perf_stats.progress_snapshots_sent;
+        self.perf_stats.prefetched_files = perf_stats.prefetched_files;
+        self.perf_stats.metadata_fallback_files = perf_stats.metadata_fallback_files;
         self.perf_stats.metadata_total_ms = perf_stats.metadata_total_ms;
+        self.perf_stats.mtime_total_ms = perf_stats.mtime_total_ms;
         self.perf_stats.size_measure_total_ms = perf_stats.size_measure_total_ms;
         self.perf_stats.batch_flush_total_ms = perf_stats.batch_flush_total_ms;
         self.perf_stats.scan_elapsed_ms = perf_stats.scan_elapsed_ms;
@@ -707,6 +787,14 @@ impl DiskMapApp {
         self.breadcrumb_cache.clear();
         self.pending_repaint = true;
         self.perf_stats = PerfStats::default();
+    }
+
+    fn cancel_scan(&mut self) {
+        if let Some(handle) = &self.scan_handle {
+            handle.cancel();
+            self.status = "Cancelling scan...".to_string();
+            self.pending_repaint = true;
+        }
     }
 
     fn enter_root(&mut self, node_id: NodeId, push_history: bool) {
@@ -942,7 +1030,90 @@ fn describe_node_kind(kind: NodeKind, has_children: bool) -> &'static str {
         NodeKind::File => "File",
         NodeKind::Symlink => "Symlink",
         NodeKind::Error => "Error entry",
+        NodeKind::Aggregate => "Aggregated files",
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArrowDirection {
+    Left,
+    Right,
+}
+
+fn arrow_toolbar_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    direction: ArrowDirection,
+) -> egui::Response {
+    let desired_size = Vec2::new(28.0, 24.0);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(desired_size, sense);
+    let visuals = ui.style().interact(&response);
+    let fill = if enabled {
+        visuals.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.weak_bg_fill
+    };
+    let stroke = if enabled {
+        visuals.bg_stroke
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke
+    };
+    ui.painter()
+        .rect(rect, visuals.corner_radius, fill, stroke, egui::StrokeKind::Inside);
+
+    let arrow_stroke = if enabled {
+        visuals.fg_stroke
+    } else {
+        Stroke::new(
+            ui.visuals().widgets.inactive.fg_stroke.width,
+            ui.visuals().weak_text_color(),
+        )
+    };
+    paint_arrow_icon(ui.painter(), rect, direction, arrow_stroke);
+
+    response
+}
+
+fn paint_arrow_icon(
+    painter: &egui::Painter,
+    rect: Rect,
+    direction: ArrowDirection,
+    stroke: Stroke,
+) {
+    let center = rect.center();
+    let shaft_half = 5.5;
+    let head = 4.0;
+    let (start, end, tip_a, tip_b) = match direction {
+        ArrowDirection::Left => {
+            let tip = Pos2::new(center.x - shaft_half, center.y);
+            let tail = Pos2::new(center.x + shaft_half, center.y);
+            (
+                tail,
+                tip,
+                Pos2::new(tip.x + head, tip.y - head),
+                Pos2::new(tip.x + head, tip.y + head),
+            )
+        }
+        ArrowDirection::Right => {
+            let tail = Pos2::new(center.x - shaft_half, center.y);
+            let tip = Pos2::new(center.x + shaft_half, center.y);
+            (
+                tail,
+                tip,
+                Pos2::new(tip.x - head, tip.y - head),
+                Pos2::new(tip.x - head, tip.y + head),
+            )
+        }
+    };
+
+    painter.line_segment([start, end], stroke);
+    painter.line_segment([end, tip_a], stroke);
+    painter.line_segment([end, tip_b], stroke);
 }
 
 fn dirs_home_fallback() -> String {
@@ -971,17 +1142,23 @@ fn truncate_middle(input: &str, max_chars: usize) -> String {
 
 fn format_perf_stats(stats: &PerfStats) -> String {
     format!(
-        "perf: messages={} batches={} entries={} nodes={} size_merges={} parent_stack_hits={} parent_fallbacks={} progress_snapshots={} scan_ms={:.2} metadata_ms={:.2} size_ms={:.2} flush_ms={:.2} layouts={} layout_ms={:.2} search_rebuilds={} search_incremental={} db_hits={} db_misses={} db_flushes={}",
+        "perf: messages={} batches={} entries={} nodes={} files={} dirs={} size_merges={} ancestor_delta_ms={:.2} parent_stack_hits={} parent_fallbacks={} progress_snapshots={} prefetched_files={} metadata_fallback_files={} scan_ms={:.2} metadata_ms={:.2} mtime_ms={:.2} size_ms={:.2} flush_ms={:.2} layouts={} layout_ms={:.2} search_rebuilds={} search_incremental={} db_hits={} db_misses={} db_flushes={}",
         stats.messages_sent,
         stats.batches_sent,
         stats.entries_seen,
         stats.nodes_discovered,
+        stats.files_scanned,
+        stats.dirs_scanned,
         stats.size_delta_merges,
+        stats.ancestor_size_delta_total_ms,
         stats.parent_stack_hits,
         stats.parent_lookup_fallbacks,
         stats.progress_snapshots_sent,
+        stats.prefetched_files,
+        stats.metadata_fallback_files,
         stats.scan_elapsed_ms,
         stats.metadata_total_ms,
+        stats.mtime_total_ms,
         stats.size_measure_total_ms,
         stats.batch_flush_total_ms,
         stats.layout_recompute_count,
@@ -1004,7 +1181,7 @@ mod tests {
         ScanMessage::Started {
             scan_id,
             path: "/root".into(),
-            root_node: TreeStore::root_record("/root".into(), "root".into()),
+            root_node: TreeStore::root_record("root".into()),
         }
     }
 
@@ -1023,7 +1200,6 @@ mod tests {
                     parent_id: 0,
                     node: NodeRecord {
                         name: "child".into(),
-                        path: "/root/child".into(),
                         kind: NodeKind::File,
                         size: 5,
                         scanned: false,
@@ -1067,7 +1243,6 @@ mod tests {
                     parent_id: 0,
                     node: NodeRecord {
                         name: "old".into(),
-                        path: "/root/old".into(),
                         kind: NodeKind::File,
                         size: 1,
                         scanned: true,
@@ -1098,7 +1273,6 @@ mod tests {
                     parent_id: 0,
                     node: NodeRecord {
                         name: "match-me".into(),
-                        path: "/root/match-me".into(),
                         kind: NodeKind::File,
                         size: 1,
                         scanned: true,

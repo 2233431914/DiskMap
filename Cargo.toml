@@ -20,6 +20,10 @@ serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 notify = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
+fixedbitset = "0.5"
+rustc-hash = "2"
+smallvec = "1"
+lru = "0.12"
 
 [dev-dependencies]
 criterion = "0.5"
