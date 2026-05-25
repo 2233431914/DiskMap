@@ -8,57 +8,195 @@ use crate::treemap::{layout_treemap, Camera, LayoutScratch, SearchState, VisualK
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
-use egui::{Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{
+    Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme,
+    Vec2,
+};
 use std::time::{Duration, Instant};
 
 const SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
 const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
-const SURFACE_BG: Color32 = Color32::from_rgb(24, 24, 24);
-const PANEL_BG: Color32 = Color32::from_rgb(32, 32, 32);
-const PANEL_BG_ELEVATED: Color32 = Color32::from_rgb(38, 38, 38);
-const PANEL_STROKE: Color32 = Color32::from_rgb(64, 64, 64);
-const PANEL_STROKE_STRONG: Color32 = Color32::from_rgb(92, 92, 92);
-const ACCENT: Color32 = Color32::from_rgb(76, 132, 196);
-const ACCENT_WARM: Color32 = Color32::from_rgb(214, 176, 88);
-const DANGER: Color32 = Color32::from_rgb(190, 92, 92);
-const TEXT_MUTED: Color32 = Color32::from_rgb(170, 170, 170);
+
+#[derive(Clone, Copy)]
+struct Palette {
+    surface: Color32,
+    panel: Color32,
+    panel_elevated: Color32,
+    text: Color32,
+    text_muted: Color32,
+    text_faint: Color32,
+    accent: Color32,
+    accent_soft: Color32,
+    danger: Color32,
+    stroke_subtle: Color32,
+    stroke_strong: Color32,
+    dir_palette: [Color32; 5],
+    file_neutral: Color32,
+    shadow_color: Color32,
+}
+
+const DARK_PALETTE: Palette = Palette {
+    surface: Color32::from_rgb(0x0F, 0x0F, 0x12),
+    panel: Color32::from_rgb(0x18, 0x18, 0x1B),
+    panel_elevated: Color32::from_rgb(0x23, 0x23, 0x28),
+    text: Color32::from_rgb(0xEC, 0xEC, 0xF1),
+    text_muted: Color32::from_rgb(0xA1, 0xA1, 0xAA),
+    text_faint: Color32::from_rgb(0x71, 0x71, 0x7A),
+    accent: Color32::from_rgb(0x81, 0x8C, 0xF8),
+    accent_soft: Color32::from_rgba_premultiplied(0x33, 0x38, 0x60, 60),
+    danger: Color32::from_rgb(0xF8, 0x71, 0x71),
+    stroke_subtle: Color32::from_rgba_premultiplied(14, 14, 14, 14),
+    stroke_strong: Color32::from_rgba_premultiplied(32, 32, 32, 32),
+    dir_palette: [
+        Color32::from_rgb(0x3B, 0x3F, 0x5C),
+        Color32::from_rgb(0x3D, 0x5A, 0x4F),
+        Color32::from_rgb(0x5A, 0x4A, 0x3A),
+        Color32::from_rgb(0x4A, 0x3A, 0x5A),
+        Color32::from_rgb(0x3A, 0x4D, 0x5A),
+    ],
+    file_neutral: Color32::from_rgb(0x48, 0x48, 0x4A),
+    shadow_color: Color32::from_black_alpha(160),
+};
+
+const LIGHT_PALETTE: Palette = Palette {
+    surface: Color32::from_rgb(0xF8, 0xF8, 0xFB),
+    panel: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    panel_elevated: Color32::from_rgb(0xF1, 0xF1, 0xF4),
+    text: Color32::from_rgb(0x18, 0x18, 0x1B),
+    text_muted: Color32::from_rgb(0x52, 0x52, 0x5B),
+    text_faint: Color32::from_rgb(0xA1, 0xA1, 0xAA),
+    accent: Color32::from_rgb(0x63, 0x66, 0xF1),
+    accent_soft: Color32::from_rgba_premultiplied(0x14, 0x15, 0x33, 38),
+    danger: Color32::from_rgb(0xDC, 0x26, 0x26),
+    stroke_subtle: Color32::from_rgba_premultiplied(0, 0, 0, 12),
+    stroke_strong: Color32::from_rgba_premultiplied(0, 0, 0, 26),
+    dir_palette: [
+        Color32::from_rgb(0xC8, 0xCC, 0xE0),
+        Color32::from_rgb(0xCC, 0xE0, 0xD4),
+        Color32::from_rgb(0xE0, 0xD0, 0xBC),
+        Color32::from_rgb(0xD8, 0xC8, 0xE0),
+        Color32::from_rgb(0xC8, 0xD4, 0xE0),
+    ],
+    file_neutral: Color32::from_rgb(0xD2, 0xD2, 0xD7),
+    shadow_color: Color32::from_black_alpha(48),
+};
+
+fn palette_for(theme: Theme) -> &'static Palette {
+    match theme {
+        Theme::Dark => &DARK_PALETTE,
+        Theme::Light => &LIGHT_PALETTE,
+    }
+}
+
+fn palette(ctx: &egui::Context) -> &'static Palette {
+    palette_for(ctx.theme())
+}
+
+fn pick_label_color(bg: Color32) -> Color32 {
+    let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if luma < 140.0 {
+        Color32::from_rgb(245, 245, 250)
+    } else {
+        Color32::from_rgb(20, 20, 24)
+    }
+}
 
 pub fn configure_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = SURFACE_BG;
-    visuals.window_fill = SURFACE_BG;
-    visuals.extreme_bg_color = Color32::from_rgb(20, 20, 20);
-    visuals.faint_bg_color = PANEL_BG;
-    visuals.override_text_color = Some(Color32::from_rgb(230, 230, 230));
-    visuals.widgets.noninteractive.bg_fill = PANEL_BG;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, PANEL_STROKE);
-    visuals.widgets.inactive.bg_fill = PANEL_BG;
-    visuals.widgets.inactive.weak_bg_fill = PANEL_BG_ELEVATED;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, PANEL_STROKE);
-    visuals.widgets.hovered.bg_fill = PANEL_BG_ELEVATED;
-    visuals.widgets.hovered.weak_bg_fill = PANEL_BG_ELEVATED;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, PANEL_STROKE_STRONG);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(48, 48, 48);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(48, 48, 48);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    visuals.selection.bg_fill = Color32::from_rgb(62, 98, 142);
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.hyperlink_color = ACCENT;
-    visuals.widgets.open.bg_fill = PANEL_BG_ELEVATED;
-    ctx.set_visuals(visuals);
+    ctx.set_visuals_of(Theme::Light, build_visuals(&LIGHT_PALETTE, false));
+    ctx.set_visuals_of(Theme::Dark, build_visuals(&DARK_PALETTE, true));
 
     let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(8.0, 6.0);
-    style.spacing.menu_margin = egui::Margin::same(8);
-    style.spacing.window_margin = egui::Margin::same(10);
-    style.text_styles.insert(egui::TextStyle::Heading, FontId::proportional(20.0));
-    style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(14.0));
-    style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(14.0));
-    style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(12.0));
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.menu_margin = Margin::same(10);
+    style.spacing.window_margin = Margin::same(14);
+    style.spacing.indent = 16.0;
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, FontId::proportional(18.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, FontId::proportional(11.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, FontId::monospace(12.0));
     ctx.set_global_style(style);
+}
+
+fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
+    let mut visuals = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.panel_fill = p.panel;
+    visuals.window_fill = p.panel;
+    visuals.extreme_bg_color = p.surface;
+    visuals.faint_bg_color = p.panel_elevated;
+    visuals.override_text_color = Some(p.text);
+
+    let radius = CornerRadius::same(6);
+    let widgets = &mut visuals.widgets;
+
+    widgets.noninteractive.bg_fill = p.panel;
+    widgets.noninteractive.weak_bg_fill = p.panel;
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.stroke_subtle);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    widgets.noninteractive.corner_radius = radius;
+
+    widgets.inactive.bg_fill = p.panel_elevated;
+    widgets.inactive.weak_bg_fill = p.panel_elevated;
+    widgets.inactive.bg_stroke = Stroke::new(1.0, p.stroke_subtle);
+    widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);
+    widgets.inactive.corner_radius = radius;
+
+    widgets.hovered.bg_fill = p.panel_elevated;
+    widgets.hovered.weak_bg_fill = p.panel_elevated;
+    widgets.hovered.bg_stroke = Stroke::new(1.0, p.stroke_strong);
+    widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
+    widgets.hovered.corner_radius = radius;
+
+    widgets.active.bg_fill = p.accent_soft;
+    widgets.active.weak_bg_fill = p.accent_soft;
+    widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
+    widgets.active.fg_stroke = Stroke::new(1.0, p.text);
+    widgets.active.corner_radius = radius;
+
+    widgets.open.bg_fill = p.panel_elevated;
+    widgets.open.weak_bg_fill = p.panel_elevated;
+    widgets.open.bg_stroke = Stroke::new(1.0, p.stroke_strong);
+    widgets.open.fg_stroke = Stroke::new(1.0, p.text);
+    widgets.open.corner_radius = radius;
+
+    visuals.selection.bg_fill = p.accent_soft;
+    visuals.selection.stroke = Stroke::new(1.0, p.accent);
+    visuals.hyperlink_color = p.accent;
+
+    visuals.window_corner_radius = CornerRadius::same(10);
+    visuals.menu_corner_radius = CornerRadius::same(10);
+
+    visuals.popup_shadow = Shadow {
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
+        color: p.shadow_color,
+    };
+    visuals.window_shadow = Shadow {
+        offset: [0, 2],
+        blur: 12,
+        spread: 0,
+        color: p.shadow_color,
+    };
+
+    visuals
 }
 
 pub struct DiskMapApp {
@@ -162,8 +300,15 @@ impl eframe::App for DiskMapApp {
         });
 
         egui::Panel::right("details_panel")
+            .resizable(true)
             .default_size(280.0)
+            .min_size(260.0)
+            .max_size(340.0)
             .show_inside(ui, |ui| self.show_details_panel(ui));
+
+        egui::Panel::bottom("status_bar")
+            .exact_size(28.0)
+            .show_inside(ui, |ui| self.show_status_bar(ui));
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.show_treemap(ui);
@@ -174,38 +319,22 @@ impl eframe::App for DiskMapApp {
 impl DiskMapApp {
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Path:");
-            let path_width = ui.available_width().clamp(260.0, 360.0);
-            let path_edit = ui.add_sized(
-                [path_width, 28.0],
-                egui::TextEdit::singleline(&mut self.path_input),
-            );
-            if path_edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                self.start_scan();
-            }
-
-            let scan_button_label = if self.scanning { "Cancel" } else { "Scan" };
-            if ui.button(scan_button_label).clicked() {
-                if self.scanning {
-                    self.cancel_scan();
-                } else {
-                    self.start_scan();
-                }
-            }
-
-            if arrow_toolbar_button(ui, !self.back_history.is_empty(), ArrowDirection::Left).clicked()
+            if icon_button(ui, !self.back_history.is_empty(), ToolbarIcon::ArrowLeft)
+                .on_hover_text("Back")
+                .clicked()
             {
                 self.navigate_back();
             }
 
-            if arrow_toolbar_button(ui, !self.forward_history.is_empty(), ArrowDirection::Right)
+            if icon_button(ui, !self.forward_history.is_empty(), ToolbarIcon::ArrowRight)
+                .on_hover_text("Forward")
                 .clicked()
             {
                 self.navigate_forward();
             }
 
-            if ui
-                .add_enabled(self.parent_of_focused_root().is_some(), egui::Button::new("Up"))
+            if icon_button(ui, self.parent_of_focused_root().is_some(), ToolbarIcon::Up)
+                .on_hover_text("Up to parent directory")
                 .clicked()
             {
                 if let Some(parent) = self.parent_of_focused_root() {
@@ -213,29 +342,70 @@ impl DiskMapApp {
                 }
             }
 
-            if ui.button("Reset View").clicked() {
+            if icon_button(ui, true, ToolbarIcon::Refresh)
+                .on_hover_text("Reset view")
+                .clicked()
+            {
                 self.reset_camera();
             }
 
-            ui.separator();
-            ui.label("Search:");
+            ui.add_space(4.0);
+
+            let path_width = ui.available_width().clamp(220.0, 420.0) - 280.0;
+            let path_width = path_width.max(200.0);
+            let path_edit = ui.add_sized(
+                [path_width, 28.0],
+                egui::TextEdit::singleline(&mut self.path_input).hint_text("/path/to/scan"),
+            );
+            if path_edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.start_scan();
+            }
+
+            let scan_label = if self.scanning { "Cancel" } else { "Scan" };
             if ui
-                .add_sized([180.0, 28.0], egui::TextEdit::singleline(&mut self.search_input))
-                .changed()
+                .add_sized([72.0, 28.0], egui::Button::new(scan_label))
+                .clicked()
             {
+                if self.scanning {
+                    self.cancel_scan();
+                } else {
+                    self.start_scan();
+                }
+            }
+
+            ui.add_space(6.0);
+
+            let search_response = ui.add_sized(
+                [180.0, 28.0],
+                egui::TextEdit::singleline(&mut self.search_input)
+                    .hint_text("Search files & folders"),
+            );
+            if search_response.changed() {
                 self.mark_search_dirty();
             }
-            if !self.search_input.is_empty() && ui.button("Clear").clicked() {
+            if !self.search_input.is_empty()
+                && icon_button(ui, true, ToolbarIcon::Close)
+                    .on_hover_text("Clear search")
+                    .clicked()
+            {
                 self.search_input.clear();
                 self.search_state.clear(self.tree.len());
                 self.search_dirty = false;
                 self.layout_dirty = true;
             }
 
-            ui.separator();
-            ui.label("Depth:");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("DEPTH")
+                    .size(10.0)
+                    .color(palette(ui.ctx()).text_faint)
+                    .strong(),
+            );
             if ui
-                .add_sized([96.0, 18.0], egui::Slider::new(&mut self.max_depth, 1..=10).text(""))
+                .add_sized(
+                    [96.0, 18.0],
+                    egui::Slider::new(&mut self.max_depth, 1..=10).text(""),
+                )
                 .changed()
             {
                 self.layout_dirty = true;
@@ -244,122 +414,319 @@ impl DiskMapApp {
                     .unwrap_or_else(Instant::now);
             }
 
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme_cycle_button(ui);
+            });
         });
     }
 
     fn show_details_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Details");
-        ui.separator();
+        let p = palette(ui.ctx());
+        ui.add_space(4.0);
+        ui.label(RichText::new("DETAILS").size(11.0).strong().color(p.text_muted));
+        ui.add_space(2.0);
+        section_divider(ui, p);
+        ui.add_space(8.0);
 
         let subject_id = self.selected_id.or(self.focused_root);
-        if let Some(node_id) = subject_id {
-            let node_path = self.tree.node_real_path(node_id);
+        let Some(node_id) = subject_id else {
+            ui.label(
+                RichText::new("Run a scan to populate the treemap.")
+                    .color(p.text_muted),
+            );
+            self.show_progress_section(ui, p);
+            self.show_search_section(ui, p);
+            return;
+        };
+
+        let node_path = self.tree.node_real_path(node_id);
+        let (
+            node_name,
+            node_size,
+            node_kind,
+            child_count,
+            node_scanned,
+            node_error,
+            node_parent,
+        ) = {
             let node = self.tree.node(node_id);
-            let matched = self.search_state.is_match(node_id);
-            ui.label(format!("Name: {}", node.name));
-            ui.label(format!("Size: {}", format_bytes(node.size)));
-            ui.label(format!(
-                "Type: {}",
-                describe_node_kind(node.kind, !node.children.is_empty())
-            ));
-            ui.label(format!(
-                "Scanned: {}",
-                if node.scanned { "yes" } else { "in progress" }
-            ));
-            if !self.search_input.is_empty() {
-                ui.label(format!(
-                    "Search match: {}",
-                    if matched { "yes" } else { "no" }
-                ));
+            (
+                node.name.clone(),
+                node.size,
+                node.kind,
+                node.children.len(),
+                node.scanned,
+                node.error.clone(),
+                node.parent,
+            )
+        };
+        let parent_size = node_parent.map(|pid| self.tree.node(pid).size);
+        let parent_fraction = parent_size.and_then(|s| {
+            if s > 0 {
+                Some((node_size as f64 / s as f64).min(1.0) as f32)
+            } else {
+                None
             }
-            let path_text = node_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "Aggregated small files".to_string());
-            ui.label(format!("Path: {path_text}"));
-            if let Some(error) = &node.error {
-                ui.colored_label(DANGER, format!("Error: {error}"));
-            }
+        });
+        let matched = self.search_state.is_match(node_id);
+        let kind_label = describe_node_kind(node_kind, child_count > 0);
 
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(node_path.is_some(), egui::Button::new("Open"))
-                    .clicked()
-                {
-                    if let Some(path) = &node_path {
-                        open_path(path);
+        egui::Frame::new()
+            .fill(p.panel_elevated)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(12))
+            .stroke(Stroke::new(1.0, p.stroke_subtle))
+            .show(ui, |ui| {
+                ui.label(RichText::new(&node_name).strong().size(14.0).color(p.text));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format_bytes(node_size))
+                            .monospace()
+                            .color(p.accent),
+                    );
+                    if let Some(frac) = parent_fraction {
+                        ui.add_space(6.0);
+                        mini_bar(ui, frac, p);
+                        ui.label(
+                            RichText::new(format!("{:.0}% of parent", frac * 100.0))
+                                .small()
+                                .color(p.text_muted),
+                        );
                     }
-                }
-                if ui
-                    .add_enabled(node_path.is_some(), egui::Button::new("Reveal"))
-                    .clicked()
-                {
-                    if let Some(path) = &node_path {
-                        reveal_in_finder(path);
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(node_path.is_some(), egui::Button::new("Copy Path"))
-                    .clicked()
-                {
-                    if let Some(path) = &node_path {
-                        ui.ctx().copy_text(path.display().to_string());
-                    }
-                }
-                if ui
-                    .add_enabled(node_path.is_some(), egui::Button::new("Trash"))
-                    .clicked()
-                {
-                    if let Some(path) = &node_path {
-                        let _ = move_to_trash(path);
-                    }
-                }
-            });
-
-            if let Some(parent) = node.parent {
-                ui.separator();
-                let parent_name = self.tree.node(parent).name.clone();
-                if ui.button(format!("Parent: {parent_name}")).clicked() {
-                    self.selected_id = Some(parent);
-                }
-            }
-
-        } else {
-            ui.label("Run a scan to populate the treemap.");
-        }
-
-        if let Some(progress) = &self.progress_summary {
-            ui.separator();
-            ui.heading("Scan");
-            ui.label(format!("Files: {}", progress.files_scanned));
-            ui.label(format!("Dirs: {}", progress.dirs_scanned));
-            ui.label(format!("Seen: {}", format_bytes(progress.bytes_seen)));
-        }
-
-        if !self.search_input.trim().is_empty() {
-            ui.separator();
-            ui.heading("Search");
-            ui.label(format!("Query: {}", self.search_input.trim()));
-            ui.label(format!("Matches in view: {}", self.search_state.match_count()));
-            ui.label(format!(
-                "Status: {}",
-                if self.search_dirty {
-                    "Updating..."
+                });
+                ui.add_space(4.0);
+                let meta = if child_count > 0 {
+                    format!("{kind_label} · {} items", child_count)
                 } else {
-                    "Ready"
+                    kind_label.to_string()
+                };
+                ui.label(RichText::new(meta).small().color(p.text_muted));
+                if !node_scanned {
+                    ui.label(
+                        RichText::new("Scanning in progress…")
+                            .small()
+                            .color(p.accent),
+                    );
                 }
-            ));
+                if !self.search_input.trim().is_empty() {
+                    let (txt, color) = if matched {
+                        ("Matches search", p.accent)
+                    } else {
+                        ("No search match", p.text_faint)
+                    };
+                    ui.label(RichText::new(txt).small().color(color));
+                }
+                if let Some(path) = &node_path {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(path.display().to_string())
+                                .monospace()
+                                .small()
+                                .color(p.text_faint),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
+
+        if let Some(err) = &node_error {
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(p.danger.r(), p.danger.g(), p.danger.b(), 28))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(format!("Error: {err}")).color(p.danger));
+                });
         }
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("PRIMARY").size(10.0).strong().color(p.text_faint));
+        ui.add_space(4.0);
+        let path_available = node_path.is_some();
+        ui.columns(2, |cols| {
+            let w0 = cols[0].available_width();
+            if accent_button(&mut cols[0], "Open", path_available, w0, p).clicked() {
+                if let Some(path) = &node_path {
+                    open_path(path);
+                }
+            }
+            let w1 = cols[1].available_width();
+            if cols[1]
+                .add_enabled(
+                    path_available,
+                    egui::Button::new("Reveal").min_size(Vec2::new(w1, 32.0)),
+                )
+                .clicked()
+            {
+                if let Some(path) = &node_path {
+                    reveal_in_finder(path);
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("UTILITY").size(10.0).strong().color(p.text_faint));
+        ui.add_space(4.0);
+        ui.columns(2, |cols| {
+            let w0 = cols[0].available_width();
+            if cols[0]
+                .add_enabled(
+                    path_available,
+                    egui::Button::new("Copy Path").min_size(Vec2::new(w0, 28.0)),
+                )
+                .clicked()
+            {
+                if let Some(path) = &node_path {
+                    cols[0].ctx().copy_text(path.display().to_string());
+                }
+            }
+            let w1 = cols[1].available_width();
+            if cols[1]
+                .add_enabled(
+                    path_available,
+                    egui::Button::new(RichText::new("Move to Trash").color(p.danger))
+                        .min_size(Vec2::new(w1, 28.0)),
+                )
+                .clicked()
+            {
+                if let Some(path) = &node_path {
+                    let _ = move_to_trash(path);
+                }
+            }
+        });
+
+        if let Some(parent) = node_parent {
+            ui.add_space(10.0);
+            ui.label(RichText::new("PARENT").size(10.0).strong().color(p.text_faint));
+            ui.add_space(4.0);
+            let parent_name = self.tree.node(parent).name.clone();
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(format!("↑ {parent_name}")).color(p.text))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, p.stroke_subtle)),
+                )
+                .clicked()
+            {
+                self.selected_id = Some(parent);
+            }
+        }
+
+        self.show_progress_section(ui, p);
+        self.show_search_section(ui, p);
+    }
+
+    fn show_progress_section(&self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(progress) = &self.progress_summary else {
+            return;
+        };
+        ui.add_space(12.0);
+        ui.label(RichText::new("SCAN").size(10.0).strong().color(p.text_faint));
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "{} files · {} dirs",
+                progress.files_scanned, progress.dirs_scanned
+            ))
+            .small()
+            .color(p.text_muted),
+        );
+        ui.label(
+            RichText::new(format_bytes(progress.bytes_seen))
+                .monospace()
+                .color(p.text),
+        );
+    }
+
+    fn show_search_section(&self, ui: &mut egui::Ui, p: &Palette) {
+        let query = self.search_input.trim();
+        if query.is_empty() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("SEARCH").size(10.0).strong().color(p.text_faint));
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("Query: {query}"))
+                .small()
+                .color(p.text_muted),
+        );
+        ui.label(
+            RichText::new(format!(
+                "{} matches · {}",
+                self.search_state.match_count(),
+                if self.search_dirty { "Updating…" } else { "Ready" }
+            ))
+            .small()
+            .color(if self.search_dirty { p.accent } else { p.text_muted }),
+        );
+    }
+
+    fn show_status_bar(&self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
+        let full_rect = ui.max_rect();
+        ui.painter().line_segment(
+            [full_rect.left_top(), full_rect.right_top()],
+            Stroke::new(1.0, p.stroke_subtle),
+        );
+
+        ui.horizontal_centered(|ui| {
+            ui.add_space(4.0);
+            let dot_color = if self.status.starts_with("Error") {
+                p.danger
+            } else if self.scanning {
+                p.accent
+            } else if self.status.starts_with("Cancel") {
+                p.text_faint
+            } else {
+                Color32::from_rgb(0x4A, 0xC4, 0x7A)
+            };
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+            ui.label(
+                RichText::new(&self.status)
+                    .size(11.5)
+                    .color(p.text_muted),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if !self.breadcrumb_cache.is_empty() {
+                    let crumb = self.breadcrumb_cache.replace(" / ", " › ");
+                    let display = truncate_middle(&crumb, 60);
+                    ui.label(
+                        RichText::new(display)
+                            .size(11.5)
+                            .monospace()
+                            .color(p.text_faint),
+                    );
+                }
+
+                if let Some(progress) = &self.progress_summary {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("│").size(11.0).color(p.text_faint));
+                    ui.add_space(10.0);
+                    let text = format!(
+                        "{} files · {} dirs · {}",
+                        progress.files_scanned,
+                        progress.dirs_scanned,
+                        format_bytes(progress.bytes_seen)
+                    );
+                    ui.label(RichText::new(text).size(11.5).color(p.text_muted));
+                }
+            });
+        });
     }
 
     fn show_treemap(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
         let available = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(available, Sense::click_and_drag());
         let painter = ui.painter_at(available);
-        painter.rect_filled(available, 0.0, Color32::from_rgb(18, 18, 18));
+        painter.rect_filled(available, 0.0, p.surface);
 
         let Some(root_id) = self.focused_root else {
             painter.text(
@@ -367,7 +734,7 @@ impl DiskMapApp {
                 egui::Align2::CENTER_CENTER,
                 "Input path and click Scan",
                 egui::TextStyle::Heading.resolve(ui.style()),
-                Color32::LIGHT_GRAY,
+                p.text_faint,
             );
             return;
         };
@@ -457,12 +824,22 @@ impl DiskMapApp {
 
         response.context_menu(|ui| {
             if let Some(node_id) = self.context_menu_target_id {
+                let p = palette(ui.ctx());
                 let node_path = self.tree.node_real_path(node_id);
                 let node = self.tree.node(node_id);
                 ui.set_min_width(CONTEXT_MENU_MIN_WIDTH);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(truncate_middle(&node.name, CONTEXT_MENU_MAX_TITLE_CHARS)).strong());
-                    ui.label(RichText::new(format_bytes(node.size)).small().weak());
+                    ui.label(
+                        RichText::new(truncate_middle(&node.name, CONTEXT_MENU_MAX_TITLE_CHARS))
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.label(
+                        RichText::new(format_bytes(node.size))
+                            .small()
+                            .monospace()
+                            .color(p.text_muted),
+                    );
                     ui.separator();
                     if ui
                         .add_enabled(node_path.is_some(), egui::Button::new("Open"))
@@ -492,7 +869,10 @@ impl DiskMapApp {
                         ui.close();
                     }
                     if ui
-                        .add_enabled(node_path.is_some(), egui::Button::new("Move to Trash"))
+                        .add_enabled(
+                            node_path.is_some(),
+                            egui::Button::new(RichText::new("Move to Trash").color(p.danger)),
+                        )
                         .clicked()
                     {
                         if let Some(path) = &node_path {
@@ -520,6 +900,7 @@ impl DiskMapApp {
     }
 
     fn show_hover_tooltip(&mut self, ui: &egui::Ui, node_id: NodeId, pos: Pos2) {
+        let p = palette(ui.ctx());
         let node_path = self.tree.node_real_path(node_id);
         let node = self.tree.node(node_id);
         egui::Area::new(egui::Id::new("hover_tooltip"))
@@ -527,38 +908,88 @@ impl DiskMapApp {
             .fixed_pos(pos + egui::vec2(16.0, 16.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::default()
-                    .fill(PANEL_BG_ELEVATED)
-                    .stroke(Stroke::new(1.0, PANEL_STROKE))
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::same(10))
+                    .fill(p.panel_elevated)
+                    .stroke(Stroke::new(1.0, p.stroke_subtle))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(10))
+                    .shadow(ui.visuals().popup_shadow)
                     .show(ui, |ui| {
-                        ui.label(RichText::new(&node.name).strong());
-                        ui.label(RichText::new(format_bytes(node.size)).color(ACCENT_WARM));
-                        if let Some(path) = &node_path {
-                            ui.label(RichText::new(path.display().to_string()).small().monospace());
-                        } else {
-                            ui.label(RichText::new("Aggregated small files").small().color(TEXT_MUTED));
-                        }
-                        if let Some(error) = &node.error {
-                            ui.label(RichText::new(error).small().color(DANGER));
-                        }
+                        ui.set_max_width(260.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+
+                        ui.horizontal(|ui| {
+                            let dot_color = if node.scanned {
+                                p.text_faint
+                            } else {
+                                p.accent
+                            };
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::splat(8.0),
+                                Sense::hover(),
+                            );
+                            ui.painter().circle_filled(rect.center(), 3.0, dot_color);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&node.name).strong().color(p.text),
+                                )
+                                .truncate(),
+                            );
+                        });
+
                         ui.label(
-                            RichText::new(if node.scanned { "Scanned" } else { "Scanning..." })
-                                .small()
-                                .color(TEXT_MUTED),
+                            RichText::new(format_bytes(node.size))
+                                .monospace()
+                                .color(p.accent),
                         );
+
+                        if let Some(path) = &node_path {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(path.display().to_string())
+                                        .small()
+                                        .monospace()
+                                        .color(p.text_muted),
+                                )
+                                .truncate(),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("Aggregated small files")
+                                    .small()
+                                    .color(p.text_faint),
+                            );
+                        }
+
+                        if let Some(error) = &node.error {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(error).small().color(p.danger),
+                                )
+                                .wrap(),
+                            );
+                        }
                     });
             });
     }
 
     fn paint_visual(&self, ui: &egui::Ui, painter: &egui::Painter, visual: &VisualNode) {
+        let palette = palette(ui.ctx());
         let is_hovered = matches!(visual.kind, VisualKind::Node(node_id) if self.hovered_id == Some(node_id));
         let is_selected = matches!(visual.kind, VisualKind::Node(node_id) if self.selected_id == Some(node_id));
-        let fill = fill_color_for_visual(visual, is_hovered, is_selected);
-        let stroke = stroke_for_visual(visual, is_hovered, is_selected);
+        let fill = fill_color_for_visual(visual, is_hovered, is_selected, palette);
+        let stroke = stroke_for_visual(visual, is_hovered, is_selected, palette);
 
-        painter.rect_filled(visual.rect, 2.0, fill);
-        painter.rect_stroke(visual.rect, 2.0, stroke, egui::StrokeKind::Inside);
+        painter.rect_filled(visual.rect, 3.0, fill);
+        painter.rect_stroke(visual.rect, 3.0, stroke, egui::StrokeKind::Inside);
+
+        if is_selected {
+            painter.rect_stroke(
+                visual.rect.expand(2.0),
+                4.0,
+                Stroke::new(3.0, palette.accent_soft),
+                egui::StrokeKind::Outside,
+            );
+        }
 
         if let Some(label_text) = &visual.label_text {
             painter.text(
@@ -566,7 +997,7 @@ impl DiskMapApp {
                 egui::Align2::CENTER_CENTER,
                 label_text,
                 egui::TextStyle::Small.resolve(ui.style()),
-                Color32::WHITE,
+                pick_label_color(fill),
             );
         }
     }
@@ -990,48 +1421,52 @@ fn find_hovered_visual(visuals: &[VisualNode], pos: Option<Pos2>) -> Option<&Vis
         .find(|visual| visual.rect.contains(pos) && visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0)
 }
 
-fn fill_color_for_visual(visual: &VisualNode, hovered: bool, selected: bool) -> Color32 {
+fn fill_color_for_visual(
+    visual: &VisualNode,
+    hovered: bool,
+    selected: bool,
+    palette: &Palette,
+) -> Color32 {
     let mut color = if visual.is_dir {
-        match visual.depth % 5 {
-            0 => Color32::from_rgb(48, 109, 181),
-            1 => Color32::from_rgb(55, 139, 106),
-            2 => Color32::from_rgb(171, 124, 52),
-            3 => Color32::from_rgb(138, 88, 159),
-            _ => Color32::from_rgb(71, 142, 152),
-        }
+        palette.dir_palette[visual.depth % palette.dir_palette.len()]
     } else {
-        Color32::from_rgb(112, 118, 128)
+        palette.file_neutral
     };
 
     if visual.hidden_by_search {
         color = color.gamma_multiply(0.35);
     } else if visual.ancestor_of_match {
-        color = color.gamma_multiply(0.8);
+        color = color.gamma_multiply(0.85);
     } else if visual.matched {
-        color = color.gamma_multiply(1.2);
+        color = color.gamma_multiply(1.10);
     }
 
     if hovered {
-        color = color.gamma_multiply(1.15);
+        color = color.gamma_multiply(1.10);
     }
     if selected {
-        color = color.gamma_multiply(1.2);
+        color = color.gamma_multiply(1.12);
     }
 
     color
 }
 
-fn stroke_for_visual(visual: &VisualNode, hovered: bool, selected: bool) -> Stroke {
+fn stroke_for_visual(
+    visual: &VisualNode,
+    hovered: bool,
+    selected: bool,
+    palette: &Palette,
+) -> Stroke {
     if selected {
-        Stroke::new(2.5, Color32::WHITE)
+        Stroke::new(1.5, palette.accent)
     } else if hovered {
-        Stroke::new(2.0, ACCENT_WARM)
+        Stroke::new(1.5, palette.stroke_strong)
     } else if visual.matched {
-        Stroke::new(1.8, ACCENT_WARM)
+        Stroke::new(1.5, palette.accent)
     } else if visual.is_dir {
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 42))
+        Stroke::new(1.0, palette.stroke_subtle)
     } else {
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 24))
+        Stroke::NONE
     }
 }
 
@@ -1047,17 +1482,18 @@ fn describe_node_kind(kind: NodeKind, has_children: bool) -> &'static str {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ArrowDirection {
-    Left,
-    Right,
+enum ToolbarIcon {
+    ArrowLeft,
+    ArrowRight,
+    Up,
+    Refresh,
+    Close,
+    ThemeLight,
+    ThemeDark,
 }
 
-fn arrow_toolbar_button(
-    ui: &mut egui::Ui,
-    enabled: bool,
-    direction: ArrowDirection,
-) -> egui::Response {
-    let desired_size = Vec2::new(28.0, 24.0);
+fn icon_button(ui: &mut egui::Ui, enabled: bool, icon: ToolbarIcon) -> egui::Response {
+    let desired_size = Vec2::new(28.0, 28.0);
     let sense = if enabled {
         Sense::click()
     } else {
@@ -1078,54 +1514,179 @@ fn arrow_toolbar_button(
     ui.painter()
         .rect(rect, visuals.corner_radius, fill, stroke, egui::StrokeKind::Inside);
 
-    let arrow_stroke = if enabled {
-        visuals.fg_stroke
+    let icon_color = if enabled {
+        visuals.fg_stroke.color
     } else {
-        Stroke::new(
-            ui.visuals().widgets.inactive.fg_stroke.width,
-            ui.visuals().weak_text_color(),
-        )
+        ui.visuals().weak_text_color()
     };
-    paint_arrow_icon(ui.painter(), rect, direction, arrow_stroke);
-
+    paint_toolbar_icon(ui.painter(), rect, icon, icon_color, fill);
     response
 }
 
-fn paint_arrow_icon(
+fn paint_toolbar_icon(
     painter: &egui::Painter,
     rect: Rect,
-    direction: ArrowDirection,
-    stroke: Stroke,
+    icon: ToolbarIcon,
+    color: Color32,
+    button_fill: Color32,
 ) {
-    let center = rect.center();
+    let c = rect.center();
+    let stroke = Stroke::new(1.4, color);
+    match icon {
+        ToolbarIcon::ArrowLeft => arrow_geom(painter, c, false, stroke),
+        ToolbarIcon::ArrowRight => arrow_geom(painter, c, true, stroke),
+        ToolbarIcon::Up => {
+            let tail = Pos2::new(c.x, c.y + 5.5);
+            let tip = Pos2::new(c.x, c.y - 5.5);
+            painter.line_segment([tail, tip], stroke);
+            painter.line_segment([tip, Pos2::new(tip.x - 4.0, tip.y + 4.0)], stroke);
+            painter.line_segment([tip, Pos2::new(tip.x + 4.0, tip.y + 4.0)], stroke);
+        }
+        ToolbarIcon::Refresh => {
+            let r = 5.5;
+            let start_angle = -0.35 * std::f32::consts::PI;
+            let end_angle = 1.4 * std::f32::consts::PI;
+            let steps = 18;
+            let mut prev: Option<Pos2> = None;
+            for i in 0..=steps {
+                let t = i as f32 / steps as f32;
+                let theta = start_angle + (end_angle - start_angle) * t;
+                let p = Pos2::new(c.x + r * theta.cos(), c.y + r * theta.sin());
+                if let Some(p0) = prev {
+                    painter.line_segment([p0, p], stroke);
+                }
+                prev = Some(p);
+            }
+            let end = Pos2::new(c.x + r * end_angle.cos(), c.y + r * end_angle.sin());
+            painter.line_segment([end, Pos2::new(end.x - 2.5, end.y - 3.5)], stroke);
+            painter.line_segment([end, Pos2::new(end.x + 3.5, end.y - 1.5)], stroke);
+        }
+        ToolbarIcon::Close => {
+            painter.line_segment(
+                [Pos2::new(c.x - 4.5, c.y - 4.5), Pos2::new(c.x + 4.5, c.y + 4.5)],
+                stroke,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x - 4.5, c.y + 4.5), Pos2::new(c.x + 4.5, c.y - 4.5)],
+                stroke,
+            );
+        }
+        ToolbarIcon::ThemeLight => {
+            painter.circle_filled(c, 3.0, color);
+            for i in 0..8 {
+                let theta = i as f32 * std::f32::consts::PI / 4.0;
+                let inner = Pos2::new(c.x + 4.5 * theta.cos(), c.y + 4.5 * theta.sin());
+                let outer = Pos2::new(c.x + 6.5 * theta.cos(), c.y + 6.5 * theta.sin());
+                painter.line_segment([inner, outer], stroke);
+            }
+        }
+        ToolbarIcon::ThemeDark => {
+            let r = 6.0;
+            painter.circle_filled(c, r, color);
+            painter.circle_filled(Pos2::new(c.x + 2.6, c.y - 1.4), r - 0.5, button_fill);
+        }
+    }
+}
+
+fn arrow_geom(painter: &egui::Painter, center: Pos2, point_right: bool, stroke: Stroke) {
     let shaft_half = 5.5;
     let head = 4.0;
-    let (start, end, tip_a, tip_b) = match direction {
-        ArrowDirection::Left => {
-            let tip = Pos2::new(center.x - shaft_half, center.y);
-            let tail = Pos2::new(center.x + shaft_half, center.y);
-            (
-                tail,
-                tip,
-                Pos2::new(tip.x + head, tip.y - head),
-                Pos2::new(tip.x + head, tip.y + head),
-            )
-        }
-        ArrowDirection::Right => {
-            let tail = Pos2::new(center.x - shaft_half, center.y);
-            let tip = Pos2::new(center.x + shaft_half, center.y);
-            (
-                tail,
-                tip,
-                Pos2::new(tip.x - head, tip.y - head),
-                Pos2::new(tip.x - head, tip.y + head),
-            )
-        }
+    let (start, end, tip_a, tip_b) = if point_right {
+        let tail = Pos2::new(center.x - shaft_half, center.y);
+        let tip = Pos2::new(center.x + shaft_half, center.y);
+        (
+            tail,
+            tip,
+            Pos2::new(tip.x - head, tip.y - head),
+            Pos2::new(tip.x - head, tip.y + head),
+        )
+    } else {
+        let tip = Pos2::new(center.x - shaft_half, center.y);
+        let tail = Pos2::new(center.x + shaft_half, center.y);
+        (
+            tail,
+            tip,
+            Pos2::new(tip.x + head, tip.y - head),
+            Pos2::new(tip.x + head, tip.y + head),
+        )
     };
-
     painter.line_segment([start, end], stroke);
     painter.line_segment([end, tip_a], stroke);
     painter.line_segment([end, tip_b], stroke);
+}
+
+fn theme_cycle_button(ui: &mut egui::Ui) -> egui::Response {
+    let current = ui.ctx().theme();
+    let (icon, tooltip, next_pref, next_sys) = match current {
+        Theme::Dark => (
+            ToolbarIcon::ThemeLight,
+            "Switch to light mode",
+            egui::ThemePreference::Light,
+            egui::SystemTheme::Light,
+        ),
+        Theme::Light => (
+            ToolbarIcon::ThemeDark,
+            "Switch to dark mode",
+            egui::ThemePreference::Dark,
+            egui::SystemTheme::Dark,
+        ),
+    };
+    let response = icon_button(ui, true, icon).on_hover_text(tooltip);
+    if response.clicked() {
+        ui.ctx().set_theme(next_pref);
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::SetTheme(next_sys));
+    }
+    response
+}
+
+fn section_divider(ui: &mut egui::Ui, palette: &Palette) {
+    let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), 1.0));
+    ui.painter().line_segment(
+        [rect.left_center(), rect.right_center()],
+        Stroke::new(1.0, palette.stroke_subtle),
+    );
+}
+
+fn mini_bar(ui: &mut egui::Ui, fraction: f32, palette: &Palette) {
+    let width = 56.0;
+    let height = 5.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let painter = ui.painter();
+    let radius = CornerRadius::same(3);
+    painter.rect_filled(rect, radius, palette.stroke_subtle);
+    let frac = fraction.clamp(0.0, 1.0);
+    let mut filled = rect;
+    filled.set_width(rect.width() * frac);
+    if filled.width() > 0.5 {
+        painter.rect_filled(filled, radius, palette.accent);
+    }
+}
+
+fn accent_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    width: f32,
+    palette: &Palette,
+) -> egui::Response {
+    let text_color = if enabled {
+        Color32::WHITE
+    } else {
+        palette.text_faint
+    };
+    let fill = if enabled {
+        palette.accent
+    } else {
+        palette.panel_elevated
+    };
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).color(text_color).strong())
+            .fill(fill)
+            .stroke(Stroke::NONE)
+            .min_size(Vec2::new(width, 32.0)),
+    )
 }
 
 fn dirs_home_fallback() -> String {
