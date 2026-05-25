@@ -1,0 +1,851 @@
+use crate::format::format_bytes;
+use crate::tree::{NodeId, TreeStore};
+use egui::{pos2, Rect, Vec2};
+use std::collections::HashSet;
+
+const MAX_VISUAL_NODES: usize = 12_000;
+const MIN_DRAW_SIDE: f32 = 2.0;
+const INNER_PADDING: f32 = 1.0;
+const STRIP_ASPECT_WARNING: f32 = 10.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelMode {
+    Full,
+    Compact,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualKind {
+    Node(NodeId),
+}
+
+#[derive(Debug, Clone)]
+pub struct VisualNode {
+    pub kind: VisualKind,
+    pub rect: Rect,
+    pub depth: usize,
+    pub is_dir: bool,
+    pub size: u64,
+    pub percent_of_parent: f32,
+    pub percent_of_total: f32,
+    pub label_mode: LabelMode,
+    pub matched: bool,
+    pub ancestor_of_match: bool,
+    pub hidden_by_search: bool,
+    pub label_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    pub pan: Vec2,
+    pub zoom: f32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SearchState {
+    query_lower: String,
+    matched_nodes: HashSet<NodeId>,
+    matched_descendant_counts: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayoutItem {
+    node_id: NodeId,
+    area: f32,
+}
+
+#[derive(Debug, Default, Clone)]
+struct LayoutDebugStats {
+    row_count: usize,
+    single_item_rows: usize,
+    rect_count: usize,
+    strip_like_rects: usize,
+}
+
+impl SearchState {
+    pub fn clear(&mut self, tree_len: usize) {
+        self.query_lower.clear();
+        self.matched_nodes.clear();
+        self.matched_descendant_counts.clear();
+        self.matched_descendant_counts.resize(tree_len, 0);
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query_lower
+    }
+
+    pub fn rebuild(&mut self, tree: &mut TreeStore, root_id: Option<NodeId>, query: &str) {
+        self.query_lower = query.trim().to_lowercase();
+        self.matched_nodes.clear();
+        self.matched_descendant_counts.clear();
+        self.matched_descendant_counts.resize(tree.len(), 0);
+
+        let Some(root_id) = root_id else {
+            return;
+        };
+        if self.query_lower.is_empty() {
+            return;
+        }
+
+        let mut stack = vec![root_id];
+        while let Some(node_id) = stack.pop() {
+            self.ingest_node_if_matches(tree, node_id);
+            stack.extend(tree.node(node_id).children.iter().rev().copied());
+        }
+    }
+
+    pub fn ingest_new_nodes(&mut self, tree: &mut TreeStore, node_ids: &[NodeId]) -> usize {
+        if self.query_lower.is_empty() {
+            return 0;
+        }
+
+        if self.matched_descendant_counts.len() < tree.len() {
+            self.matched_descendant_counts.resize(tree.len(), 0);
+        }
+
+        let mut updates = 0usize;
+        for &node_id in node_ids {
+            if self.ingest_node_if_matches(tree, node_id) {
+                updates += 1;
+            }
+        }
+        updates
+    }
+
+    pub fn is_match(&self, node_id: NodeId) -> bool {
+        self.matched_nodes.contains(&node_id)
+    }
+
+    pub fn is_ancestor_of_match(&self, node_id: NodeId) -> bool {
+        self.matched_descendant_counts
+            .get(node_id)
+            .copied()
+            .unwrap_or_default()
+            > 0
+            && !self.is_match(node_id)
+    }
+
+    pub fn is_hidden(&self, node_id: NodeId) -> bool {
+        !self.query_lower.is_empty()
+            && !self.is_match(node_id)
+            && self
+                .matched_descendant_counts
+                .get(node_id)
+                .copied()
+                .unwrap_or_default()
+                == 0
+    }
+
+    pub fn match_count(&self) -> usize {
+        self.matched_nodes.len()
+    }
+
+    fn ingest_node_if_matches(&mut self, tree: &mut TreeStore, node_id: NodeId) -> bool {
+        if self.query_lower.is_empty() || node_id >= tree.len() {
+            return false;
+        }
+
+        if !tree.node_name_matches_query(node_id, &self.query_lower) || !self.matched_nodes.insert(node_id) {
+            return false;
+        }
+
+        let mut current = tree.node(node_id).parent;
+        while let Some(ancestor_id) = current {
+            if ancestor_id >= self.matched_descendant_counts.len() {
+                self.matched_descendant_counts.resize(tree.len(), 0);
+            }
+            self.matched_descendant_counts[ancestor_id] += 1;
+            current = tree.node(ancestor_id).parent;
+        }
+        true
+    }
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+        }
+    }
+}
+
+impl Camera {
+    pub fn apply(&self, rect: Rect, viewport: Rect) -> Rect {
+        let center = viewport.center() + self.pan;
+        let size = rect.size() * self.zoom;
+        let min = pos2(
+            center.x + (rect.min.x - viewport.center().x) * self.zoom,
+            center.y + (rect.min.y - viewport.center().y) * self.zoom,
+        );
+        Rect::from_min_size(min, size)
+    }
+
+    pub fn zoom_around(&mut self, pointer: egui::Pos2, delta: f32) {
+        let old_zoom = self.zoom;
+        self.zoom = (self.zoom * delta).clamp(0.35, 6.0);
+        let factor = self.zoom / old_zoom;
+        self.pan = (self.pan + pointer.to_vec2()) * factor - pointer.to_vec2();
+    }
+}
+
+pub fn layout_treemap(
+    tree: &mut TreeStore,
+    root: NodeId,
+    canvas_rect: Rect,
+    camera: Camera,
+    max_depth: usize,
+    search_state: &SearchState,
+) -> Vec<VisualNode> {
+    let mut out = Vec::with_capacity(8192);
+    let root_node = tree.node(root);
+    let total_size = root_node.size.max(1);
+    let layout_rect = camera.apply(canvas_rect, canvas_rect).shrink(8.0);
+
+    layout_node_squarified(
+        tree,
+        root,
+        layout_rect,
+        0,
+        max_depth,
+        root,
+        total_size,
+        search_state,
+        &mut out,
+    );
+
+    out
+}
+
+fn layout_node_squarified(
+    tree: &mut TreeStore,
+    parent_id: NodeId,
+    rect: Rect,
+    depth: usize,
+    max_depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+    out: &mut Vec<VisualNode>,
+) {
+    if out.len() >= MAX_VISUAL_NODES || depth >= max_depth {
+        return;
+    }
+    if rect.width() < MIN_DRAW_SIDE || rect.height() < MIN_DRAW_SIDE {
+        return;
+    }
+
+    tree.ensure_sorted_children(parent_id);
+    let children = tree.sorted_children(parent_id);
+    if children.is_empty() {
+        return;
+    }
+
+    let parent_area = rect.width() * rect.height();
+    if parent_area <= 0.0 {
+        return;
+    }
+
+    let total_child_size: u64 = children
+        .iter()
+        .map(|child_id| tree.node(*child_id).size)
+        .filter(|size| *size > 0)
+        .sum();
+    if total_child_size == 0 {
+        return;
+    }
+
+    let mut items = Vec::with_capacity(children.len());
+    for &node_id in children {
+        let size = tree.node(node_id).size;
+        if size > 0 {
+            items.push(LayoutItem {
+                node_id,
+                area: (size as f32 / total_child_size as f32) * parent_area,
+            });
+        }
+    }
+    if items.is_empty() {
+        return;
+    }
+
+    let debug_stats = squarify_items(
+        tree,
+        &items,
+        rect,
+        depth,
+        max_depth,
+        root_id,
+        total_size,
+        search_state,
+        out,
+    );
+
+    emit_debug_warnings(depth, &debug_stats);
+}
+
+fn squarify_items(
+    tree: &mut TreeStore,
+    items: &[LayoutItem],
+    rect: Rect,
+    depth: usize,
+    max_depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+    out: &mut Vec<VisualNode>,
+) -> LayoutDebugStats {
+    let mut stats = LayoutDebugStats::default();
+    let mut remaining = rect;
+    let mut row: Vec<LayoutItem> = Vec::new();
+    let mut index = 0usize;
+
+    while index < items.len() && remaining.width() > 0.0 && remaining.height() > 0.0 {
+        let short_side = remaining.width().min(remaining.height());
+        if short_side <= 0.0 {
+            break;
+        }
+
+        let next_item = items[index];
+        if row.is_empty() {
+            row.push(next_item);
+            index += 1;
+            continue;
+        }
+
+        let current_score = worst_aspect_ratio(row.iter().map(|item| item.area), short_side);
+        let candidate_score = worst_aspect_ratio(
+            row.iter().map(|item| item.area).chain(std::iter::once(next_item.area)),
+            short_side,
+        );
+
+        if candidate_score <= current_score {
+            row.push(next_item);
+            index += 1;
+        } else {
+            remaining = layout_row(
+                tree,
+                &row,
+                remaining,
+                depth,
+                max_depth,
+                root_id,
+                total_size,
+                search_state,
+                out,
+                &mut stats,
+            );
+            row.clear();
+        }
+    }
+
+    if !row.is_empty() && remaining.width() > 0.0 && remaining.height() > 0.0 {
+        let _ = layout_row(
+            tree,
+            &row,
+            remaining,
+            depth,
+            max_depth,
+            root_id,
+            total_size,
+            search_state,
+            out,
+            &mut stats,
+        );
+    }
+
+    stats
+}
+
+fn worst_aspect_ratio<I>(areas: I, side: f32) -> f32
+where
+    I: IntoIterator<Item = f32>,
+{
+    if side <= 0.0 {
+        return f32::INFINITY;
+    }
+
+    let mut sum = 0.0_f32;
+    let mut max_area = 0.0_f32;
+    let mut min_area = f32::INFINITY;
+
+    for area in areas {
+        if area <= 0.0 {
+            return f32::INFINITY;
+        }
+        sum += area;
+        max_area = max_area.max(area);
+        min_area = min_area.min(area);
+    }
+
+    if sum <= 0.0 || min_area <= 0.0 || !min_area.is_finite() {
+        return f32::INFINITY;
+    }
+
+    let side2 = side * side;
+    ((side2 * max_area) / (sum * sum)).max((sum * sum) / (side2 * min_area))
+}
+
+fn layout_row(
+    tree: &mut TreeStore,
+    row: &[LayoutItem],
+    remaining_rect: Rect,
+    depth: usize,
+    max_depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+    out: &mut Vec<VisualNode>,
+    debug_stats: &mut LayoutDebugStats,
+) -> Rect {
+    let sum_area: f32 = row.iter().map(|item| item.area).sum();
+    if sum_area <= 0.0 || remaining_rect.width() <= 0.0 || remaining_rect.height() <= 0.0 {
+        return remaining_rect;
+    }
+
+    debug_stats.row_count += 1;
+    if row.len() == 1 {
+        debug_stats.single_item_rows += 1;
+    }
+
+    if remaining_rect.width() >= remaining_rect.height() {
+        layout_vertical_column(
+            tree,
+            row,
+            remaining_rect,
+            sum_area,
+            depth,
+            max_depth,
+            root_id,
+            total_size,
+            search_state,
+            out,
+            debug_stats,
+        )
+    } else {
+        layout_horizontal_row(
+            tree,
+            row,
+            remaining_rect,
+            sum_area,
+            depth,
+            max_depth,
+            root_id,
+            total_size,
+            search_state,
+            out,
+            debug_stats,
+        )
+    }
+}
+
+fn layout_horizontal_row(
+    tree: &mut TreeStore,
+    row: &[LayoutItem],
+    remaining_rect: Rect,
+    sum_area: f32,
+    depth: usize,
+    max_depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+    out: &mut Vec<VisualNode>,
+    debug_stats: &mut LayoutDebugStats,
+) -> Rect {
+    let row_height = (sum_area / remaining_rect.width().max(f32::EPSILON)).min(remaining_rect.height());
+    if row_height <= 0.0 {
+        return remaining_rect;
+    }
+
+    let row_rect = Rect::from_min_max(
+        remaining_rect.min,
+        pos2(remaining_rect.right(), remaining_rect.top() + row_height),
+    );
+
+    let mut x = row_rect.left();
+    for (index, item) in row.iter().copied().enumerate() {
+        let width = if index + 1 == row.len() {
+            row_rect.right() - x
+        } else {
+            (item.area / row_height.max(f32::EPSILON)).min(row_rect.right() - x)
+        };
+        let item_rect = Rect::from_min_max(
+            pos2(x, row_rect.top()),
+            pos2((x + width).min(row_rect.right()), row_rect.bottom()),
+        );
+        x = item_rect.right();
+        emit_visual_and_recurse(
+            tree,
+            item.node_id,
+            item_rect,
+            depth,
+            max_depth,
+            root_id,
+            total_size,
+            search_state,
+            out,
+            debug_stats,
+        );
+    }
+
+    Rect::from_min_max(pos2(remaining_rect.left(), row_rect.bottom()), remaining_rect.max)
+}
+
+fn layout_vertical_column(
+    tree: &mut TreeStore,
+    row: &[LayoutItem],
+    remaining_rect: Rect,
+    sum_area: f32,
+    depth: usize,
+    max_depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+    out: &mut Vec<VisualNode>,
+    debug_stats: &mut LayoutDebugStats,
+) -> Rect {
+    let column_width = (sum_area / remaining_rect.height().max(f32::EPSILON)).min(remaining_rect.width());
+    if column_width <= 0.0 {
+        return remaining_rect;
+    }
+
+    let column_rect = Rect::from_min_max(
+        remaining_rect.min,
+        pos2(remaining_rect.left() + column_width, remaining_rect.bottom()),
+    );
+
+    let mut y = column_rect.top();
+    for (index, item) in row.iter().copied().enumerate() {
+        let height = if index + 1 == row.len() {
+            column_rect.bottom() - y
+        } else {
+            (item.area / column_width.max(f32::EPSILON)).min(column_rect.bottom() - y)
+        };
+        let item_rect = Rect::from_min_max(
+            pos2(column_rect.left(), y),
+            pos2(column_rect.right(), (y + height).min(column_rect.bottom())),
+        );
+        y = item_rect.bottom();
+        emit_visual_and_recurse(
+            tree,
+            item.node_id,
+            item_rect,
+            depth,
+            max_depth,
+            root_id,
+            total_size,
+            search_state,
+            out,
+            debug_stats,
+        );
+    }
+
+    Rect::from_min_max(pos2(column_rect.right(), remaining_rect.top()), remaining_rect.max)
+}
+
+fn emit_visual_and_recurse(
+    tree: &mut TreeStore,
+    node_id: NodeId,
+    raw_rect: Rect,
+    depth: usize,
+    max_depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+    out: &mut Vec<VisualNode>,
+    debug_stats: &mut LayoutDebugStats,
+) {
+    if out.len() >= MAX_VISUAL_NODES || raw_rect.width() < MIN_DRAW_SIDE || raw_rect.height() < MIN_DRAW_SIDE {
+        return;
+    }
+
+    debug_stats.rect_count += 1;
+    let aspect = rect_aspect_ratio(raw_rect);
+    if aspect > STRIP_ASPECT_WARNING {
+        debug_stats.strip_like_rects += 1;
+    }
+
+    let draw_rect = inset_rect(raw_rect, INNER_PADDING);
+    if draw_rect.width() < MIN_DRAW_SIDE || draw_rect.height() < MIN_DRAW_SIDE {
+        return;
+    }
+
+    out.push(make_visual_node(
+        tree,
+        node_id,
+        draw_rect,
+        depth,
+        root_id,
+        total_size,
+        search_state,
+    ));
+
+    if depth + 1 >= max_depth {
+        return;
+    }
+
+    let node = tree.node(node_id);
+    if node.children.is_empty() {
+        return;
+    }
+
+    let inner_rect = inset_rect(raw_rect, INNER_PADDING * 2.0);
+    if inner_rect.width() < MIN_DRAW_SIDE || inner_rect.height() < MIN_DRAW_SIDE {
+        return;
+    }
+
+    layout_node_squarified(
+        tree,
+        node_id,
+        inner_rect,
+        depth + 1,
+        max_depth,
+        root_id,
+        total_size,
+        search_state,
+        out,
+    );
+}
+
+fn inset_rect(rect: Rect, padding: f32) -> Rect {
+    rect.shrink2(Vec2::new(
+        padding.min(rect.width() * 0.5),
+        padding.min(rect.height() * 0.5),
+    ))
+}
+
+pub fn rect_aspect_ratio(rect: Rect) -> f32 {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return f32::INFINITY;
+    }
+    (rect.width() / rect.height()).max(rect.height() / rect.width())
+}
+
+#[cfg(debug_assertions)]
+fn emit_debug_warnings(depth: usize, stats: &LayoutDebugStats) {
+    if stats.row_count > 0 && stats.single_item_rows == stats.row_count {
+        eprintln!(
+            "warning: squarify grouping failed at depth {depth}: every row had exactly one item"
+        );
+    }
+    if stats.rect_count > 0 && (stats.strip_like_rects as f32 / stats.rect_count as f32) > 0.6 {
+        eprintln!(
+            "warning: strip-heavy squarify output at depth {depth}: {}/{} rects exceed aspect {}",
+            stats.strip_like_rects,
+            stats.rect_count,
+            STRIP_ASPECT_WARNING
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn emit_debug_warnings(_depth: usize, _stats: &LayoutDebugStats) {}
+
+fn make_visual_node(
+    tree: &TreeStore,
+    node_id: NodeId,
+    rect: Rect,
+    depth: usize,
+    root_id: NodeId,
+    total_size: u64,
+    search_state: &SearchState,
+) -> VisualNode {
+    let node = tree.node(node_id);
+    let parent_size = node
+        .parent
+        .map(|parent_id| tree.node(parent_id).size.max(1))
+        .unwrap_or(node.size.max(1));
+    let matched = search_state.is_match(node_id);
+    let ancestor_of_match = search_state.is_ancestor_of_match(node_id);
+    let hidden_by_search = search_state.is_hidden(node_id);
+    let label_mode = label_mode_for_rect(rect);
+
+    let label_text = match label_mode {
+        LabelMode::Full => Some(if node_id == root_id {
+            format!(
+                "{} (root)\n{}\n{:.1}% of root · {:.1}% of parent",
+                node.name,
+                format_bytes(node.size),
+                (node.size as f32 / total_size.max(1) as f32) * 100.0,
+                (node.size as f32 / parent_size as f32) * 100.0,
+            )
+        } else {
+            format!(
+                "{}\n{}\n{:.1}% of root · {:.1}% of parent",
+                node.name,
+                format_bytes(node.size),
+                (node.size as f32 / total_size.max(1) as f32) * 100.0,
+                (node.size as f32 / parent_size as f32) * 100.0,
+            )
+        }),
+        LabelMode::Compact => Some(if node_id == root_id {
+            format!("{} (root)\n{}", node.name, format_bytes(node.size))
+        } else {
+            format!("{}\n{}", node.name, format_bytes(node.size))
+        }),
+        LabelMode::Hidden => None,
+    };
+
+    VisualNode {
+        kind: VisualKind::Node(node_id),
+        rect,
+        depth,
+        is_dir: !node.children.is_empty(),
+        size: node.size,
+        percent_of_parent: node.size as f32 / parent_size as f32,
+        percent_of_total: node.size as f32 / total_size.max(1) as f32,
+        label_mode,
+        matched,
+        ancestor_of_match,
+        hidden_by_search,
+        label_text,
+    }
+}
+
+fn label_mode_for_rect(rect: Rect) -> LabelMode {
+    if rect.width() > 120.0 && rect.height() > 72.0 {
+        LabelMode::Full
+    } else if rect.width() > 72.0 && rect.height() > 36.0 {
+        LabelMode::Compact
+    } else {
+        LabelMode::Hidden
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{NodeKind, TreeStore};
+    use std::path::PathBuf;
+
+    fn sample_tree(sizes: &[u64]) -> (TreeStore, NodeId) {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), PathBuf::from("/"), NodeKind::Dir, 0);
+        let mut total = 0_u64;
+        for (index, size) in sizes.iter().copied().enumerate() {
+            let child = tree.add_node(
+                Some(root),
+                format!("child-{index}"),
+                PathBuf::from(format!("/child-{index}")),
+                NodeKind::File,
+                size,
+            );
+            tree.node_mut(child).scanned = true;
+            total += size;
+        }
+        tree.apply_direct_size_delta(root, total);
+        tree.repair_sorted_children(&[root]);
+        (tree, root)
+    }
+
+    #[test]
+    fn layout_should_keep_rects_inside_canvas() {
+        let (mut tree, root) = sample_tree(&[60, 40]);
+        tree.repair_sorted_children(&[root]);
+        let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 800.0));
+        let visuals = layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default());
+
+        assert!(!visuals.is_empty());
+        assert!(visuals.iter().all(|visual| canvas.contains(visual.rect.min) && canvas.contains(visual.rect.max)));
+    }
+
+    #[test]
+    fn search_state_marks_ancestors_without_recursive_queries() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), PathBuf::from("/"), NodeKind::Dir, 0);
+        let dir = tree.add_node(Some(root), "dir".into(), PathBuf::from("/dir"), NodeKind::Dir, 0);
+        let file = tree.add_node(Some(dir), "match".into(), PathBuf::from("/dir/match"), NodeKind::File, 1);
+        let mut search_state = SearchState::default();
+
+        search_state.rebuild(&mut tree, Some(root), "match");
+
+        assert!(search_state.is_match(file));
+        assert!(search_state.is_ancestor_of_match(root));
+        assert!(search_state.is_ancestor_of_match(dir));
+        assert!(!search_state.is_hidden(dir));
+    }
+
+    #[test]
+    fn layout_handles_zero_sizes_and_tiny_rectangles() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), PathBuf::from("/"), NodeKind::Dir, 0);
+        tree.add_node(Some(root), "zero".into(), PathBuf::from("/zero"), NodeKind::File, 0);
+        tree.add_node(Some(root), "also-zero".into(), PathBuf::from("/also-zero"), NodeKind::Dir, 0);
+        tree.repair_sorted_children(&[root]);
+
+        let tiny = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let visuals = layout_treemap(&mut tree, root, tiny, Camera::default(), 2, &SearchState::default());
+
+        assert!(visuals.is_empty());
+    }
+
+    #[test]
+    fn layout_preserves_area_ratio_for_sized_children() {
+        let (mut tree, root) = sample_tree(&[90, 60, 30, 20]);
+        let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 700.0));
+        let visuals = layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default());
+
+        let first = visuals.iter().find(|visual| {
+            matches!(visual.kind, VisualKind::Node(node_id) if tree.node(node_id).name == "child-0")
+        }).unwrap();
+        let second = visuals.iter().find(|visual| {
+            matches!(visual.kind, VisualKind::Node(node_id) if tree.node(node_id).name == "child-1")
+        }).unwrap();
+        let area_ratio = first.rect.area() / second.rect.area().max(f32::EPSILON);
+
+        assert!((area_ratio - 1.5).abs() < 0.2);
+    }
+
+    #[test]
+    fn layout_avoids_collapsing_every_small_item_into_tiny_strips() {
+        let (mut tree, root) = sample_tree(&[100, 80, 60, 30, 20, 10]);
+        let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(900.0, 600.0));
+        let visuals = layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default());
+
+        assert!(visuals.iter().all(|visual| visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0));
+    }
+
+    #[test]
+    fn squarified_algorithm_forms_multi_item_groups_and_avoids_full_width_strips() {
+        let sizes = [1405_u64, 475, 339, 127, 99, 64, 51, 32, 7, 6, 5, 4];
+        let (mut tree, root) = sample_tree(&sizes);
+        let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 600.0));
+        let visuals = layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default());
+
+        let total_area: f32 = visuals.iter().map(|visual| visual.rect.area()).sum();
+        assert!((total_area - (1000.0 * 600.0)).abs() < 50_000.0);
+        assert!(visuals.iter().all(|visual| visual.rect.width() >= 0.0 && visual.rect.height() >= 0.0));
+
+        let full_width_like = visuals
+            .iter()
+            .filter(|visual| (visual.rect.width() - (canvas.width() - 18.0)).abs() < 4.0)
+            .count();
+        assert!(full_width_like < visuals.len());
+
+        let good_aspect_count = visuals
+            .iter()
+            .filter(|visual| rect_aspect_ratio(visual.rect) < 10.0)
+            .count();
+        assert!(good_aspect_count * 2 >= visuals.len());
+    }
+
+    #[test]
+    fn search_state_incrementally_tracks_new_matches() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), PathBuf::from("/"), NodeKind::Dir, 0);
+        let child = tree.add_node(Some(root), "alpha".into(), PathBuf::from("/alpha"), NodeKind::File, 1);
+        let mut search_state = SearchState::default();
+
+        search_state.rebuild(&mut tree, Some(root), "match");
+        assert_eq!(search_state.match_count(), 0);
+
+        let matching = tree.add_node(Some(root), "match-file".into(), PathBuf::from("/match"), NodeKind::File, 1);
+        tree.repair_sorted_children(&[root]);
+        let updates = search_state.ingest_new_nodes(&mut tree, &[child, matching]);
+
+        assert_eq!(updates, 1);
+        assert!(search_state.is_match(matching));
+        assert!(search_state.is_ancestor_of_match(root));
+    }
+}
