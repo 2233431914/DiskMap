@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test files
+10
+10。提高
+=
