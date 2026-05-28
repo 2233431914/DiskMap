@@ -1,4 +1,5 @@
 use crate::scanner::{self, PerfStats, ProgressSnapshot, ScanHandle, ScanMessage, ScanOptions};
+use crate::tree::{NodeKind, NodeRecord};
 use crossbeam_channel::Sender;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,6 +12,27 @@ pub struct ProgressSummary {
     pub current_path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanIssueSummary {
+    pub error_entries: u64,
+    pub permission_errors: u64,
+    pub skipped_paths: u64,
+    pub symlinks: u64,
+}
+
+impl ScanIssueSummary {
+    pub fn has_findings(&self) -> bool {
+        self.error_entries > 0
+            || self.permission_errors > 0
+            || self.skipped_paths > 0
+            || self.symlinks > 0
+    }
+
+    pub fn issue_count(&self) -> u64 {
+        self.error_entries
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ScanSession {
     active_scan_id: u64,
@@ -18,6 +40,7 @@ pub struct ScanSession {
     handle: Option<ScanHandle>,
     scanning: bool,
     progress: Option<ProgressSummary>,
+    issue_summary: ScanIssueSummary,
     perf_stats: PerfStats,
 }
 
@@ -65,8 +88,28 @@ impl ScanSession {
         });
     }
 
+    pub fn observe_node(&mut self, node: &NodeRecord) {
+        match node.kind {
+            NodeKind::Symlink => {
+                self.issue_summary.symlinks += 1;
+            }
+            NodeKind::Error => {
+                self.issue_summary.error_entries += 1;
+                self.issue_summary.skipped_paths += 1;
+                if is_permission_error(node.error.as_deref()) {
+                    self.issue_summary.permission_errors += 1;
+                }
+            }
+            NodeKind::File | NodeKind::Dir | NodeKind::Aggregate => {}
+        }
+    }
+
     pub fn progress(&self) -> Option<&ProgressSummary> {
         self.progress.as_ref()
+    }
+
+    pub fn issue_summary(&self) -> ScanIssueSummary {
+        self.issue_summary
     }
 
     pub fn perf_stats(&self) -> &PerfStats {
@@ -110,6 +153,7 @@ impl ScanSession {
         self.handle = None;
         self.scanning = true;
         self.progress = None;
+        self.issue_summary = ScanIssueSummary::default();
         self.perf_stats = PerfStats::default();
         self.active_scan_id
     }
@@ -140,6 +184,14 @@ impl ScanSession {
     }
 }
 
+fn is_permission_error(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let lower = error.to_ascii_lowercase();
+    lower.contains("permission denied") || lower.contains("operation not permitted")
+}
+
 pub fn scan_id_for_message(message: &ScanMessage) -> u64 {
     match message {
         ScanMessage::Started { scan_id, .. }
@@ -154,6 +206,7 @@ pub fn scan_id_for_message(message: &ScanMessage) -> u64 {
 mod tests {
     use super::*;
     use crate::tree::TreeStore;
+    use crate::tree::{NodeKind, NodeRecord};
 
     fn started(scan_id: u64) -> ScanMessage {
         ScanMessage::Started {
@@ -208,6 +261,34 @@ mod tests {
             progress.current_path,
             PathBuf::from("/root/current/file.txt")
         );
+    }
+
+    #[test]
+    fn observe_node_tracks_error_permission_skip_and_symlink_counts() {
+        let mut session = ScanSession::default();
+
+        session.observe_node(&NodeRecord {
+            name: "private".into(),
+            kind: NodeKind::Error,
+            size: 0,
+            scanned: true,
+            error: Some("Permission denied (os error 13)".into()),
+        });
+        session.observe_node(&NodeRecord {
+            name: "linked".into(),
+            kind: NodeKind::Symlink,
+            size: 0,
+            scanned: true,
+            error: None,
+        });
+
+        let summary = session.issue_summary();
+        assert_eq!(summary.error_entries, 1);
+        assert_eq!(summary.permission_errors, 1);
+        assert_eq!(summary.skipped_paths, 1);
+        assert_eq!(summary.symlinks, 1);
+        assert_eq!(summary.issue_count(), 1);
+        assert!(summary.has_findings());
     }
 
     #[test]

@@ -466,6 +466,7 @@ impl DiskMapApp {
         let Some(node_id) = subject_id else {
             ui.label(RichText::new("Run a scan to populate the treemap.").color(p.text_muted));
             self.show_progress_section(ui, p);
+            self.show_scan_issue_section(ui, p);
             self.show_search_section(ui, p);
             return;
         };
@@ -644,6 +645,7 @@ impl DiskMapApp {
         }
 
         self.show_progress_section(ui, p);
+        self.show_scan_issue_section(ui, p);
         self.show_search_section(ui, p);
     }
 
@@ -682,6 +684,37 @@ impl DiskMapApp {
             )
             .truncate(),
         );
+    }
+
+    fn show_scan_issue_section(&self, ui: &mut egui::Ui, p: &Palette) {
+        let summary = self.scan.issue_summary();
+        if !summary.has_findings() {
+            return;
+        }
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("SCAN ISSUES")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        for (label, count, color) in [
+            ("Error entries", summary.error_entries, p.danger),
+            ("Skipped paths", summary.skipped_paths, p.text_muted),
+            ("Permission errors", summary.permission_errors, p.danger),
+            ("Symlinks", summary.symlinks, p.text_muted),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            ui.label(
+                RichText::new(format!("{label}: {count}"))
+                    .small()
+                    .color(color),
+            );
+        }
     }
 
     fn show_search_section(&self, ui: &mut egui::Ui, p: &Palette) {
@@ -1120,7 +1153,7 @@ impl DiskMapApp {
                     self.prune_invalid_selection();
                     self.refresh_search_matches();
                     self.layout_dirty = true;
-                    self.status = format!("Finished: {}", format_bytes(total_bytes));
+                    self.status = self.finished_status(total_bytes);
                     self.pending_repaint = true;
                     eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
@@ -1159,6 +1192,7 @@ impl DiskMapApp {
         for discovered in batch.discovered_nodes {
             let node_id = discovered.node_id;
             let parent_id = discovered.parent_id;
+            self.scan.observe_node(&discovered.node);
             self.tree
                 .insert_node(node_id, Some(parent_id), discovered.node);
             discovered_node_ids.push(node_id);
@@ -1213,6 +1247,19 @@ impl DiskMapApp {
     fn apply_progress(&mut self, progress: ProgressSnapshot) {
         self.scan.apply_progress(progress);
         self.status = "Scanning...".to_string();
+    }
+
+    fn finished_status(&self, total_bytes: u64) -> String {
+        let issue_count = self.scan.issue_summary().issue_count();
+        if issue_count == 0 {
+            return format!("Finished: {}", format_bytes(total_bytes));
+        }
+
+        format!(
+            "Finished: {} · {}",
+            format_bytes(total_bytes),
+            pluralize(issue_count, "issue", "issues")
+        )
     }
 
     fn clear_search(&mut self) {
@@ -1712,6 +1759,14 @@ fn truncate_middle(input: &str, max_chars: usize) -> String {
     format!("{left}…{right}")
 }
 
+fn pluralize(count: u64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
 fn format_perf_stats(stats: &PerfStats) -> String {
     format!(
         "perf: messages={} batches={} entries={} nodes={} files={} dirs={} size_merges={} ancestor_delta_ms={:.2} parent_stack_hits={} parent_fallbacks={} progress_snapshots={} prefetched_files={} metadata_fallback_files={} scan_ms={:.2} metadata_ms={:.2} mtime_ms={:.2} size_ms={:.2} flush_ms={:.2} layouts={} layout_ms={:.2} search_rebuilds={} search_incremental={} db_hits={} db_misses={} db_flushes={}",
@@ -1893,6 +1948,52 @@ mod tests {
         assert_eq!(app.scan.active_id(), 7);
         assert!(!app.scan.has_handle());
         assert_eq!(app.status, "Open failed: boom");
+    }
+
+    #[test]
+    fn scan_issue_summary_updates_from_discovered_nodes() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![
+                    DiscoveredNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "private".into(),
+                            kind: NodeKind::Error,
+                            size: 0,
+                            scanned: true,
+                            error: Some("Operation not permitted".into()),
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 2,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "linked".into(),
+                            kind: NodeKind::Symlink,
+                            size: 0,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                ],
+                size_deltas: vec![],
+                scanned_nodes: vec![1, 2],
+                progress: None,
+            },
+        });
+
+        let summary = app.scan.issue_summary();
+        assert_eq!(summary.error_entries, 1);
+        assert_eq!(summary.permission_errors, 1);
+        assert_eq!(summary.skipped_paths, 1);
+        assert_eq!(summary.symlinks, 1);
+        assert_eq!(app.finished_status(0), "Finished: 0 B · 1 issue");
     }
 
     #[test]

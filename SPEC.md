@@ -170,37 +170,37 @@ struct TreeStore {
 ## 10. Future Phases
 
 ### Phase 2: Stabilization and Usability
-- Keep destructive actions disabled by default
-- Keep SQLite cache disabled by default
-- Maintain clippy-clean code with `cargo clippy --all-targets --all-features -- -D warnings`
-- Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
-- Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
-- Persist lightweight preferences: last scan path, window size, theme, depth, and scan options
+- [x] Keep destructive actions disabled by default
+- [x] Keep SQLite cache disabled by default
+- [x] Maintain clippy-clean code with `cargo clippy --all-targets --all-features -- -D warnings`
+- [x] Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
+- [ ] Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
+- [ ] Persist lightweight preferences: last scan path, window size, theme, depth, and scan options
 
 ### Phase 3: Scan Controls
-- Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories
-- Add safe scan mode options:
-  - Do not cross filesystem or mount boundaries
-  - Include or exclude hidden files
-  - Follow or do not follow symlinks
-- Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
+- [ ] Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories
+- [ ] Add safe scan mode options:
+  - [ ] Do not cross filesystem or mount boundaries
+  - [ ] Include or exclude hidden files
+  - [ ] Follow or do not follow symlinks
+- [ ] Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
 
 ### Phase 4: Reporting and Size Model
-- Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
-- Clearly display the active size basis, such as apparent size or allocated size on disk
-- Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
+- [ ] Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
+- [ ] Clearly display the active size basis, such as apparent size or allocated size on disk
+- [ ] Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
 
 ### Phase 5: Real-time Monitoring
-- Add notify crate (FSEvents/kqueue)
-- Debounce 300-1000ms
-- Incremental rescan of changed directories
+- [ ] Add notify crate (FSEvents/kqueue)
+- [ ] Debounce 300-1000ms
+- [ ] Incremental rescan of changed directories
 
 ### Phase 6: Treemap Upgrade
-- Preserve Squarified Treemap interface
-- Evaluate deeper zoom/search workflows
+- [x] Preserve Squarified Treemap interface
+- [ ] Evaluate deeper zoom/search workflows
 
 ### Phase 7: Productization
-- Enable SQLite index for faster rescans behind a user setting
-- Search and filter
-- Extension-based coloring
-- Move to Trash functionality with confirmation and reliable platform adapter
+- [ ] Enable SQLite index for faster rescans behind a user setting
+- [ ] Search and filter
+- [ ] Extension-based coloring
+- [ ] Move to Trash functionality with confirmation and reliable platform adapter
