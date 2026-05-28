@@ -15,6 +15,7 @@
 - **In-memory tree aggregation:** Custom TreeStore
 - **Treemap rendering:** egui::Painter (custom drawing)
 - **Shell open:** open (v5)
+- **Preference persistence:** eframe native storage/window persistence
 - **Experimental cache:** rusqlite (implemented, disabled by default)
 
 ## 3. Features (MVP Scope)
@@ -175,7 +176,8 @@ struct TreeStore {
 - [x] Maintain clippy-clean code with `cargo clippy --all-targets --all-features -- -D warnings`
 - [x] Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
 - [x] Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
-- [ ] Persist lightweight preferences: last scan path, window size, theme, depth, and scan options
+- [x] Persist lightweight preferences: last scan path, window size, theme, and depth
+- [ ] Persist user-facing scan options once scan controls are added
 
 ### Phase 3: Scan Controls
 - [ ] Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories

@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
+const STORAGE_PATH_INPUT: &str = "disk_map.path_input";
+const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
+const STORAGE_THEME: &str = "disk_map.theme";
 const DEFAULT_SCAN_OPTIONS: ScanOptions = ScanOptions {
     batch_flush_interval: Duration::from_millis(33),
     max_pending_nodes: 2_048,
@@ -230,6 +233,7 @@ pub struct DiskMapApp {
     hovered_visual_kind: Option<VisualKind>,
     camera: Camera,
     max_depth: usize,
+    theme_preference: Option<Theme>,
     status: String,
     cached_visuals: Vec<VisualNode>,
     layout_scratch: LayoutScratch,
@@ -256,6 +260,7 @@ impl Default for DiskMapApp {
             hovered_visual_kind: None,
             camera: Camera::default(),
             max_depth: 1,
+            theme_preference: None,
             status: "Ready".to_string(),
             cached_visuals: Vec::new(),
             layout_scratch: LayoutScratch::default(),
@@ -263,6 +268,48 @@ impl Default for DiskMapApp {
             layout_dirty: true,
             last_layout_refresh: Instant::now(),
             pending_repaint: false,
+        }
+    }
+}
+
+impl DiskMapApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+        if let Some(storage) = cc.storage {
+            app.restore_preferences(storage);
+        }
+        if let Some(theme) = app.theme_preference {
+            apply_theme_preference(&cc.egui_ctx, theme);
+        } else {
+            app.theme_preference = Some(cc.egui_ctx.theme());
+        }
+        app
+    }
+
+    fn restore_preferences(&mut self, storage: &dyn eframe::Storage) {
+        if let Some(path_input) = storage.get_string(STORAGE_PATH_INPUT) {
+            if !path_input.trim().is_empty() {
+                self.path_input = path_input;
+            }
+        }
+
+        if let Some(depth) = storage
+            .get_string(STORAGE_MAX_DEPTH)
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            self.max_depth = depth.clamp(1, 10);
+        }
+
+        self.theme_preference = storage
+            .get_string(STORAGE_THEME)
+            .and_then(|value| parse_theme_preference(&value));
+    }
+
+    fn save_preferences(&self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(STORAGE_PATH_INPUT, self.path_input.clone());
+        storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
+        if let Some(theme) = self.theme_preference {
+            storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
         }
     }
 }
@@ -299,6 +346,10 @@ impl eframe::App for DiskMapApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.show_treemap(ui);
         });
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.save_preferences(storage);
     }
 }
 
@@ -446,7 +497,9 @@ impl DiskMapApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                theme_cycle_button(ui);
+                if let Some(theme) = theme_cycle_button(ui) {
+                    self.theme_preference = Some(theme);
+                }
             });
         });
     }
@@ -1750,29 +1803,47 @@ fn arrow_geom(painter: &egui::Painter, center: Pos2, point_right: bool, stroke: 
     painter.line_segment([end, tip_b], stroke);
 }
 
-fn theme_cycle_button(ui: &mut egui::Ui) -> egui::Response {
+fn apply_theme_preference(ctx: &egui::Context, theme: Theme) {
+    let (preference, system_theme) = match theme {
+        Theme::Dark => (egui::ThemePreference::Dark, egui::SystemTheme::Dark),
+        Theme::Light => (egui::ThemePreference::Light, egui::SystemTheme::Light),
+    };
+    ctx.set_theme(preference);
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(system_theme));
+}
+
+fn parse_theme_preference(value: &str) -> Option<Theme> {
+    match value {
+        "dark" => Some(Theme::Dark),
+        "light" => Some(Theme::Light),
+        _ => None,
+    }
+}
+
+fn theme_preference_name(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => "dark",
+        Theme::Light => "light",
+    }
+}
+
+fn theme_cycle_button(ui: &mut egui::Ui) -> Option<Theme> {
     let current = ui.ctx().theme();
-    let (icon, tooltip, next_pref, next_sys) = match current {
+    let (icon, tooltip, next_theme) = match current {
         Theme::Dark => (
             ToolbarIcon::ThemeLight,
             "Switch to light mode",
-            egui::ThemePreference::Light,
-            egui::SystemTheme::Light,
+            Theme::Light,
         ),
-        Theme::Light => (
-            ToolbarIcon::ThemeDark,
-            "Switch to dark mode",
-            egui::ThemePreference::Dark,
-            egui::SystemTheme::Dark,
-        ),
+        Theme::Light => (ToolbarIcon::ThemeDark, "Switch to dark mode", Theme::Dark),
     };
     let response = icon_button(ui, true, icon).on_hover_text(tooltip);
     if response.clicked() {
-        ui.ctx().set_theme(next_pref);
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::SetTheme(next_sys));
+        apply_theme_preference(ui.ctx(), next_theme);
+        Some(next_theme)
+    } else {
+        None
     }
-    response
 }
 
 fn section_divider(ui: &mut egui::Ui, palette: &Palette) {
@@ -1892,7 +1963,25 @@ mod tests {
     use super::*;
     use crate::scanner::{DiscoveredNode, ProgressSnapshot, ScanBatch};
     use crate::tree::NodeRecord;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct TestStorage {
+        values: BTreeMap<String, String>,
+    }
+
+    impl eframe::Storage for TestStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_string(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     fn root_started(scan_id: u64) -> ScanMessage {
         ScanMessage::Started {
@@ -2026,6 +2115,49 @@ mod tests {
     #[test]
     fn default_scan_options_keep_cache_disabled() {
         assert_eq!(DEFAULT_SCAN_OPTIONS.cache_mode, CacheMode::Disabled);
+    }
+
+    #[test]
+    fn preferences_restore_path_depth_and_theme() {
+        let mut storage = TestStorage::default();
+        storage
+            .values
+            .insert(STORAGE_PATH_INPUT.into(), "/restored".into());
+        storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
+        storage.values.insert(STORAGE_THEME.into(), "dark".into());
+        let mut app = DiskMapApp::default();
+
+        app.restore_preferences(&storage);
+
+        assert_eq!(app.path_input, "/restored");
+        assert_eq!(app.max_depth, 10);
+        assert_eq!(app.theme_preference, Some(Theme::Dark));
+    }
+
+    #[test]
+    fn preferences_save_path_depth_and_theme() {
+        let mut storage = TestStorage::default();
+        let app = DiskMapApp {
+            path_input: "/next".into(),
+            max_depth: 4,
+            theme_preference: Some(Theme::Light),
+            ..Default::default()
+        };
+
+        app.save_preferences(&mut storage);
+
+        assert_eq!(
+            storage.values.get(STORAGE_PATH_INPUT).map(String::as_str),
+            Some("/next")
+        );
+        assert_eq!(
+            storage.values.get(STORAGE_MAX_DEPTH).map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            storage.values.get(STORAGE_THEME).map(String::as_str),
+            Some("light")
+        );
     }
 
     #[test]
