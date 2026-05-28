@@ -174,7 +174,7 @@ struct TreeStore {
 - [x] Keep SQLite cache disabled by default
 - [x] Maintain clippy-clean code with `cargo clippy --all-targets --all-features -- -D warnings`
 - [x] Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
-- [ ] Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
+- [x] Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
 - [ ] Persist lightweight preferences: last scan path, window size, theme, depth, and scan options
 
 ### Phase 3: Scan Controls

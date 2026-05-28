@@ -49,6 +49,11 @@ struct Palette {
     shadow_color: Color32,
 }
 
+struct StateMessage {
+    title: &'static str,
+    detail: String,
+}
+
 const DARK_PALETTE: Palette = Palette {
     surface: Color32::from_rgb(0x0F, 0x0F, 0x12),
     panel: Color32::from_rgb(0x18, 0x18, 0x1B),
@@ -464,7 +469,7 @@ impl DiskMapApp {
             .selected_id()
             .or(self.navigation.focused_root());
         let Some(node_id) = subject_id else {
-            ui.label(RichText::new("Run a scan to populate the treemap.").color(p.text_muted));
+            self.show_state_message(ui, p, &self.no_root_state_message());
             self.show_progress_section(ui, p);
             self.show_scan_issue_section(ui, p);
             self.show_search_section(ui, p);
@@ -686,6 +691,17 @@ impl DiskMapApp {
         );
     }
 
+    fn show_state_message(&self, ui: &mut egui::Ui, p: &Palette, message: &StateMessage) {
+        ui.label(
+            RichText::new(message.title)
+                .strong()
+                .size(14.0)
+                .color(p.text),
+        );
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(&message.detail).color(p.text_muted).small()).wrap());
+    }
+
     fn show_scan_issue_section(&self, ui: &mut egui::Ui, p: &Palette) {
         let summary = self.scan.issue_summary();
         if !summary.has_findings() {
@@ -820,6 +836,74 @@ impl DiskMapApp {
         });
     }
 
+    fn no_root_state_message(&self) -> StateMessage {
+        if self.scan.is_scanning() {
+            return StateMessage {
+                title: "Starting scan",
+                detail: format!("Waiting for scan results from {}.", self.path_input.trim()),
+            };
+        }
+
+        if self.status.starts_with("Error") {
+            return StateMessage {
+                title: "Unable to scan path",
+                detail: self
+                    .status
+                    .strip_prefix("Error: ")
+                    .unwrap_or(&self.status)
+                    .to_string(),
+            };
+        }
+
+        if self.status.starts_with("Scan cancelled") {
+            return StateMessage {
+                title: "Scan cancelled",
+                detail: "Start another scan to populate the treemap.".to_string(),
+            };
+        }
+
+        StateMessage {
+            title: "No scan loaded",
+            detail: "Choose a path and start a scan to populate the treemap.".to_string(),
+        }
+    }
+
+    fn empty_root_state_message(&self, root_id: NodeId) -> Option<StateMessage> {
+        let root = self.tree.node(root_id);
+        if self.scan.is_scanning() || !root.children.is_empty() {
+            return None;
+        }
+
+        Some(StateMessage {
+            title: "Empty folder",
+            detail: format!("{} has no visible files or child folders.", root.name),
+        })
+    }
+
+    fn paint_state_message(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        style: &egui::Style,
+        palette: &Palette,
+        message: &StateMessage,
+    ) {
+        painter.text(
+            rect.center() - Vec2::new(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            message.title,
+            egui::TextStyle::Heading.resolve(style),
+            palette.text_faint,
+        );
+        painter.text(
+            rect.center() + Vec2::new(0.0, 14.0),
+            egui::Align2::CENTER_CENTER,
+            truncate_middle(&message.detail, 72),
+            egui::TextStyle::Small.resolve(style),
+            palette.text_muted,
+        );
+    }
+
     fn show_treemap(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui.ctx());
         let available = ui.available_rect_before_wrap();
@@ -828,15 +912,20 @@ impl DiskMapApp {
         painter.rect_filled(available, 0.0, p.surface);
 
         let Some(root_id) = self.navigation.focused_root() else {
-            painter.text(
-                available.center(),
-                egui::Align2::CENTER_CENTER,
-                "Input path and click Scan",
-                egui::TextStyle::Heading.resolve(ui.style()),
-                p.text_faint,
+            self.paint_state_message(
+                &painter,
+                available,
+                ui.style(),
+                p,
+                &self.no_root_state_message(),
             );
             return;
         };
+
+        if let Some(message) = self.empty_root_state_message(root_id) {
+            self.paint_state_message(&painter, available, ui.style(), p, &message);
+            return;
+        }
 
         let canvas_changed = self.last_canvas_rect != Some(available);
         if canvas_changed {
@@ -1994,6 +2083,33 @@ mod tests {
         assert_eq!(summary.skipped_paths, 1);
         assert_eq!(summary.symlinks, 1);
         assert_eq!(app.finished_status(0), "Finished: 0 B · 1 issue");
+    }
+
+    #[test]
+    fn no_root_state_message_reflects_error_and_cancelled_states() {
+        let mut app = DiskMapApp {
+            status: "Error: Path does not exist: /missing".into(),
+            ..Default::default()
+        };
+
+        let error_message = app.no_root_state_message();
+        assert_eq!(error_message.title, "Unable to scan path");
+        assert_eq!(error_message.detail, "Path does not exist: /missing");
+
+        app.status = "Scan cancelled".into();
+        let cancelled_message = app.no_root_state_message();
+        assert_eq!(cancelled_message.title, "Scan cancelled");
+    }
+
+    #[test]
+    fn empty_root_state_message_reports_empty_finished_folder() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+
+        let message = app.empty_root_state_message(0).expect("empty root state");
+
+        assert_eq!(message.title, "Empty folder");
+        assert!(message.detail.contains("root"));
     }
 
     #[test]
