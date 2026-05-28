@@ -20,12 +20,13 @@ pub enum CacheMode {
     Enabled,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub batch_flush_interval: Duration,
     pub max_pending_nodes: usize,
     pub max_pending_size_deltas: usize,
     pub cache_mode: CacheMode,
+    pub exclude_patterns: Vec<String>,
 }
 
 impl Default for ScanOptions {
@@ -35,8 +36,23 @@ impl Default for ScanOptions {
             max_pending_nodes: 2_048,
             max_pending_size_deltas: 4_096,
             cache_mode: CacheMode::Disabled,
+            exclude_patterns: Vec::new(),
         }
     }
+}
+
+pub fn parse_exclude_patterns(input: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for pattern in input
+        .split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    {
+        if !patterns.iter().any(|existing| existing == pattern) {
+            patterns.push(pattern.to_string());
+        }
+    }
+    patterns
 }
 
 #[derive(Debug, Clone, Default)]
@@ -261,6 +277,80 @@ struct AggregateState {
     buckets: FxHashMap<NodeId, AggregateBucket>,
 }
 
+#[derive(Debug, Clone)]
+struct ExcludeMatcher {
+    patterns: Vec<String>,
+}
+
+impl ExcludeMatcher {
+    fn new(patterns: Vec<String>) -> Self {
+        Self {
+            patterns: patterns
+                .into_iter()
+                .map(|pattern| pattern.replace('\\', "/").to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+
+        let normalized_path = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let components: Vec<String> = path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .map(|component| component.to_ascii_lowercase())
+            .collect();
+
+        self.patterns.iter().any(|pattern| {
+            if pattern.contains('/') || pattern.contains('\\') {
+                if pattern.contains('*') {
+                    wildcard_match(pattern, &normalized_path)
+                } else {
+                    normalized_path.contains(pattern)
+                }
+            } else {
+                components
+                    .iter()
+                    .any(|component| wildcard_match(pattern, component))
+            }
+        })
+    }
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return value == pattern;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return true;
+    }
+
+    let mut remainder = value;
+    for (index, part) in parts.iter().enumerate() {
+        let Some(found_at) = remainder.find(part) else {
+            return false;
+        };
+        if index == 0 && !pattern.starts_with('*') && found_at != 0 {
+            return false;
+        }
+        remainder = &remainder[found_at + part.len()..];
+    }
+
+    pattern.ends_with('*') || value.ends_with(parts.last().copied().unwrap_or_default())
+}
+
 impl AggregateState {
     fn add_file(&mut self, parent_id: NodeId, size: u64) {
         let bucket = self.buckets.entry(parent_id).or_default();
@@ -274,7 +364,7 @@ impl AggregateState {
 }
 
 impl BatchAccumulator {
-    fn new(options: ScanOptions) -> Self {
+    fn new(options: &ScanOptions) -> Self {
         Self {
             discovered_nodes: Vec::with_capacity(options.max_pending_nodes.min(256)),
             size_deltas: FxHashMap::with_capacity_and_hasher(
@@ -293,7 +383,7 @@ impl BatchAccumulator {
             && self.progress.is_none()
     }
 
-    fn should_flush(&self, options: ScanOptions, last_flush: Instant) -> bool {
+    fn should_flush(&self, options: &ScanOptions, last_flush: Instant) -> bool {
         self.discovered_nodes.len() >= options.max_pending_nodes
             || self.size_deltas.len() >= options.max_pending_size_deltas
             || last_flush.elapsed() >= options.batch_flush_interval
@@ -368,17 +458,26 @@ fn run_scan(
         CacheMode::Enabled => ScanDb::new(&std::env::temp_dir().join("disk-map.db")).ok(),
     };
     let mut counters = ScanCounters::new(path.clone());
-    let mut batch = BatchAccumulator::new(options);
+    let mut batch = BatchAccumulator::new(&options);
     let mut aggregate_state = AggregateState::default();
     let mut last_flush = Instant::now();
 
     let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
     let walker_prefetch_perf = Arc::clone(&prefetch_perf);
     let cache_enabled = matches!(options.cache_mode, CacheMode::Enabled);
+    let exclude_matcher = ExcludeMatcher::new(options.exclude_patterns.clone());
     let walker = WalkDirGeneric::<ScanWalkState>::new(&path)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_depth, _path, _state, children| {
+            if !exclude_matcher.is_empty() {
+                children.retain(|child| {
+                    child
+                        .as_ref()
+                        .map_or(true, |entry| !exclude_matcher.matches_path(&entry.path()))
+                });
+            }
+
             let file_count = children
                 .iter()
                 .filter_map(|child| child.as_ref().ok())
@@ -546,7 +645,7 @@ fn run_scan(
                             });
                             batch.scanned_nodes.push(node_id);
                             counters.current_path = entry_path;
-                            if batch.should_flush(options, last_flush) {
+                            if batch.should_flush(&options, last_flush) {
                                 flush_batch(
                                     &tx,
                                     scan_id,
@@ -671,7 +770,7 @@ fn run_scan(
 
         counters.current_path = entry_path;
 
-        if batch.should_flush(options, last_flush) {
+        if batch.should_flush(&options, last_flush) {
             flush_batch(
                 &tx,
                 scan_id,
@@ -1000,7 +1099,7 @@ mod tests {
     #[test]
     fn batch_accumulator_merges_size_deltas_by_node() {
         let options = ScanOptions::default();
-        let mut batch = BatchAccumulator::new(options);
+        let mut batch = BatchAccumulator::new(&options);
 
         *batch.size_deltas.entry(1).or_insert(0) += 10;
         *batch.size_deltas.entry(1).or_insert(0) += 32;
@@ -1011,6 +1110,23 @@ mod tests {
 
         assert_eq!(deltas.get(&1), Some(&42));
         assert_eq!(deltas.get(&2), Some(&5));
+    }
+
+    #[test]
+    fn parse_exclude_patterns_trims_splits_and_deduplicates() {
+        let patterns = parse_exclude_patterns(".git, node_modules; target\n.git");
+
+        assert_eq!(patterns, vec![".git", "node_modules", "target"]);
+    }
+
+    #[test]
+    fn exclude_matcher_matches_components_paths_and_wildcards() {
+        let matcher = ExcludeMatcher::new(parse_exclude_patterns(".git,Library/Caches,*.tmp"));
+
+        assert!(matcher.matches_path(Path::new("/repo/.git/config")));
+        assert!(matcher.matches_path(Path::new("/Users/me/Library/Caches/app/file")));
+        assert!(matcher.matches_path(Path::new("/tmp/build.tmp")));
+        assert!(!matcher.matches_path(Path::new("/repo/src/targeted/file")));
     }
 
     #[cfg(unix)]

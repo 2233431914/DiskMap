@@ -177,10 +177,11 @@ struct TreeStore {
 - [x] Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
 - [x] Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
 - [x] Persist lightweight preferences: last scan path, window size, theme, and depth
-- [ ] Persist user-facing scan options once scan controls are added
+- [x] Persist current user-facing scan options
 
 ### Phase 3: Scan Controls
-- [ ] Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories
+- [x] Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories
+- Exclude input accepts comma, semicolon, or newline separated patterns. Plain names match path components; patterns containing `/` match the normalized path; `*` wildcard is supported.
 - [ ] Add safe scan mode options:
   - [ ] Do not cross filesystem or mount boundaries
   - [ ] Include or exclude hidden files

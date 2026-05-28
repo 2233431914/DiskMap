@@ -1,6 +1,8 @@
 use crate::format::format_bytes;
 use crate::platform::{open_path, reveal_in_finder};
-use crate::scanner::{CacheMode, PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions};
+use crate::scanner::{
+    parse_exclude_patterns, PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
+};
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{
     layout_treemap, Camera, LayoutScratch, TreemapLayoutParams, VisualKind, VisualNode,
@@ -25,14 +27,9 @@ const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
 const STORAGE_PATH_INPUT: &str = "disk_map.path_input";
+const STORAGE_EXCLUDE_INPUT: &str = "disk_map.exclude_input";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
-const DEFAULT_SCAN_OPTIONS: ScanOptions = ScanOptions {
-    batch_flush_interval: Duration::from_millis(33),
-    max_pending_nodes: 2_048,
-    max_pending_size_deltas: 4_096,
-    cache_mode: CacheMode::Disabled,
-};
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -221,6 +218,7 @@ fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
 
 pub struct DiskMapApp {
     path_input: String,
+    exclude_input: String,
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
@@ -248,6 +246,7 @@ impl Default for DiskMapApp {
         let (tx, rx) = unbounded();
         Self {
             path_input: dirs_home_fallback(),
+            exclude_input: String::new(),
             initial_scan_pending: true,
             tx,
             rx,
@@ -293,6 +292,10 @@ impl DiskMapApp {
             }
         }
 
+        if let Some(exclude_input) = storage.get_string(STORAGE_EXCLUDE_INPUT) {
+            self.exclude_input = exclude_input;
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -307,9 +310,17 @@ impl DiskMapApp {
 
     fn save_preferences(&self, storage: &mut dyn eframe::Storage) {
         storage.set_string(STORAGE_PATH_INPUT, self.path_input.clone());
+        storage.set_string(STORAGE_EXCLUDE_INPUT, self.exclude_input.clone());
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
             storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
+        }
+    }
+
+    fn scan_options(&self) -> ScanOptions {
+        ScanOptions {
+            exclude_patterns: parse_exclude_patterns(&self.exclude_input),
+            ..ScanOptions::default()
         }
     }
 }
@@ -428,6 +439,20 @@ impl DiskMapApp {
                     self.start_scan();
                 }
             }
+
+            ui.add_space(6.0);
+
+            ui.label(
+                RichText::new("EXCLUDE")
+                    .size(10.0)
+                    .color(palette(ui.ctx()).text_faint)
+                    .strong(),
+            );
+            ui.add_sized(
+                [150.0, 28.0],
+                egui::TextEdit::singleline(&mut self.exclude_input)
+                    .hint_text(".git,node_modules,target"),
+            );
 
             ui.add_space(6.0);
 
@@ -1419,7 +1444,7 @@ impl DiskMapApp {
     fn start_scan(&mut self) {
         self.scan.start(
             std::path::PathBuf::from(self.path_input.trim()),
-            DEFAULT_SCAN_OPTIONS,
+            self.scan_options(),
             self.tx.clone(),
         );
 
@@ -1961,6 +1986,7 @@ fn format_perf_stats(stats: &PerfStats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::CacheMode;
     use crate::scanner::{DiscoveredNode, ProgressSnapshot, ScanBatch};
     use crate::tree::NodeRecord;
     use std::collections::BTreeMap;
@@ -2114,7 +2140,10 @@ mod tests {
 
     #[test]
     fn default_scan_options_keep_cache_disabled() {
-        assert_eq!(DEFAULT_SCAN_OPTIONS.cache_mode, CacheMode::Disabled);
+        assert_eq!(
+            DiskMapApp::default().scan_options().cache_mode,
+            CacheMode::Disabled
+        );
     }
 
     #[test]
@@ -2123,6 +2152,9 @@ mod tests {
         storage
             .values
             .insert(STORAGE_PATH_INPUT.into(), "/restored".into());
+        storage
+            .values
+            .insert(STORAGE_EXCLUDE_INPUT.into(), ".git,target".into());
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2130,6 +2162,7 @@ mod tests {
         app.restore_preferences(&storage);
 
         assert_eq!(app.path_input, "/restored");
+        assert_eq!(app.exclude_input, ".git,target");
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2139,6 +2172,7 @@ mod tests {
         let mut storage = TestStorage::default();
         let app = DiskMapApp {
             path_input: "/next".into(),
+            exclude_input: "node_modules;target".into(),
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2155,8 +2189,28 @@ mod tests {
             Some("4")
         );
         assert_eq!(
+            storage
+                .values
+                .get(STORAGE_EXCLUDE_INPUT)
+                .map(String::as_str),
+            Some("node_modules;target")
+        );
+        assert_eq!(
             storage.values.get(STORAGE_THEME).map(String::as_str),
             Some("light")
+        );
+    }
+
+    #[test]
+    fn scan_options_include_user_exclude_patterns() {
+        let app = DiskMapApp {
+            exclude_input: ".git, node_modules; target".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            app.scan_options().exclude_patterns,
+            vec![".git", "node_modules", "target"]
         );
     }
 

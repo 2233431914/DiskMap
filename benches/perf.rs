@@ -89,6 +89,7 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                     max_pending_nodes: 2048,
                     max_pending_size_deltas: 4096,
                     cache_mode: CacheMode::Disabled,
+                    exclude_patterns: Vec::new(),
                 },
             ));
         })
