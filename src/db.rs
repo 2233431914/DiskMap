@@ -52,7 +52,9 @@ impl ScanDb {
             .ok()?;
 
         let (size, cached_mtime): (u64, u64) = stmt
-            .query_row(params![path_str.as_ref()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(params![path_str.as_ref()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .ok()?;
 
         let entry = CacheEntry {

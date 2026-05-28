@@ -47,7 +47,7 @@ pub struct Camera {
 pub struct SearchState {
     query_lower: String,
     matched_bits: FixedBitSet,
-    matched_count: usize,
+    matched_ids: Vec<NodeId>,
     matched_descendant_counts: Vec<u32>,
 }
 
@@ -71,12 +71,32 @@ pub struct LayoutScratch {
     row: SmallVec<[LayoutItem; 16]>,
 }
 
+pub struct TreemapLayoutParams<'a, 'b> {
+    pub root: NodeId,
+    pub canvas_rect: Rect,
+    pub camera: Camera,
+    pub max_depth: usize,
+    pub search_state: &'a SearchState,
+    pub out: &'b mut Vec<VisualNode>,
+    pub scratch: &'b mut LayoutScratch,
+}
+
+struct LayoutContext<'a> {
+    tree: &'a mut TreeStore,
+    root_id: NodeId,
+    total_size: u64,
+    max_depth: usize,
+    search_state: &'a SearchState,
+    out: &'a mut Vec<VisualNode>,
+    scratch: &'a mut LayoutScratch,
+}
+
 impl SearchState {
     pub fn clear(&mut self, tree_len: usize) {
         self.query_lower.clear();
         self.matched_bits.clear();
         self.matched_bits.grow(tree_len);
-        self.matched_count = 0;
+        self.matched_ids.clear();
         self.matched_descendant_counts.clear();
         self.matched_descendant_counts.resize(tree_len, 0);
     }
@@ -89,7 +109,7 @@ impl SearchState {
         self.query_lower = query.trim().to_lowercase();
         self.matched_bits.clear();
         self.matched_bits.grow(tree.len());
-        self.matched_count = 0;
+        self.matched_ids.clear();
         self.matched_descendant_counts.clear();
         self.matched_descendant_counts.resize(tree.len(), 0);
 
@@ -103,7 +123,8 @@ impl SearchState {
         let mut stack = vec![root_id];
         while let Some(node_id) = stack.pop() {
             self.ingest_node_if_matches(tree, node_id);
-            stack.extend(tree.node(node_id).children.iter().rev().copied());
+            tree.ensure_sorted_children(node_id);
+            stack.extend(tree.sorted_children(node_id).iter().rev().copied());
         }
     }
 
@@ -153,7 +174,11 @@ impl SearchState {
     }
 
     pub fn match_count(&self) -> usize {
-        self.matched_count
+        self.matched_ids.len()
+    }
+
+    pub fn matches(&self) -> &[NodeId] {
+        &self.matched_ids
     }
 
     fn ingest_node_if_matches(&mut self, tree: &mut TreeStore, node_id: NodeId) -> bool {
@@ -161,11 +186,13 @@ impl SearchState {
             return false;
         }
 
-        if !tree.node_name_matches_query(node_id, &self.query_lower) || self.matched_bits.contains(node_id) {
+        if !tree.node_name_matches_query(node_id, &self.query_lower)
+            || self.matched_bits.contains(node_id)
+        {
             return false;
         }
         self.matched_bits.insert(node_id);
-        self.matched_count += 1;
+        self.matched_ids.push(node_id);
 
         let mut current = tree.node(node_id).parent;
         while let Some(ancestor_id) = current {
@@ -207,56 +234,42 @@ impl Camera {
     }
 }
 
-pub fn layout_treemap(
-    tree: &mut TreeStore,
-    root: NodeId,
-    canvas_rect: Rect,
-    camera: Camera,
-    max_depth: usize,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
-    scratch: &mut LayoutScratch,
-) {
-    out.clear();
-    let root_node = tree.node(root);
+pub fn layout_treemap(tree: &mut TreeStore, params: TreemapLayoutParams<'_, '_>) {
+    params.out.clear();
+    let root_node = tree.node(params.root);
     let total_size = root_node.size.max(1);
-    let layout_rect = camera.apply(canvas_rect, canvas_rect).shrink(8.0);
-
-    layout_node_squarified(
+    let layout_rect = params
+        .camera
+        .apply(params.canvas_rect, params.canvas_rect)
+        .shrink(8.0);
+    let mut context = LayoutContext {
         tree,
-        root,
-        layout_rect,
-        0,
-        max_depth,
-        root,
+        root_id: params.root,
         total_size,
-        search_state,
-        out,
-        scratch,
-    );
+        max_depth: params.max_depth,
+        search_state: params.search_state,
+        out: params.out,
+        scratch: params.scratch,
+    };
+
+    layout_node_squarified(&mut context, params.root, layout_rect, 0);
 }
 
 fn layout_node_squarified(
-    tree: &mut TreeStore,
+    context: &mut LayoutContext<'_>,
     parent_id: NodeId,
     rect: Rect,
     depth: usize,
-    max_depth: usize,
-    root_id: NodeId,
-    total_size: u64,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
-    scratch: &mut LayoutScratch,
 ) {
-    if out.len() >= MAX_VISUAL_NODES || depth >= max_depth {
+    if context.out.len() >= MAX_VISUAL_NODES || depth >= context.max_depth {
         return;
     }
     if rect.width() < MIN_DRAW_SIDE || rect.height() < MIN_DRAW_SIDE {
         return;
     }
 
-    tree.ensure_sorted_children(parent_id);
-    let children = tree.sorted_children(parent_id);
+    context.tree.ensure_sorted_children(parent_id);
+    let children = context.tree.sorted_children(parent_id);
     if children.is_empty() {
         return;
     }
@@ -268,20 +281,20 @@ fn layout_node_squarified(
 
     let total_child_size: u64 = children
         .iter()
-        .map(|child_id| tree.node(*child_id).size)
+        .map(|child_id| context.tree.node(*child_id).size)
         .filter(|size| *size > 0)
         .sum();
     if total_child_size == 0 {
         return;
     }
 
-    let mut items = std::mem::take(&mut scratch.items);
+    let mut items = std::mem::take(&mut context.scratch.items);
     items.clear();
     if items.capacity() < children.len() {
         items.reserve(children.len() - items.capacity());
     }
     for &node_id in children {
-        let size = tree.node(node_id).size;
+        let size = context.tree.node(node_id).size;
         if size > 0 {
             items.push(LayoutItem {
                 node_id,
@@ -290,42 +303,25 @@ fn layout_node_squarified(
         }
     }
     if items.is_empty() {
-        scratch.items = items;
+        context.scratch.items = items;
         return;
     }
 
-    let debug_stats = squarify_items(
-        tree,
-        &items,
-        rect,
-        depth,
-        max_depth,
-        root_id,
-        total_size,
-        search_state,
-        out,
-        scratch,
-    );
-    scratch.items = items;
+    let debug_stats = squarify_items(context, &items, rect, depth);
+    context.scratch.items = items;
 
     emit_debug_warnings(depth, &debug_stats);
 }
 
 fn squarify_items(
-    tree: &mut TreeStore,
+    context: &mut LayoutContext<'_>,
     items: &[LayoutItem],
     rect: Rect,
     depth: usize,
-    max_depth: usize,
-    root_id: NodeId,
-    total_size: u64,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
-    scratch: &mut LayoutScratch,
 ) -> LayoutDebugStats {
     let mut stats = LayoutDebugStats::default();
     let mut remaining = rect;
-    scratch.row.clear();
+    context.scratch.row.clear();
     let mut index = 0usize;
 
     while index < items.len() && remaining.width() > 0.0 && remaining.height() > 0.0 {
@@ -335,15 +331,17 @@ fn squarify_items(
         }
 
         let next_item = items[index];
-        if scratch.row.is_empty() {
-            scratch.row.push(next_item);
+        if context.scratch.row.is_empty() {
+            context.scratch.row.push(next_item);
             index += 1;
             continue;
         }
 
-        let current_score = worst_aspect_ratio(scratch.row.iter().map(|item| item.area), short_side);
+        let current_score =
+            worst_aspect_ratio(context.scratch.row.iter().map(|item| item.area), short_side);
         let candidate_score = worst_aspect_ratio(
-            scratch
+            context
+                .scratch
                 .row
                 .iter()
                 .map(|item| item.area)
@@ -352,45 +350,21 @@ fn squarify_items(
         );
 
         if candidate_score <= current_score {
-            scratch.row.push(next_item);
+            context.scratch.row.push(next_item);
             index += 1;
         } else {
-            let mut row_items = std::mem::take(&mut scratch.row);
-            remaining = layout_row(
-                tree,
-                &row_items,
-                remaining,
-                depth,
-                max_depth,
-                root_id,
-                total_size,
-                search_state,
-                out,
-                &mut stats,
-                scratch,
-            );
+            let mut row_items = std::mem::take(&mut context.scratch.row);
+            remaining = layout_row(context, &row_items, remaining, depth, &mut stats);
             row_items.clear();
-            scratch.row = row_items;
+            context.scratch.row = row_items;
         }
     }
 
-    if !scratch.row.is_empty() && remaining.width() > 0.0 && remaining.height() > 0.0 {
-        let mut row_items = std::mem::take(&mut scratch.row);
-        let _ = layout_row(
-            tree,
-            &row_items,
-            remaining,
-            depth,
-            max_depth,
-            root_id,
-            total_size,
-            search_state,
-            out,
-            &mut stats,
-            scratch,
-        );
+    if !context.scratch.row.is_empty() && remaining.width() > 0.0 && remaining.height() > 0.0 {
+        let mut row_items = std::mem::take(&mut context.scratch.row);
+        let _ = layout_row(context, &row_items, remaining, depth, &mut stats);
         row_items.clear();
-        scratch.row = row_items;
+        context.scratch.row = row_items;
     }
 
     stats
@@ -426,17 +400,11 @@ where
 }
 
 fn layout_row(
-    tree: &mut TreeStore,
+    context: &mut LayoutContext<'_>,
     row: &[LayoutItem],
     remaining_rect: Rect,
     depth: usize,
-    max_depth: usize,
-    root_id: NodeId,
-    total_size: u64,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
     debug_stats: &mut LayoutDebugStats,
-    scratch: &mut LayoutScratch,
 ) -> Rect {
     let sum_area: f32 = row.iter().map(|item| item.area).sum();
     if sum_area <= 0.0 || remaining_rect.width() <= 0.0 || remaining_rect.height() <= 0.0 {
@@ -449,53 +417,22 @@ fn layout_row(
     }
 
     if remaining_rect.width() >= remaining_rect.height() {
-        layout_vertical_column(
-            tree,
-            row,
-            remaining_rect,
-            sum_area,
-            depth,
-            max_depth,
-            root_id,
-            total_size,
-            search_state,
-            out,
-            debug_stats,
-            scratch,
-        )
+        layout_vertical_column(context, row, remaining_rect, sum_area, depth, debug_stats)
     } else {
-        layout_horizontal_row(
-            tree,
-            row,
-            remaining_rect,
-            sum_area,
-            depth,
-            max_depth,
-            root_id,
-            total_size,
-            search_state,
-            out,
-            debug_stats,
-            scratch,
-        )
+        layout_horizontal_row(context, row, remaining_rect, sum_area, depth, debug_stats)
     }
 }
 
 fn layout_horizontal_row(
-    tree: &mut TreeStore,
+    context: &mut LayoutContext<'_>,
     row: &[LayoutItem],
     remaining_rect: Rect,
     sum_area: f32,
     depth: usize,
-    max_depth: usize,
-    root_id: NodeId,
-    total_size: u64,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
     debug_stats: &mut LayoutDebugStats,
-    scratch: &mut LayoutScratch,
 ) -> Rect {
-    let row_height = (sum_area / remaining_rect.width().max(f32::EPSILON)).min(remaining_rect.height());
+    let row_height =
+        (sum_area / remaining_rect.width().max(f32::EPSILON)).min(remaining_rect.height());
     if row_height <= 0.0 {
         return remaining_rect;
     }
@@ -517,46 +454,35 @@ fn layout_horizontal_row(
             pos2((x + width).min(row_rect.right()), row_rect.bottom()),
         );
         x = item_rect.right();
-        emit_visual_and_recurse(
-            tree,
-            item.node_id,
-            item_rect,
-            depth,
-            max_depth,
-            root_id,
-            total_size,
-            search_state,
-            out,
-            debug_stats,
-            scratch,
-        );
+        emit_visual_and_recurse(context, item.node_id, item_rect, depth, debug_stats);
     }
 
-    Rect::from_min_max(pos2(remaining_rect.left(), row_rect.bottom()), remaining_rect.max)
+    Rect::from_min_max(
+        pos2(remaining_rect.left(), row_rect.bottom()),
+        remaining_rect.max,
+    )
 }
 
 fn layout_vertical_column(
-    tree: &mut TreeStore,
+    context: &mut LayoutContext<'_>,
     row: &[LayoutItem],
     remaining_rect: Rect,
     sum_area: f32,
     depth: usize,
-    max_depth: usize,
-    root_id: NodeId,
-    total_size: u64,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
     debug_stats: &mut LayoutDebugStats,
-    scratch: &mut LayoutScratch,
 ) -> Rect {
-    let column_width = (sum_area / remaining_rect.height().max(f32::EPSILON)).min(remaining_rect.width());
+    let column_width =
+        (sum_area / remaining_rect.height().max(f32::EPSILON)).min(remaining_rect.width());
     if column_width <= 0.0 {
         return remaining_rect;
     }
 
     let column_rect = Rect::from_min_max(
         remaining_rect.min,
-        pos2(remaining_rect.left() + column_width, remaining_rect.bottom()),
+        pos2(
+            remaining_rect.left() + column_width,
+            remaining_rect.bottom(),
+        ),
     );
 
     let mut y = column_rect.top();
@@ -571,38 +497,26 @@ fn layout_vertical_column(
             pos2(column_rect.right(), (y + height).min(column_rect.bottom())),
         );
         y = item_rect.bottom();
-        emit_visual_and_recurse(
-            tree,
-            item.node_id,
-            item_rect,
-            depth,
-            max_depth,
-            root_id,
-            total_size,
-            search_state,
-            out,
-            debug_stats,
-            scratch,
-        );
+        emit_visual_and_recurse(context, item.node_id, item_rect, depth, debug_stats);
     }
 
-    Rect::from_min_max(pos2(column_rect.right(), remaining_rect.top()), remaining_rect.max)
+    Rect::from_min_max(
+        pos2(column_rect.right(), remaining_rect.top()),
+        remaining_rect.max,
+    )
 }
 
 fn emit_visual_and_recurse(
-    tree: &mut TreeStore,
+    context: &mut LayoutContext<'_>,
     node_id: NodeId,
     raw_rect: Rect,
     depth: usize,
-    max_depth: usize,
-    root_id: NodeId,
-    total_size: u64,
-    search_state: &SearchState,
-    out: &mut Vec<VisualNode>,
     debug_stats: &mut LayoutDebugStats,
-    scratch: &mut LayoutScratch,
 ) {
-    if out.len() >= MAX_VISUAL_NODES || raw_rect.width() < MIN_DRAW_SIDE || raw_rect.height() < MIN_DRAW_SIDE {
+    if context.out.len() >= MAX_VISUAL_NODES
+        || raw_rect.width() < MIN_DRAW_SIDE
+        || raw_rect.height() < MIN_DRAW_SIDE
+    {
         return;
     }
 
@@ -617,21 +531,21 @@ fn emit_visual_and_recurse(
         return;
     }
 
-    out.push(make_visual_node(
-        tree,
+    context.out.push(make_visual_node(
+        context.tree,
         node_id,
         draw_rect,
         depth,
-        root_id,
-        total_size,
-        search_state,
+        context.root_id,
+        context.total_size,
+        context.search_state,
     ));
 
-    if depth + 1 >= max_depth {
+    if depth + 1 >= context.max_depth {
         return;
     }
 
-    let node = tree.node(node_id);
+    let node = context.tree.node(node_id);
     if node.children.is_empty() {
         return;
     }
@@ -641,18 +555,7 @@ fn emit_visual_and_recurse(
         return;
     }
 
-    layout_node_squarified(
-        tree,
-        node_id,
-        inner_rect,
-        depth + 1,
-        max_depth,
-        root_id,
-        total_size,
-        search_state,
-        out,
-        scratch,
-    );
+    layout_node_squarified(context, node_id, inner_rect, depth + 1);
 }
 
 fn inset_rect(rect: Rect, padding: f32) -> Rect {
@@ -679,9 +582,7 @@ fn emit_debug_warnings(depth: usize, stats: &LayoutDebugStats) {
     if stats.rect_count > 0 && (stats.strip_like_rects as f32 / stats.rect_count as f32) > 0.6 {
         eprintln!(
             "warning: strip-heavy squarify output at depth {depth}: {}/{} rects exceed aspect {}",
-            stats.strip_like_rects,
-            stats.rect_count,
-            STRIP_ASPECT_WARNING
+            stats.strip_like_rects, stats.rect_count, STRIP_ASPECT_WARNING
         );
     }
 }
@@ -771,12 +672,7 @@ mod tests {
         tree.set_root_path("/".into());
         let mut total = 0_u64;
         for (index, size) in sizes.iter().copied().enumerate() {
-            let child = tree.add_node(
-                Some(root),
-                format!("child-{index}"),
-                NodeKind::File,
-                size,
-            );
+            let child = tree.add_node(Some(root), format!("child-{index}"), NodeKind::File, size);
             tree.node_mut(child).scanned = true;
             total += size;
         }
@@ -792,10 +688,23 @@ mod tests {
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 800.0));
         let mut visuals = Vec::new();
         let mut scratch = LayoutScratch::default();
-        layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default(), &mut visuals, &mut scratch);
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: canvas,
+                camera: Camera::default(),
+                max_depth: 1,
+                search_state: &SearchState::default(),
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
 
         assert!(!visuals.is_empty());
-        assert!(visuals.iter().all(|visual| canvas.contains(visual.rect.min) && canvas.contains(visual.rect.max)));
+        assert!(visuals
+            .iter()
+            .all(|visual| canvas.contains(visual.rect.min) && canvas.contains(visual.rect.max)));
     }
 
     #[test]
@@ -813,6 +722,44 @@ mod tests {
         assert!(search_state.is_ancestor_of_match(root));
         assert!(search_state.is_ancestor_of_match(dir));
         assert!(!search_state.is_hidden(dir));
+        assert_eq!(search_state.matches(), &[file]);
+        assert_eq!(search_state.match_count(), search_state.matches().len());
+    }
+
+    #[test]
+    fn search_state_clear_removes_ordered_matches() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/".into());
+        let file = tree.add_node(Some(root), "match".into(), NodeKind::File, 1);
+        let mut search_state = SearchState::default();
+        search_state.rebuild(&mut tree, Some(root), "match");
+
+        search_state.clear(tree.len());
+
+        assert!(search_state.matches().is_empty());
+        assert_eq!(search_state.match_count(), 0);
+        assert!(!search_state.is_match(file));
+    }
+
+    #[test]
+    fn search_state_matches_follow_sorted_depth_first_order() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/".into());
+        let small_file = tree.add_node(Some(root), "match-small".into(), NodeKind::File, 1);
+        let dir = tree.add_node(Some(root), "match-dir".into(), NodeKind::Dir, 10);
+        let nested = tree.add_node(Some(dir), "match-nested".into(), NodeKind::File, 1);
+        let large_file = tree.add_node(Some(root), "match-large".into(), NodeKind::File, 20);
+        tree.repair_sorted_children(&[root, dir]);
+
+        let mut search_state = SearchState::default();
+        search_state.rebuild(&mut tree, Some(root), "match");
+
+        assert_eq!(
+            search_state.matches(),
+            &[dir, nested, large_file, small_file]
+        );
     }
 
     #[test]
@@ -827,7 +774,18 @@ mod tests {
         let tiny = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         let mut visuals = Vec::new();
         let mut scratch = LayoutScratch::default();
-        layout_treemap(&mut tree, root, tiny, Camera::default(), 2, &SearchState::default(), &mut visuals, &mut scratch);
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: tiny,
+                camera: Camera::default(),
+                max_depth: 2,
+                search_state: &SearchState::default(),
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
 
         assert!(visuals.is_empty());
     }
@@ -838,7 +796,18 @@ mod tests {
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 700.0));
         let mut visuals = Vec::new();
         let mut scratch = LayoutScratch::default();
-        layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default(), &mut visuals, &mut scratch);
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: canvas,
+                camera: Camera::default(),
+                max_depth: 1,
+                search_state: &SearchState::default(),
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
 
         let first = visuals.iter().find(|visual| {
             matches!(visual.kind, VisualKind::Node(node_id) if tree.node(node_id).name == "child-0")
@@ -857,9 +826,22 @@ mod tests {
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(900.0, 600.0));
         let mut visuals = Vec::new();
         let mut scratch = LayoutScratch::default();
-        layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default(), &mut visuals, &mut scratch);
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: canvas,
+                camera: Camera::default(),
+                max_depth: 1,
+                search_state: &SearchState::default(),
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
 
-        assert!(visuals.iter().all(|visual| visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0));
+        assert!(visuals
+            .iter()
+            .all(|visual| visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0));
     }
 
     #[test]
@@ -869,11 +851,24 @@ mod tests {
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 600.0));
         let mut visuals = Vec::new();
         let mut scratch = LayoutScratch::default();
-        layout_treemap(&mut tree, root, canvas, Camera::default(), 1, &SearchState::default(), &mut visuals, &mut scratch);
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: canvas,
+                camera: Camera::default(),
+                max_depth: 1,
+                search_state: &SearchState::default(),
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
 
         let total_area: f32 = visuals.iter().map(|visual| visual.rect.area()).sum();
         assert!((total_area - (1000.0 * 600.0)).abs() < 50_000.0);
-        assert!(visuals.iter().all(|visual| visual.rect.width() >= 0.0 && visual.rect.height() >= 0.0));
+        assert!(visuals
+            .iter()
+            .all(|visual| visual.rect.width() >= 0.0 && visual.rect.height() >= 0.0));
 
         let full_width_like = visuals
             .iter()
@@ -904,7 +899,12 @@ mod tests {
         let updates = search_state.ingest_new_nodes(&mut tree, &[child, matching]);
 
         assert_eq!(updates, 1);
+        assert_eq!(search_state.matches(), &[matching]);
         assert!(search_state.is_match(matching));
         assert!(search_state.is_ancestor_of_match(root));
+
+        let duplicate_updates = search_state.ingest_new_nodes(&mut tree, &[matching]);
+        assert_eq!(duplicate_updates, 0);
+        assert_eq!(search_state.matches(), &[matching]);
     }
 }

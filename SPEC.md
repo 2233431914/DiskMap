@@ -14,8 +14,8 @@
 - **Thread communication:** crossbeam-channel (v0.5)
 - **In-memory tree aggregation:** Custom TreeStore
 - **Treemap rendering:** egui::Painter (custom drawing)
-- **Clipboard:** arboard (v3)
 - **Shell open:** open (v5)
+- **Experimental cache:** rusqlite (implemented, disabled by default)
 
 ## 3. Features (MVP Scope)
 
@@ -23,24 +23,26 @@
 - [x] Input/select scan directory path
 - [x] Background scanning with jwalk parallel traversal
 - [x] Real-time UI refresh during scan (snapshots at depth <= 1)
-- [x] Treemap visualization by area (Slice-and-Dice algorithm)
+- [x] Treemap visualization by area (Squarified Treemap algorithm)
 - [x] Hover tooltip showing path and size
-- [x] Left-click to drill into directory
+- [x] Left-click to select, double-click to drill into directory
 - [x] Right-click context menu: Reveal in Finder / Copy Path / Open
+- [x] Search result navigation with Previous/Next and Enter/Shift+Enter
+- [x] Small-file aggregation as virtual "Other Files" nodes
 
 ### 3.2 Excluded from MVP
-- SQLite storage
+- SQLite storage enabled in the default UI
 - Duplicate file detection
 - FSEvents real-time monitoring
-- Allocated size (real disk blocks)
 - Animations
-- File deletion
+- File deletion / Move to Trash
+- Scan exclude rules and persisted preferences
+- Export/reporting workflows
 
 ### 3.3 Sidebar Features
 - [x] Current directory path display
 - [x] Current directory size display
 - [x] Open in Finder button
-- [x] List of largest children (sorted, clickable to drill)
 
 ### 3.4 Navigation
 - [x] Breadcrumb path display
@@ -54,17 +56,17 @@
 UI Thread
     ↓ StartScan(path)
 Scan Thread (jwalk)
-    ↓ ScanEvent::File/Dir/Error via channel
+    ↓ ScanMessage::Batch/Error via channel
 Aggregator (TreeStore)
     ↓ accumulate sizes
-    ↓ emit Snapshot/Finished
+    ↓ emit incremental batches/Finished
 egui Painter
     ↓ draw Treemap
 ```
 
 ### 4.2 Threading Model
 - Scanning runs on separate thread spawned by `scanner::start_scan`
-- Communication via crossbeam-channel (bounded sender, unbounded receiver)
+- Communication via crossbeam-channel (unbounded sender/receiver)
 - UI thread receives messages in `app.update()` via `rx.try_recv()`
 - No direct UI manipulation from scan thread
 
@@ -75,6 +77,10 @@ disk-map/
 └── src/
     ├── main.rs
     ├── app.rs
+    ├── app/
+    │   ├── navigation.rs
+    │   ├── scan_session.rs
+    │   └── search_nav.rs
     ├── scanner.rs
     ├── tree.rs
     ├── treemap.rs
@@ -82,25 +88,26 @@ disk-map/
     └── format.rs
 ```
 
+`app.rs` owns UI composition, painting, and cross-state coordination. App state with deeper lifecycle rules is kept in focused submodules: navigation history/focus, search navigation cursor/dirty state, and scan session progress/perf state.
+
 ## 5. Data Structures
 
 ### 5.1 NodeKind
 ```rust
-enum NodeKind { File, Dir, Symlink, Error }
+enum NodeKind { File, Dir, Symlink, Error, Aggregate }
 ```
 
 ### 5.2 Node
 ```rust
 struct Node {
-    id: NodeId,
     parent: Option<NodeId>,
     name: String,
-    path: PathBuf,
     kind: NodeKind,
     size: u64,
     children: Vec<NodeId>,
     scanned: bool,
     error: Option<String>,
+    lower_name: String,
 }
 ```
 
@@ -109,18 +116,22 @@ struct Node {
 struct TreeStore {
     nodes: Vec<Node>,
     root: Option<NodeId>,
+    root_path: PathBuf,
 }
 ```
 
 ## 6. Treemap Layout
 
-- **Algorithm:** Slice-and-Dice (simple, fast)
-- **Max display depth:** 5 levels
+- **Algorithm:** Squarified Treemap
+- **Default display depth:** 1 level, adjustable up to 10
 - **Node sorting:** By size descending (largest first)
 - **Visual feedback:**
-  - Hover highlights node (gamma 1.35)
-  - 6-color palette cycling by depth
+  - Hover/selection highlights node
+  - Search matches and ancestors are visually distinguished
+  - Search navigation cycles through matches in the current focused subtree using tree display order
+  - Directory palette cycles by depth
   - Minimum rect threshold: 2px (skip render)
+- **Small files:** files at or below 16 KiB are aggregated per parent into a virtual `Other Files` node. Virtual aggregate nodes have no real filesystem path and cannot be opened, revealed, or copied as a path.
 
 ## 7. Platform Integration
 
@@ -129,13 +140,17 @@ struct TreeStore {
 - `open <path>` for Open
 
 ### 7.2 Clipboard
-- Copy full path string to clipboard via arboard
+- Copy full path string through egui clipboard integration
+
+### 7.3 Destructive Actions
+- Move to Trash is not exposed in the default MVP UI.
+- Experimental trash support must report errors and must not silently trigger a rescan.
 
 ## 8. UI Layout
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ Path: [_______________] [Scan] [Root]  Status      │ <- TopPanel
+│ Nav [Root] Path: [________] [Scan] Search Depth    │ <- TopPanel
 ├────────────┬──────────────────────────────────────┤
 │ DiskMap  │                                      │
 │ Current:  │                                      │
@@ -143,10 +158,6 @@ struct TreeStore {
 │ [Open]    │         (egui::Painter)               │
 │ [Reveal]  │                                      │
 │           │                                      │
-│ Largest:  │                                      │
-│ - child1  │                                      │
-│ - child2  │                                      │
-│ ...       │                                      │
 └────────────┴──────────────────────────────────────┘
 ```
 
@@ -158,22 +169,38 @@ struct TreeStore {
 
 ## 10. Future Phases
 
-### Phase 2: Performance
-- Replace recursive scan with jwalk
-- Batch events (every 100ms progress, every 500ms snapshot)
-- Area threshold: merge small nodes
+### Phase 2: Stabilization and Usability
+- Keep destructive actions disabled by default
+- Keep SQLite cache disabled by default
+- Maintain clippy-clean code with `cargo clippy --all-targets --all-features -- -D warnings`
+- Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
+- Improve empty/error/cancelled states for missing paths, inaccessible roots, empty folders, and cancelled scans
+- Persist lightweight preferences: last scan path, window size, theme, depth, and scan options
 
-### Phase 3: Real-time Monitoring
+### Phase 3: Scan Controls
+- Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories
+- Add safe scan mode options:
+  - Do not cross filesystem or mount boundaries
+  - Include or exclude hidden files
+  - Follow or do not follow symlinks
+- Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
+
+### Phase 4: Reporting and Size Model
+- Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
+- Clearly display the active size basis, such as apparent size or allocated size on disk
+- Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
+
+### Phase 5: Real-time Monitoring
 - Add notify crate (FSEvents/kqueue)
 - Debounce 300-1000ms
 - Incremental rescan of changed directories
 
-### Phase 4: Treemap Upgrade
-- Replace Slice-and-Dice with Squarified Treemap
-- Maintain same interface
+### Phase 6: Treemap Upgrade
+- Preserve Squarified Treemap interface
+- Evaluate deeper zoom/search workflows
 
-### Phase 5: Productization
-- SQLite index for faster rescans
+### Phase 7: Productization
+- Enable SQLite index for faster rescans behind a user setting
 - Search and filter
 - Extension-based coloring
-- Move to Trash functionality
+- Move to Trash functionality with confirmation and reliable platform adapter

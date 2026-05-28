@@ -2,8 +2,8 @@ use crate::db::ScanDb;
 use crate::tree::{NodeId, NodeKind, NodeRecord, TreeStore};
 
 use crossbeam_channel::Sender;
-use rustc_hash::FxHashMap;
 use jwalk::{ClientState, WalkDirGeneric};
+use rustc_hash::FxHashMap;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -228,6 +228,34 @@ struct AggregateBucket {
     file_count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ScanCounters {
+    files_scanned: u64,
+    dirs_scanned: u64,
+    bytes_seen: u64,
+    current_path: PathBuf,
+}
+
+impl ScanCounters {
+    fn new(current_path: PathBuf) -> Self {
+        Self {
+            files_scanned: 0,
+            dirs_scanned: 0,
+            bytes_seen: 0,
+            current_path,
+        }
+    }
+
+    fn progress_snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            files_scanned: self.files_scanned,
+            dirs_scanned: self.dirs_scanned,
+            bytes_seen: self.bytes_seen,
+            current_path: self.current_path.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct AggregateState {
     buckets: FxHashMap<NodeId, AggregateBucket>,
@@ -339,13 +367,10 @@ fn run_scan(
         CacheMode::Disabled => None,
         CacheMode::Enabled => ScanDb::new(&std::env::temp_dir().join("disk-map.db")).ok(),
     };
-    let mut files_scanned = 0_u64;
-    let mut dirs_scanned = 0_u64;
-    let mut bytes_seen = 0_u64;
+    let mut counters = ScanCounters::new(path.clone());
     let mut batch = BatchAccumulator::new(options);
     let mut aggregate_state = AggregateState::default();
     let mut last_flush = Instant::now();
-    let mut last_seen_path = path.clone();
 
     let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
     let walker_prefetch_perf = Arc::clone(&prefetch_perf);
@@ -367,7 +392,9 @@ fn run_scan(
             let dir_prefetch_start = Instant::now();
             let mut prefetched_files = 0usize;
             for child in children.iter_mut() {
-                if prefetched_files >= budget.max_files || dir_prefetch_start.elapsed() >= budget.max_time {
+                if prefetched_files >= budget.max_files
+                    || dir_prefetch_start.elapsed() >= budget.max_time
+                {
                     break;
                 }
                 let Ok(dir_entry) = child.as_mut() else {
@@ -403,10 +430,9 @@ fn run_scan(
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    walker_prefetch_perf.mtime_ns.fetch_add(
-                        mtime_start.elapsed().as_nanos() as u64,
-                        Ordering::Relaxed,
-                    );
+                    walker_prefetch_perf
+                        .mtime_ns
+                        .fetch_add(mtime_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     Some(mtime)
                 } else {
                     None
@@ -414,10 +440,9 @@ fn run_scan(
 
                 let size_start = Instant::now();
                 let measured_size = size_on_disk_bytes(&metadata);
-                walker_prefetch_perf.size_ns.fetch_add(
-                    size_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
+                walker_prefetch_perf
+                    .size_ns
+                    .fetch_add(size_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                 dir_entry.client_state.prefetched_file = Some(Ok(PrefetchedFileInfo {
                     metadata,
@@ -438,13 +463,13 @@ fn run_scan(
                 &mut batch,
                 &mut perf_stats,
                 &mut last_flush,
-                files_scanned,
-                dirs_scanned,
-                bytes_seen,
-                &last_seen_path,
+                &counters,
             );
             perf_stats.messages_sent += 1;
-            let _ = tx.send(ScanMessage::Cancelled { scan_id, perf_stats });
+            let _ = tx.send(ScanMessage::Cancelled {
+                scan_id,
+                perf_stats,
+            });
             return;
         }
 
@@ -501,7 +526,8 @@ fn run_scan(
                     let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(err) => {
-                            perf_stats.metadata_total_ms += metadata_start.elapsed().as_secs_f64() * 1000.0;
+                            perf_stats.metadata_total_ms +=
+                                metadata_start.elapsed().as_secs_f64() * 1000.0;
                             node_error = Some(err.to_string());
                             let node_id = shadow_tree.len();
                             let node = NodeRecord {
@@ -519,7 +545,7 @@ fn run_scan(
                                 node,
                             });
                             batch.scanned_nodes.push(node_id);
-                            last_seen_path = entry_path;
+                            counters.current_path = entry_path;
                             if batch.should_flush(options, last_flush) {
                                 flush_batch(
                                     &tx,
@@ -527,17 +553,15 @@ fn run_scan(
                                     &mut batch,
                                     &mut perf_stats,
                                     &mut last_flush,
-                                    files_scanned,
-                                    dirs_scanned,
-                                    bytes_seen,
-                                    &last_seen_path,
+                                    &counters,
                                 );
                             }
                             continue;
                         }
                     };
                     perf_stats.metadata_total_ms += metadata_start.elapsed().as_secs_f64() * 1000.0;
-                    let cached_mtime = cached_mtime_for_metadata(&metadata, db.is_some(), &mut perf_stats);
+                    let cached_mtime =
+                        cached_mtime_for_metadata(&metadata, db.is_some(), &mut perf_stats);
                     let measured_size = size_on_disk_bytes(&metadata);
                     let size_start = Instant::now();
                     let size = measured_size_for_file(
@@ -560,7 +584,11 @@ fn run_scan(
         if kind == NodeKind::Dir {
             let node = NodeRecord {
                 name,
-                kind: if node_error.is_some() { NodeKind::Error } else { kind },
+                kind: if node_error.is_some() {
+                    NodeKind::Error
+                } else {
+                    kind
+                },
                 size,
                 scanned: false,
                 error: node_error,
@@ -578,10 +606,10 @@ fn run_scan(
                 &entry_path,
                 node_id,
             );
-            dirs_scanned += 1;
+            counters.dirs_scanned += 1;
         } else if kind == NodeKind::File {
-            files_scanned += 1;
-            bytes_seen += size;
+            counters.files_scanned += 1;
+            counters.bytes_seen += size;
             shadow_tree.apply_size_delta(parent_id, size);
             let ancestor_delta_start = Instant::now();
             let mut current = Some(parent_id);
@@ -601,7 +629,11 @@ fn run_scan(
             } else {
                 let node = NodeRecord {
                     name,
-                    kind: if node_error.is_some() { NodeKind::Error } else { kind },
+                    kind: if node_error.is_some() {
+                        NodeKind::Error
+                    } else {
+                        kind
+                    },
                     size,
                     scanned: true,
                     error: node_error,
@@ -618,7 +650,11 @@ fn run_scan(
         } else {
             let node = NodeRecord {
                 name,
-                kind: if node_error.is_some() { NodeKind::Error } else { kind },
+                kind: if node_error.is_some() {
+                    NodeKind::Error
+                } else {
+                    kind
+                },
                 size,
                 scanned: true,
                 error: node_error,
@@ -633,7 +669,7 @@ fn run_scan(
             batch.scanned_nodes.push(node_id);
         }
 
-        last_seen_path = entry_path;
+        counters.current_path = entry_path;
 
         if batch.should_flush(options, last_flush) {
             flush_batch(
@@ -642,10 +678,7 @@ fn run_scan(
                 &mut batch,
                 &mut perf_stats,
                 &mut last_flush,
-                files_scanned,
-                dirs_scanned,
-                bytes_seen,
-                &last_seen_path,
+                &counters,
             );
         }
     }
@@ -675,18 +708,18 @@ fn run_scan(
         &mut batch,
         &mut perf_stats,
         &mut last_flush,
-        files_scanned,
-        dirs_scanned,
-        bytes_seen,
-        &last_seen_path,
+        &counters,
     );
 
     let elapsed = start.elapsed();
-    perf_stats.files_scanned = files_scanned;
-    perf_stats.dirs_scanned = dirs_scanned;
-    perf_stats.metadata_total_ms += prefetch_perf.metadata_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-    perf_stats.mtime_total_ms += prefetch_perf.mtime_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-    perf_stats.size_measure_total_ms += prefetch_perf.size_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    perf_stats.files_scanned = counters.files_scanned;
+    perf_stats.dirs_scanned = counters.dirs_scanned;
+    perf_stats.metadata_total_ms +=
+        prefetch_perf.metadata_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    perf_stats.mtime_total_ms +=
+        prefetch_perf.mtime_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    perf_stats.size_measure_total_ms +=
+        prefetch_perf.size_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     perf_stats.scan_elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     eprintln!("Scan {scan_id} completed in {:?}", elapsed);
 
@@ -741,7 +774,11 @@ impl ParentLookup {
         self.directory_ids
             .get(parent_path)
             .copied()
-            .or_else(|| entry_path.parent().and_then(|parent| self.directory_ids.get(parent).copied()))
+            .or_else(|| {
+                entry_path
+                    .parent()
+                    .and_then(|parent| self.directory_ids.get(parent).copied())
+            })
             .unwrap_or(self.root_id)
     }
 
@@ -771,22 +808,14 @@ fn flush_batch(
     batch: &mut BatchAccumulator,
     perf_stats: &mut PerfStats,
     last_flush: &mut Instant,
-    files_scanned: u64,
-    dirs_scanned: u64,
-    bytes_seen: u64,
-    current_path: &Path,
+    counters: &ScanCounters,
 ) {
     if batch.is_empty() {
         return;
     }
 
     let flush_start = Instant::now();
-    batch.progress = Some(ProgressSnapshot {
-        files_scanned,
-        dirs_scanned,
-        bytes_seen,
-        current_path: current_path.to_path_buf(),
-    });
+    batch.progress = Some(counters.progress_snapshot());
     let outgoing = std::mem::take(batch).into_batch();
     perf_stats.messages_sent += 1;
     perf_stats.batches_sent += 1;
@@ -940,7 +969,10 @@ mod tests {
             },
         ];
 
-        assert!(matches!(messages.first(), Some(ScanMessage::Started { .. })));
+        assert!(matches!(
+            messages.first(),
+            Some(ScanMessage::Started { .. })
+        ));
         assert!(matches!(messages.get(1), Some(ScanMessage::Batch { .. })));
         assert!(matches!(
             messages.last(),

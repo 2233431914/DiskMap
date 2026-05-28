@@ -1,14 +1,16 @@
 use std::path::Path;
 
-pub fn reveal_in_finder(path: &Path) {
-    let _ = std::process::Command::new("open")
+pub fn reveal_in_finder(path: &Path) -> anyhow::Result<()> {
+    std::process::Command::new("open")
         .arg("-R")
         .arg(path)
-        .spawn();
+        .spawn()?;
+    Ok(())
 }
 
-pub fn open_path(path: &Path) {
-    let _ = open::that(path);
+pub fn open_path(path: &Path) -> anyhow::Result<()> {
+    open::that(path)?;
+    Ok(())
 }
 
 pub fn move_to_trash(path: &Path) -> anyhow::Result<()> {

@@ -101,7 +101,11 @@ impl TreeStore {
     }
 
     pub fn insert_node(&mut self, id: NodeId, parent: Option<NodeId>, record: NodeRecord) {
-        assert_eq!(id, self.nodes.len(), "incremental nodes must append in order");
+        assert_eq!(
+            id,
+            self.nodes.len(),
+            "incremental nodes must append in order"
+        );
 
         self.nodes.push(Node {
             parent,
@@ -289,5 +293,20 @@ mod tests {
 
         assert_eq!(first, PathBuf::from("/root/child/file.txt"));
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn aggregate_nodes_do_not_have_real_paths() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/root".into());
+        let aggregate = tree.add_node(
+            Some(root),
+            "Other Files (2)".into(),
+            NodeKind::Aggregate,
+            12,
+        );
+
+        assert!(tree.node_real_path(aggregate).is_none());
     }
 }

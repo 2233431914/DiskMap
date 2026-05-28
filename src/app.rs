@@ -1,23 +1,35 @@
 use crate::format::format_bytes;
-use crate::platform::{move_to_trash, open_path, reveal_in_finder};
-use crate::scanner::{
-    self, CacheMode, PerfStats, ProgressSnapshot, ScanBatch, ScanHandle, ScanMessage, ScanOptions,
-};
+use crate::platform::{open_path, reveal_in_finder};
+use crate::scanner::{CacheMode, PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions};
 use crate::tree::{NodeId, NodeKind, TreeStore};
-use crate::treemap::{layout_treemap, Camera, LayoutScratch, SearchState, VisualKind, VisualNode};
+use crate::treemap::{
+    layout_treemap, Camera, LayoutScratch, TreemapLayoutParams, VisualKind, VisualNode,
+};
+
+mod navigation;
+mod scan_session;
+mod search_nav;
+
+use navigation::{NavigationOutcome, NavigationState};
+use scan_session::ScanSession;
+use search_nav::{SearchController, SearchDirection, SEARCH_REFRESH_INTERVAL};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use egui::{
-    Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme,
-    Vec2,
+    Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme, Vec2,
 };
 use std::time::{Duration, Instant};
 
-const SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(150);
 const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
+const DEFAULT_SCAN_OPTIONS: ScanOptions = ScanOptions {
+    batch_flush_interval: Duration::from_millis(33),
+    max_pending_nodes: 2_048,
+    max_pending_size_deltas: 4_096,
+    cache_mode: CacheMode::Disabled,
+};
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -201,44 +213,25 @@ fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
 
 pub struct DiskMapApp {
     path_input: String,
-    search_input: String,
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
     tree: TreeStore,
-    focused_root: Option<NodeId>,
-    selected_id: Option<NodeId>,
+    navigation: NavigationState,
+    search: SearchController,
+    scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
     hovered_visual_kind: Option<VisualKind>,
     camera: Camera,
     max_depth: usize,
-    scanning: bool,
     status: String,
-    progress_summary: Option<ProgressSummary>,
-    search_state: SearchState,
-    active_scan_id: u64,
-    scan_counter: u64,
-    scan_handle: Option<ScanHandle>,
-    back_history: Vec<NodeId>,
-    forward_history: Vec<NodeId>,
     cached_visuals: Vec<VisualNode>,
     layout_scratch: LayoutScratch,
     last_canvas_rect: Option<Rect>,
     layout_dirty: bool,
-    search_dirty: bool,
-    search_last_refresh: Instant,
     last_layout_refresh: Instant,
-    breadcrumb_cache: String,
     pending_repaint: bool,
-    perf_stats: PerfStats,
-}
-
-#[derive(Debug, Clone)]
-struct ProgressSummary {
-    files_scanned: u64,
-    dirs_scanned: u64,
-    bytes_seen: u64,
 }
 
 impl Default for DiskMapApp {
@@ -246,37 +239,25 @@ impl Default for DiskMapApp {
         let (tx, rx) = unbounded();
         Self {
             path_input: dirs_home_fallback(),
-            search_input: String::new(),
             initial_scan_pending: true,
             tx,
             rx,
             tree: TreeStore::new(),
-            focused_root: None,
-            selected_id: None,
+            navigation: NavigationState::default(),
+            search: SearchController::default(),
+            scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
             hovered_visual_kind: None,
             camera: Camera::default(),
             max_depth: 1,
-            scanning: false,
             status: "Ready".to_string(),
-            progress_summary: None,
-            search_state: SearchState::default(),
-            active_scan_id: 0,
-            scan_counter: 0,
-            scan_handle: None,
-            back_history: Vec::new(),
-            forward_history: Vec::new(),
             cached_visuals: Vec::new(),
             layout_scratch: LayoutScratch::default(),
             last_canvas_rect: None,
             layout_dirty: true,
-            search_dirty: false,
-            search_last_refresh: Instant::now(),
             last_layout_refresh: Instant::now(),
-            breadcrumb_cache: String::new(),
             pending_repaint: false,
-            perf_stats: PerfStats::default(),
         }
     }
 }
@@ -319,27 +300,42 @@ impl eframe::App for DiskMapApp {
 impl DiskMapApp {
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if icon_button(ui, !self.back_history.is_empty(), ToolbarIcon::ArrowLeft)
+            if icon_button(ui, self.navigation.can_go_back(), ToolbarIcon::ArrowLeft)
                 .on_hover_text("Back")
                 .clicked()
             {
                 self.navigate_back();
             }
 
-            if icon_button(ui, !self.forward_history.is_empty(), ToolbarIcon::ArrowRight)
-                .on_hover_text("Forward")
-                .clicked()
+            if icon_button(
+                ui,
+                self.navigation.can_go_forward(),
+                ToolbarIcon::ArrowRight,
+            )
+            .on_hover_text("Forward")
+            .clicked()
             {
                 self.navigate_forward();
             }
 
-            if icon_button(ui, self.parent_of_focused_root().is_some(), ToolbarIcon::Up)
+            if icon_button(ui, self.navigation.can_go_up(&self.tree), ToolbarIcon::Up)
                 .on_hover_text("Up to parent directory")
                 .clicked()
             {
-                if let Some(parent) = self.parent_of_focused_root() {
+                if let Some(parent) = self.navigation.parent_of_focused_root(&self.tree) {
                     self.enter_root(parent, true);
                 }
+            }
+
+            if icon_button(
+                ui,
+                self.navigation.can_return_to_scan_root(&self.tree),
+                ToolbarIcon::Home,
+            )
+            .on_hover_text("Return to scan root")
+            .clicked()
+            {
+                self.return_to_scan_root();
             }
 
             if icon_button(ui, true, ToolbarIcon::Refresh)
@@ -361,12 +357,16 @@ impl DiskMapApp {
                 self.start_scan();
             }
 
-            let scan_label = if self.scanning { "Cancel" } else { "Scan" };
+            let scan_label = if self.scan.is_scanning() {
+                "Cancel"
+            } else {
+                "Scan"
+            };
             if ui
                 .add_sized([72.0, 28.0], egui::Button::new(scan_label))
                 .clicked()
             {
-                if self.scanning {
+                if self.scan.is_scanning() {
                     self.cancel_scan();
                 } else {
                     self.start_scan();
@@ -377,21 +377,47 @@ impl DiskMapApp {
 
             let search_response = ui.add_sized(
                 [180.0, 28.0],
-                egui::TextEdit::singleline(&mut self.search_input)
+                egui::TextEdit::singleline(self.search.input_mut())
                     .hint_text("Search files & folders"),
             );
             if search_response.changed() {
                 self.mark_search_dirty();
             }
-            if !self.search_input.is_empty()
+            if search_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                if ui.input(|input| input.modifiers.shift) {
+                    self.navigate_search_match(SearchDirection::Previous);
+                } else {
+                    self.navigate_search_match(SearchDirection::Next);
+                }
+            }
+            ui.add_space(2.0);
+            if icon_button(
+                ui,
+                self.can_navigate_search_matches(),
+                ToolbarIcon::ArrowLeft,
+            )
+            .on_hover_text("Previous search match")
+            .clicked()
+            {
+                self.navigate_search_match(SearchDirection::Previous);
+            }
+            if icon_button(
+                ui,
+                self.can_navigate_search_matches(),
+                ToolbarIcon::ArrowRight,
+            )
+            .on_hover_text("Next search match")
+            .clicked()
+            {
+                self.navigate_search_match(SearchDirection::Next);
+            }
+            if !self.search.input().is_empty()
                 && icon_button(ui, true, ToolbarIcon::Close)
                     .on_hover_text("Clear search")
                     .clicked()
             {
-                self.search_input.clear();
-                self.search_state.clear(self.tree.len());
-                self.search_dirty = false;
-                self.layout_dirty = true;
+                self.clear_search();
             }
 
             ui.add_space(6.0);
@@ -423,32 +449,29 @@ impl DiskMapApp {
     fn show_details_panel(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui.ctx());
         ui.add_space(4.0);
-        ui.label(RichText::new("DETAILS").size(11.0).strong().color(p.text_muted));
+        ui.label(
+            RichText::new("DETAILS")
+                .size(11.0)
+                .strong()
+                .color(p.text_muted),
+        );
         ui.add_space(2.0);
         section_divider(ui, p);
         ui.add_space(8.0);
 
-        let subject_id = self.selected_id.or(self.focused_root);
+        let subject_id = self
+            .navigation
+            .selected_id()
+            .or(self.navigation.focused_root());
         let Some(node_id) = subject_id else {
-            ui.label(
-                RichText::new("Run a scan to populate the treemap.")
-                    .color(p.text_muted),
-            );
+            ui.label(RichText::new("Run a scan to populate the treemap.").color(p.text_muted));
             self.show_progress_section(ui, p);
             self.show_search_section(ui, p);
             return;
         };
 
         let node_path = self.tree.node_real_path(node_id);
-        let (
-            node_name,
-            node_size,
-            node_kind,
-            child_count,
-            node_scanned,
-            node_error,
-            node_parent,
-        ) = {
+        let (node_name, node_size, node_kind, child_count, node_scanned, node_error, node_parent) = {
             let node = self.tree.node(node_id);
             (
                 node.name.clone(),
@@ -468,7 +491,7 @@ impl DiskMapApp {
                 None
             }
         });
-        let matched = self.search_state.is_match(node_id);
+        let matched = self.search.state().is_match(node_id);
         let kind_label = describe_node_kind(node_kind, child_count > 0);
 
         egui::Frame::new()
@@ -509,7 +532,7 @@ impl DiskMapApp {
                             .color(p.accent),
                     );
                 }
-                if !self.search_input.trim().is_empty() {
+                if !self.search.query().is_empty() {
                     let (txt, color) = if matched {
                         ("Matches search", p.accent)
                     } else {
@@ -534,7 +557,12 @@ impl DiskMapApp {
         if let Some(err) = &node_error {
             ui.add_space(6.0);
             egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(p.danger.r(), p.danger.g(), p.danger.b(), 28))
+                .fill(Color32::from_rgba_unmultiplied(
+                    p.danger.r(),
+                    p.danger.g(),
+                    p.danger.b(),
+                    28,
+                ))
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
@@ -543,14 +571,19 @@ impl DiskMapApp {
         }
 
         ui.add_space(12.0);
-        ui.label(RichText::new("PRIMARY").size(10.0).strong().color(p.text_faint));
+        ui.label(
+            RichText::new("PRIMARY")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
         ui.add_space(4.0);
         let path_available = node_path.is_some();
         ui.columns(2, |cols| {
             let w0 = cols[0].available_width();
             if accent_button(&mut cols[0], "Open", path_available, w0, p).clicked() {
                 if let Some(path) = &node_path {
-                    open_path(path);
+                    self.apply_platform_result("Open", open_path(path));
                 }
             }
             let w1 = cols[1].available_width();
@@ -562,45 +595,40 @@ impl DiskMapApp {
                 .clicked()
             {
                 if let Some(path) = &node_path {
-                    reveal_in_finder(path);
+                    self.apply_platform_result("Reveal", reveal_in_finder(path));
                 }
             }
         });
 
         ui.add_space(10.0);
-        ui.label(RichText::new("UTILITY").size(10.0).strong().color(p.text_faint));
+        ui.label(
+            RichText::new("UTILITY")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
         ui.add_space(4.0);
-        ui.columns(2, |cols| {
-            let w0 = cols[0].available_width();
-            if cols[0]
-                .add_enabled(
-                    path_available,
-                    egui::Button::new("Copy Path").min_size(Vec2::new(w0, 28.0)),
-                )
-                .clicked()
-            {
-                if let Some(path) = &node_path {
-                    cols[0].ctx().copy_text(path.display().to_string());
-                }
+        let copy_width = ui.available_width();
+        if ui
+            .add_enabled(
+                path_available,
+                egui::Button::new("Copy Path").min_size(Vec2::new(copy_width, 28.0)),
+            )
+            .clicked()
+        {
+            if let Some(path) = &node_path {
+                ui.ctx().copy_text(path.display().to_string());
             }
-            let w1 = cols[1].available_width();
-            if cols[1]
-                .add_enabled(
-                    path_available,
-                    egui::Button::new(RichText::new("Move to Trash").color(p.danger))
-                        .min_size(Vec2::new(w1, 28.0)),
-                )
-                .clicked()
-            {
-                if let Some(path) = &node_path {
-                    let _ = move_to_trash(path);
-                }
-            }
-        });
+        }
 
         if let Some(parent) = node_parent {
             ui.add_space(10.0);
-            ui.label(RichText::new("PARENT").size(10.0).strong().color(p.text_faint));
+            ui.label(
+                RichText::new("PARENT")
+                    .size(10.0)
+                    .strong()
+                    .color(p.text_faint),
+            );
             ui.add_space(4.0);
             let parent_name = self.tree.node(parent).name.clone();
             if ui
@@ -611,7 +639,7 @@ impl DiskMapApp {
                 )
                 .clicked()
             {
-                self.selected_id = Some(parent);
+                self.navigation.set_selected_id(Some(parent));
             }
         }
 
@@ -620,11 +648,16 @@ impl DiskMapApp {
     }
 
     fn show_progress_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let Some(progress) = &self.progress_summary else {
+        let Some(progress) = self.scan.progress() else {
             return;
         };
         ui.add_space(12.0);
-        ui.label(RichText::new("SCAN").size(10.0).strong().color(p.text_faint));
+        ui.label(
+            RichText::new("SCAN")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
@@ -639,29 +672,55 @@ impl DiskMapApp {
                 .monospace()
                 .color(p.text),
         );
+        let current_path = truncate_middle(&progress.current_path.display().to_string(), 42);
+        ui.add(
+            egui::Label::new(
+                RichText::new(current_path)
+                    .small()
+                    .monospace()
+                    .color(p.text_faint),
+            )
+            .truncate(),
+        );
     }
 
     fn show_search_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let query = self.search_input.trim();
+        let query = self.search.query();
         if query.is_empty() {
             return;
         }
         ui.add_space(12.0);
-        ui.label(RichText::new("SEARCH").size(10.0).strong().color(p.text_faint));
+        ui.label(
+            RichText::new("SEARCH")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!("Query: {query}"))
                 .small()
                 .color(p.text_muted),
         );
+        let match_text = if self.search.is_dirty() {
+            format!("{} matches · Updating…", self.search.state().match_count())
+        } else if let Some(index) = self.search.active_match() {
+            format!(
+                "{} / {} matches · Ready",
+                index + 1,
+                self.search.state().match_count()
+            )
+        } else {
+            format!("{} matches · Ready", self.search.state().match_count())
+        };
         ui.label(
-            RichText::new(format!(
-                "{} matches · {}",
-                self.search_state.match_count(),
-                if self.search_dirty { "Updating…" } else { "Ready" }
-            ))
-            .small()
-            .color(if self.search_dirty { p.accent } else { p.text_muted }),
+            RichText::new(match_text)
+                .small()
+                .color(if self.search.is_dirty() {
+                    p.accent
+                } else {
+                    p.text_muted
+                }),
         );
     }
 
@@ -677,7 +736,7 @@ impl DiskMapApp {
             ui.add_space(4.0);
             let dot_color = if self.status.starts_with("Error") {
                 p.danger
-            } else if self.scanning {
+            } else if self.scan.is_scanning() {
                 p.accent
             } else if self.status.starts_with("Cancel") {
                 p.text_faint
@@ -686,16 +745,12 @@ impl DiskMapApp {
             };
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
             ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-            ui.label(
-                RichText::new(&self.status)
-                    .size(11.5)
-                    .color(p.text_muted),
-            );
+            ui.label(RichText::new(&self.status).size(11.5).color(p.text_muted));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(6.0);
-                if !self.breadcrumb_cache.is_empty() {
-                    let crumb = self.breadcrumb_cache.replace(" / ", " › ");
+                if !self.navigation.breadcrumb().is_empty() {
+                    let crumb = self.navigation.breadcrumb().replace(" / ", " › ");
                     let display = truncate_middle(&crumb, 60);
                     ui.label(
                         RichText::new(display)
@@ -705,7 +760,7 @@ impl DiskMapApp {
                     );
                 }
 
-                if let Some(progress) = &self.progress_summary {
+                if let Some(progress) = self.scan.progress() {
                     ui.add_space(10.0);
                     ui.label(RichText::new("│").size(11.0).color(p.text_faint));
                     ui.add_space(10.0);
@@ -716,6 +771,17 @@ impl DiskMapApp {
                         format_bytes(progress.bytes_seen)
                     );
                     ui.label(RichText::new(text).size(11.5).color(p.text_muted));
+                    let current_path =
+                        truncate_middle(&progress.current_path.display().to_string(), 44);
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("│").size(11.0).color(p.text_faint));
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(current_path)
+                            .size(11.5)
+                            .monospace()
+                            .color(p.text_faint),
+                    );
                 }
             });
         });
@@ -728,7 +794,7 @@ impl DiskMapApp {
         let painter = ui.painter_at(available);
         painter.rect_filled(available, 0.0, p.surface);
 
-        let Some(root_id) = self.focused_root else {
+        let Some(root_id) = self.navigation.focused_root() else {
             painter.text(
                 available.center(),
                 egui::Align2::CENTER_CENTER,
@@ -749,28 +815,30 @@ impl DiskMapApp {
         }
 
         let should_refresh_layout = self.layout_dirty
-            && (!self.scanning || self.last_layout_refresh.elapsed() >= LAYOUT_REFRESH_INTERVAL);
+            && (!self.scan.is_scanning()
+                || self.last_layout_refresh.elapsed() >= LAYOUT_REFRESH_INTERVAL);
 
         if should_refresh_layout {
             let layout_start = Instant::now();
             layout_treemap(
                 &mut self.tree,
-                root_id,
-                available,
-                self.camera,
-                self.max_depth,
-                &self.search_state,
-                &mut self.cached_visuals,
-                &mut self.layout_scratch,
+                TreemapLayoutParams {
+                    root: root_id,
+                    canvas_rect: available,
+                    camera: self.camera,
+                    max_depth: self.max_depth,
+                    search_state: self.search.state(),
+                    out: &mut self.cached_visuals,
+                    scratch: &mut self.layout_scratch,
+                },
             );
             self.layout_dirty = false;
             self.last_layout_refresh = Instant::now();
-            self.perf_stats.layout_recompute_count += 1;
-            self.perf_stats.layout_total_ms += layout_start.elapsed().as_secs_f64() * 1000.0;
+            self.scan.record_layout_recompute(layout_start.elapsed());
         }
 
-        self.hovered_visual_kind =
-            find_hovered_visual(&self.cached_visuals, response.hover_pos()).map(|visual| visual.kind);
+        self.hovered_visual_kind = find_hovered_visual(&self.cached_visuals, response.hover_pos())
+            .map(|visual| visual.kind);
         self.hovered_id = self.hovered_visual_kind.map(|kind| match kind {
             VisualKind::Node(node_id) => node_id,
         });
@@ -779,7 +847,7 @@ impl DiskMapApp {
             self.context_menu_target_id = self.hovered_id;
         }
 
-        if response.dragged() && self.search_input.is_empty() {
+        if response.dragged() && self.search.input().is_empty() {
             let drag_delta = response.drag_delta();
             if drag_delta != Vec2::ZERO {
                 self.camera.pan += drag_delta;
@@ -809,16 +877,16 @@ impl DiskMapApp {
                 if !self.tree.node(node_id).children.is_empty() {
                     self.enter_root(node_id, true);
                 } else {
-                    self.selected_id = Some(node_id);
+                    self.navigation.set_selected_id(Some(node_id));
                 }
             } else {
                 self.reset_camera();
             }
         } else if response.clicked() {
             if let Some(node_id) = self.hovered_id {
-                self.selected_id = Some(node_id);
+                self.navigation.set_selected_id(Some(node_id));
             } else {
-                self.selected_id = None;
+                self.navigation.set_selected_id(None);
             }
         }
 
@@ -827,15 +895,17 @@ impl DiskMapApp {
                 let p = palette(ui.ctx());
                 let node_path = self.tree.node_real_path(node_id);
                 let node = self.tree.node(node_id);
+                let node_name = node.name.clone();
+                let node_size = node.size;
                 ui.set_min_width(CONTEXT_MENU_MIN_WIDTH);
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new(truncate_middle(&node.name, CONTEXT_MENU_MAX_TITLE_CHARS))
+                        RichText::new(truncate_middle(&node_name, CONTEXT_MENU_MAX_TITLE_CHARS))
                             .strong()
                             .color(p.text),
                     );
                     ui.label(
-                        RichText::new(format_bytes(node.size))
+                        RichText::new(format_bytes(node_size))
                             .small()
                             .monospace()
                             .color(p.text_muted),
@@ -846,7 +916,7 @@ impl DiskMapApp {
                         .clicked()
                     {
                         if let Some(path) = &node_path {
-                            open_path(path);
+                            self.apply_platform_result("Open", open_path(path));
                         }
                         ui.close();
                     }
@@ -855,7 +925,7 @@ impl DiskMapApp {
                         .clicked()
                     {
                         if let Some(path) = &node_path {
-                            reveal_in_finder(path);
+                            self.apply_platform_result("Reveal", reveal_in_finder(path));
                         }
                         ui.close();
                     }
@@ -865,18 +935,6 @@ impl DiskMapApp {
                     {
                         if let Some(path) = &node_path {
                             ui.ctx().copy_text(path.display().to_string());
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            node_path.is_some(),
-                            egui::Button::new(RichText::new("Move to Trash").color(p.danger)),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = &node_path {
-                            let _ = move_to_trash(path);
                         }
                         ui.close();
                     }
@@ -918,21 +976,13 @@ impl DiskMapApp {
                         ui.spacing_mut().item_spacing.y = 3.0;
 
                         ui.horizontal(|ui| {
-                            let dot_color = if node.scanned {
-                                p.text_faint
-                            } else {
-                                p.accent
-                            };
-                            let (rect, _) = ui.allocate_exact_size(
-                                Vec2::splat(8.0),
-                                Sense::hover(),
-                            );
+                            let dot_color = if node.scanned { p.text_faint } else { p.accent };
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                             ui.painter().circle_filled(rect.center(), 3.0, dot_color);
                             ui.add(
-                                egui::Label::new(
-                                    RichText::new(&node.name).strong().color(p.text),
-                                )
-                                .truncate(),
+                                egui::Label::new(RichText::new(&node.name).strong().color(p.text))
+                                    .truncate(),
                             );
                         });
 
@@ -962,10 +1012,8 @@ impl DiskMapApp {
 
                         if let Some(error) = &node.error {
                             ui.add(
-                                egui::Label::new(
-                                    RichText::new(error).small().color(p.danger),
-                                )
-                                .wrap(),
+                                egui::Label::new(RichText::new(error).small().color(p.danger))
+                                    .wrap(),
                             );
                         }
                     });
@@ -974,8 +1022,9 @@ impl DiskMapApp {
 
     fn paint_visual(&self, ui: &egui::Ui, painter: &egui::Painter, visual: &VisualNode) {
         let palette = palette(ui.ctx());
-        let is_hovered = matches!(visual.kind, VisualKind::Node(node_id) if self.hovered_id == Some(node_id));
-        let is_selected = matches!(visual.kind, VisualKind::Node(node_id) if self.selected_id == Some(node_id));
+        let is_hovered =
+            matches!(visual.kind, VisualKind::Node(node_id) if self.hovered_id == Some(node_id));
+        let is_selected = matches!(visual.kind, VisualKind::Node(node_id) if self.navigation.selected_id() == Some(node_id));
         let fill = fill_color_for_visual(visual, is_hovered, is_selected, palette);
         let stroke = stroke_for_visual(visual, is_hovered, is_selected, palette);
 
@@ -1003,15 +1052,19 @@ impl DiskMapApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
-            if let Some(selected_id) = self.selected_id {
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            if let Some(selected_id) = self.navigation.selected_id() {
                 if !self.tree.node(selected_id).children.is_empty() {
                     self.enter_root(selected_id, true);
                 }
             }
         }
 
-        if ctx.input(|input| input.key_pressed(egui::Key::Backspace)) {
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input(|input| input.key_pressed(egui::Key::Backspace))
+        {
             self.navigate_back();
         }
 
@@ -1024,12 +1077,10 @@ impl DiskMapApp {
         }
 
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            if self.selected_id.is_some() {
-                self.selected_id = None;
-            } else if !self.search_input.is_empty() {
-                self.search_input.clear();
-                self.search_state.clear(self.tree.len());
-                self.layout_dirty = true;
+            if self.navigation.selected_id().is_some() {
+                self.navigation.set_selected_id(None);
+            } else if !self.search.input().is_empty() {
+                self.clear_search();
             }
         }
     }
@@ -1038,22 +1089,23 @@ impl DiskMapApp {
         let mut saw_batch = false;
 
         while let Ok(message) = self.rx.try_recv() {
-            let message_scan_id = scan_id_for_message(&message);
-            if message_scan_id != self.active_scan_id {
+            if !self.scan.accepts(&message) {
                 continue;
             }
 
             match message {
-                ScanMessage::Started { path, root_node, .. } => {
-                    self.scanning = true;
+                ScanMessage::Started {
+                    path, root_node, ..
+                } => {
+                    self.scan.mark_started();
                     self.status = format!("Scanning {}", path.display());
                     self.tree.clear();
                     self.tree.push_node(None, root_node);
                     self.tree.set_root_path(path);
-                    self.focused_root = self.tree.root;
+                    self.navigation.set_scan_root(self.tree.root);
                     self.layout_dirty = true;
                     self.mark_search_dirty();
-                    self.rebuild_breadcrumb_cache();
+                    self.navigation.rebuild_breadcrumb_cache(&self.tree);
                 }
                 ScanMessage::Batch { batch, .. } => {
                     self.apply_scan_batch(batch);
@@ -1064,35 +1116,29 @@ impl DiskMapApp {
                     perf_stats,
                     ..
                 } => {
-                    self.scanning = false;
-                    self.scan_handle = None;
-                    self.merge_scan_perf_stats(perf_stats);
+                    self.scan.mark_finished(perf_stats);
                     self.prune_invalid_selection();
                     self.refresh_search_matches();
                     self.layout_dirty = true;
                     self.status = format!("Finished: {}", format_bytes(total_bytes));
                     self.pending_repaint = true;
-                    eprintln!("{}", format_perf_stats(&self.perf_stats));
+                    eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
                 ScanMessage::Cancelled { perf_stats, .. } => {
-                    self.scanning = false;
-                    self.scan_handle = None;
-                    self.merge_scan_perf_stats(perf_stats);
+                    self.scan.mark_cancelled(perf_stats);
                     self.status = "Scan cancelled".to_string();
                     self.pending_repaint = true;
-                    eprintln!("{}", format_perf_stats(&self.perf_stats));
+                    eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
                 ScanMessage::Error {
                     message,
                     perf_stats,
                     ..
                 } => {
-                    self.scanning = false;
-                    self.scan_handle = None;
-                    self.merge_scan_perf_stats(perf_stats);
+                    self.scan.mark_error(perf_stats);
                     self.status = format!("Error: {message}");
                     self.pending_repaint = true;
-                    eprintln!("{}", format_perf_stats(&self.perf_stats));
+                    eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
             }
         }
@@ -1113,7 +1159,8 @@ impl DiskMapApp {
         for discovered in batch.discovered_nodes {
             let node_id = discovered.node_id;
             let parent_id = discovered.parent_id;
-            self.tree.insert_node(node_id, Some(parent_id), discovered.node);
+            self.tree
+                .insert_node(node_id, Some(parent_id), discovered.node);
             discovered_node_ids.push(node_id);
             dirty_nodes.push(parent_id);
             dirty_nodes.push(node_id);
@@ -1151,9 +1198,11 @@ impl DiskMapApp {
             self.apply_progress(progress);
         }
 
-        if !discovered_node_ids.is_empty() && !self.search_input.trim().is_empty() {
-            self.perf_stats.search_incremental_updates +=
-                self.search_state.ingest_new_nodes(&mut self.tree, &discovered_node_ids) as u64;
+        if !discovered_node_ids.is_empty() && !self.search.query().is_empty() {
+            let updates =
+                self.search
+                    .ingest_new_nodes(&mut self.tree, &discovered_node_ids) as u64;
+            self.scan.record_search_incremental_updates(updates);
         }
 
         if touched_visible_subtree {
@@ -1162,131 +1211,67 @@ impl DiskMapApp {
     }
 
     fn apply_progress(&mut self, progress: ProgressSnapshot) {
-        self.progress_summary = Some(ProgressSummary {
-            files_scanned: progress.files_scanned,
-            dirs_scanned: progress.dirs_scanned,
-            bytes_seen: progress.bytes_seen,
-        });
+        self.scan.apply_progress(progress);
         self.status = "Scanning...".to_string();
     }
 
-    fn merge_scan_perf_stats(&mut self, perf_stats: PerfStats) {
-        self.perf_stats.messages_sent = perf_stats.messages_sent;
-        self.perf_stats.batches_sent = perf_stats.batches_sent;
-        self.perf_stats.entries_seen = perf_stats.entries_seen;
-        self.perf_stats.nodes_discovered = perf_stats.nodes_discovered;
-        self.perf_stats.files_scanned = perf_stats.files_scanned;
-        self.perf_stats.dirs_scanned = perf_stats.dirs_scanned;
-        self.perf_stats.size_delta_merges = perf_stats.size_delta_merges;
-        self.perf_stats.ancestor_size_delta_total_ms = perf_stats.ancestor_size_delta_total_ms;
-        self.perf_stats.parent_stack_hits = perf_stats.parent_stack_hits;
-        self.perf_stats.parent_lookup_fallbacks = perf_stats.parent_lookup_fallbacks;
-        self.perf_stats.progress_snapshots_sent = perf_stats.progress_snapshots_sent;
-        self.perf_stats.prefetched_files = perf_stats.prefetched_files;
-        self.perf_stats.metadata_fallback_files = perf_stats.metadata_fallback_files;
-        self.perf_stats.metadata_total_ms = perf_stats.metadata_total_ms;
-        self.perf_stats.mtime_total_ms = perf_stats.mtime_total_ms;
-        self.perf_stats.size_measure_total_ms = perf_stats.size_measure_total_ms;
-        self.perf_stats.batch_flush_total_ms = perf_stats.batch_flush_total_ms;
-        self.perf_stats.scan_elapsed_ms = perf_stats.scan_elapsed_ms;
-        self.perf_stats.db_cache_hits = perf_stats.db_cache_hits;
-        self.perf_stats.db_cache_misses = perf_stats.db_cache_misses;
-        self.perf_stats.db_flush_count = perf_stats.db_flush_count;
+    fn clear_search(&mut self) {
+        self.search.clear(self.tree.len());
+        self.layout_dirty = true;
+    }
+
+    fn apply_platform_result(&mut self, action: &str, result: anyhow::Result<()>) {
+        if let Err(error) = result {
+            self.status = format!("{action} failed: {error}");
+            self.pending_repaint = true;
+        }
     }
 
     fn start_scan(&mut self) {
-        if let Some(handle) = &self.scan_handle {
-            handle.cancel();
-        }
-
-        self.scan_counter += 1;
-        self.active_scan_id = self.scan_counter;
-        self.scan_handle = Some(scanner::start_scan(
+        self.scan.start(
             std::path::PathBuf::from(self.path_input.trim()),
-            self.active_scan_id,
-            ScanOptions {
-                cache_mode: CacheMode::Disabled,
-                ..Default::default()
-            },
+            DEFAULT_SCAN_OPTIONS,
             self.tx.clone(),
-        ));
+        );
 
         self.tree.clear();
-        self.focused_root = None;
-        self.selected_id = None;
+        self.navigation.clear_for_new_scan();
         self.hovered_id = None;
         self.context_menu_target_id = None;
         self.hovered_visual_kind = None;
-        self.search_state.clear(0);
-        self.progress_summary = None;
-        self.back_history.clear();
-        self.forward_history.clear();
+        self.search.clear(0);
         self.cached_visuals.clear();
         self.reset_camera();
         self.layout_dirty = true;
-        self.search_dirty = false;
-        self.scanning = true;
         self.status = format!("Scanning {}", self.path_input.trim());
-        self.breadcrumb_cache.clear();
         self.pending_repaint = true;
-        self.perf_stats = PerfStats::default();
     }
 
     fn cancel_scan(&mut self) {
-        if let Some(handle) = &self.scan_handle {
-            handle.cancel();
+        if self.scan.cancel() {
             self.status = "Cancelling scan...".to_string();
             self.pending_repaint = true;
         }
     }
 
     fn enter_root(&mut self, node_id: NodeId, push_history: bool) {
-        if self.focused_root == Some(node_id) {
-            self.reset_camera();
-            return;
-        }
-        if push_history {
-            if let Some(current) = self.focused_root {
-                self.back_history.push(current);
-            }
-            self.forward_history.clear();
-        }
-        self.focused_root = Some(node_id);
-        self.selected_id = Some(node_id);
-        self.reset_camera();
-        self.refresh_search_matches();
-        self.layout_dirty = true;
-        self.rebuild_breadcrumb_cache();
+        let outcome = self.navigation.enter_root(node_id, push_history);
+        self.apply_navigation_outcome(outcome);
+    }
+
+    fn return_to_scan_root(&mut self) {
+        let outcome = self.navigation.return_to_scan_root(&self.tree);
+        self.apply_navigation_outcome(outcome);
     }
 
     fn navigate_back(&mut self) {
-        let Some(previous) = self.back_history.pop() else {
-            return;
-        };
-        if let Some(current) = self.focused_root {
-            self.forward_history.push(current);
-        }
-        self.focused_root = Some(previous);
-        self.selected_id = Some(previous);
-        self.reset_camera();
-        self.refresh_search_matches();
-        self.layout_dirty = true;
-        self.rebuild_breadcrumb_cache();
+        let outcome = self.navigation.navigate_back();
+        self.apply_navigation_outcome(outcome);
     }
 
     fn navigate_forward(&mut self) {
-        let Some(next) = self.forward_history.pop() else {
-            return;
-        };
-        if let Some(current) = self.focused_root {
-            self.back_history.push(current);
-        }
-        self.focused_root = Some(next);
-        self.selected_id = Some(next);
-        self.reset_camera();
-        self.refresh_search_matches();
-        self.layout_dirty = true;
-        self.rebuild_breadcrumb_cache();
+        let outcome = self.navigation.navigate_forward();
+        self.apply_navigation_outcome(outcome);
     }
 
     fn reset_camera(&mut self) {
@@ -1297,20 +1282,29 @@ impl DiskMapApp {
             .unwrap_or_else(Instant::now);
     }
 
+    fn apply_navigation_outcome(&mut self, outcome: NavigationOutcome) {
+        match outcome {
+            NavigationOutcome::Noop => {}
+            NavigationOutcome::ResetCameraOnly => self.reset_camera(),
+            NavigationOutcome::FocusChanged { refresh_search } => {
+                self.reset_camera();
+                if refresh_search {
+                    self.refresh_search_matches();
+                }
+                self.layout_dirty = true;
+                self.navigation.rebuild_breadcrumb_cache(&self.tree);
+            }
+        }
+    }
+
     fn refresh_search_matches(&mut self) {
-        self.search_dirty = false;
-        self.search_last_refresh = Instant::now();
-        self.search_state
-            .rebuild(&mut self.tree, self.focused_root, self.search_input.trim());
-        self.perf_stats.search_rebuild_count += 1;
+        self.search
+            .refresh(&mut self.tree, self.navigation.focused_root());
+        self.scan.record_search_rebuild();
     }
 
     fn maybe_refresh_search(&mut self, ctx: &egui::Context) {
-        if !self.search_dirty {
-            return;
-        }
-
-        if self.search_last_refresh.elapsed() >= SEARCH_REFRESH_INTERVAL || !self.scanning {
+        if self.search.maybe_refresh_due(self.scan.is_scanning()) {
             self.refresh_search_matches();
             self.layout_dirty = true;
             self.pending_repaint = true;
@@ -1319,53 +1313,38 @@ impl DiskMapApp {
     }
 
     fn mark_search_dirty(&mut self) {
-        self.search_dirty = true;
-        self.search_last_refresh = self
-            .search_last_refresh
-            .checked_sub(SEARCH_REFRESH_INTERVAL)
-            .unwrap_or_else(Instant::now);
+        self.search.mark_dirty();
+    }
+
+    fn can_navigate_search_matches(&self) -> bool {
+        self.search.can_navigate()
+    }
+
+    fn navigate_search_match(&mut self, direction: SearchDirection) {
+        if self.search.query().is_empty() {
+            return;
+        }
+        if self.search.is_dirty() {
+            self.refresh_search_matches();
+        }
+
+        if let Some(node_id) = self.search.next_match(direction, &self.tree) {
+            let outcome = self.navigation.focus_search_match(&self.tree, node_id);
+            self.apply_navigation_outcome(outcome);
+        }
     }
 
     fn prune_invalid_selection(&mut self) {
-        if let Some(selected_id) = self.selected_id {
-            if selected_id >= self.tree.len() {
-                self.selected_id = None;
-            }
-        }
-        if let Some(root_id) = self.focused_root {
-            if root_id >= self.tree.len() {
-                self.focused_root = self.tree.root;
-                self.rebuild_breadcrumb_cache();
-            }
-        }
-    }
-
-    fn parent_of_focused_root(&self) -> Option<NodeId> {
-        self.focused_root.and_then(|node_id| self.tree.node(node_id).parent)
+        self.navigation.prune_invalid(&self.tree);
     }
 
     fn batch_touches_visible_subtree(&self, node_id: NodeId) -> bool {
-        if let Some(root_id) = self.focused_root {
+        if let Some(root_id) = self.navigation.focused_root() {
             self.tree.is_descendant_or_same(node_id, root_id)
                 || self.tree.is_descendant_or_same(root_id, node_id)
         } else {
             true
         }
-    }
-
-    fn rebuild_breadcrumb_cache(&mut self) {
-        let Some(root_id) = self.focused_root else {
-            self.breadcrumb_cache.clear();
-            return;
-        };
-
-        self.breadcrumb_cache = self
-            .tree
-            .ancestors(root_id)
-            .into_iter()
-            .map(|id| self.tree.node(id).name.clone())
-            .collect::<Vec<_>>()
-            .join(" / ");
     }
 
     fn maybe_request_deferred_repaint(&mut self, ctx: &egui::Context) {
@@ -1376,17 +1355,17 @@ impl DiskMapApp {
     }
 
     fn drive_background_updates(&self, ctx: &egui::Context) {
-        if self.scanning {
+        if self.scan.is_scanning() {
             // Keep the UI alive while scan batches arrive, even when there is no user input.
             ctx.request_repaint_after(LAYOUT_REFRESH_INTERVAL);
-        } else if self.search_dirty {
+        } else if self.search.is_dirty() {
             ctx.request_repaint_after(SEARCH_REFRESH_INTERVAL);
         }
     }
 
     #[cfg(test)]
     fn apply_scan_message_for_test(&mut self, message: ScanMessage) {
-        if scan_id_for_message(&message) != self.active_scan_id {
+        if !self.scan.accepts(&message) {
             return;
         }
 
@@ -1394,31 +1373,27 @@ impl DiskMapApp {
             ScanMessage::Started { root_node, .. } => {
                 self.tree.clear();
                 self.tree.push_node(None, root_node);
-                self.focused_root = self.tree.root;
-                self.rebuild_breadcrumb_cache();
+                self.navigation.set_scan_root(self.tree.root);
+                self.navigation.rebuild_breadcrumb_cache(&self.tree);
             }
             ScanMessage::Batch { batch, .. } => self.apply_scan_batch(batch),
-            ScanMessage::Finished { .. } | ScanMessage::Cancelled { .. } | ScanMessage::Error { .. } => {}
+            ScanMessage::Finished { .. }
+            | ScanMessage::Cancelled { .. }
+            | ScanMessage::Error { .. } => {}
         }
     }
-}
 
-fn scan_id_for_message(message: &ScanMessage) -> u64 {
-    match message {
-        ScanMessage::Started { scan_id, .. }
-        | ScanMessage::Batch { scan_id, .. }
-        | ScanMessage::Finished { scan_id, .. }
-        | ScanMessage::Cancelled { scan_id, .. }
-        | ScanMessage::Error { scan_id, .. } => *scan_id,
+    #[cfg(test)]
+    fn set_active_scan_id_for_test(&mut self, scan_id: u64) {
+        self.scan.set_active_id_for_test(scan_id);
     }
 }
 
 fn find_hovered_visual(visuals: &[VisualNode], pos: Option<Pos2>) -> Option<&VisualNode> {
     let pos = pos?;
-    visuals
-        .iter()
-        .rev()
-        .find(|visual| visual.rect.contains(pos) && visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0)
+    visuals.iter().rev().find(|visual| {
+        visual.rect.contains(pos) && visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0
+    })
 }
 
 fn fill_color_for_visual(
@@ -1486,6 +1461,7 @@ enum ToolbarIcon {
     ArrowLeft,
     ArrowRight,
     Up,
+    Home,
     Refresh,
     Close,
     ThemeLight,
@@ -1511,8 +1487,13 @@ fn icon_button(ui: &mut egui::Ui, enabled: bool, icon: ToolbarIcon) -> egui::Res
     } else {
         ui.visuals().widgets.inactive.bg_stroke
     };
-    ui.painter()
-        .rect(rect, visuals.corner_radius, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter().rect(
+        rect,
+        visuals.corner_radius,
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 
     let icon_color = if enabled {
         visuals.fg_stroke.color
@@ -1542,6 +1523,18 @@ fn paint_toolbar_icon(
             painter.line_segment([tip, Pos2::new(tip.x - 4.0, tip.y + 4.0)], stroke);
             painter.line_segment([tip, Pos2::new(tip.x + 4.0, tip.y + 4.0)], stroke);
         }
+        ToolbarIcon::Home => {
+            let roof_left = Pos2::new(c.x - 6.0, c.y - 0.5);
+            let roof_top = Pos2::new(c.x, c.y - 6.0);
+            let roof_right = Pos2::new(c.x + 6.0, c.y - 0.5);
+            painter.line_segment([roof_left, roof_top], stroke);
+            painter.line_segment([roof_top, roof_right], stroke);
+            let base_min = Pos2::new(c.x - 4.5, c.y - 0.5);
+            let base_max = Pos2::new(c.x + 4.5, c.y + 6.0);
+            painter.line_segment([base_min, Pos2::new(base_min.x, base_max.y)], stroke);
+            painter.line_segment([Pos2::new(base_min.x, base_max.y), base_max], stroke);
+            painter.line_segment([base_max, Pos2::new(base_max.x, base_min.y)], stroke);
+        }
         ToolbarIcon::Refresh => {
             let r = 5.5;
             let start_angle = -0.35 * std::f32::consts::PI;
@@ -1563,11 +1556,17 @@ fn paint_toolbar_icon(
         }
         ToolbarIcon::Close => {
             painter.line_segment(
-                [Pos2::new(c.x - 4.5, c.y - 4.5), Pos2::new(c.x + 4.5, c.y + 4.5)],
+                [
+                    Pos2::new(c.x - 4.5, c.y - 4.5),
+                    Pos2::new(c.x + 4.5, c.y + 4.5),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [Pos2::new(c.x - 4.5, c.y + 4.5), Pos2::new(c.x + 4.5, c.y - 4.5)],
+                [
+                    Pos2::new(c.x - 4.5, c.y + 4.5),
+                    Pos2::new(c.x + 4.5, c.y - 4.5),
+                ],
                 stroke,
             );
         }
@@ -1747,8 +1746,9 @@ fn format_perf_stats(stats: &PerfStats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::{DiscoveredNode, ScanBatch};
+    use crate::scanner::{DiscoveredNode, ProgressSnapshot, ScanBatch};
     use crate::tree::NodeRecord;
+    use std::path::PathBuf;
 
     fn root_started(scan_id: u64) -> ScanMessage {
         ScanMessage::Started {
@@ -1758,12 +1758,66 @@ mod tests {
         }
     }
 
+    fn app_with_search_matches() -> DiskMapApp {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![
+                    DiscoveredNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "match-dir".into(),
+                            kind: NodeKind::Dir,
+                            size: 10,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 2,
+                        parent_id: 1,
+                        node: NodeRecord {
+                            name: "match-file".into(),
+                            kind: NodeKind::File,
+                            size: 1,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 3,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "match-root-file".into(),
+                            kind: NodeKind::File,
+                            size: 1,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                ],
+                size_deltas: vec![(0, 11), (1, 1)],
+                scanned_nodes: vec![1, 2, 3],
+                progress: None,
+            },
+        });
+        *app.search.input_mut() = "match".into();
+        app.refresh_search_matches();
+        app
+    }
+
+    fn app_for_scan(scan_id: u64) -> DiskMapApp {
+        let mut app = DiskMapApp::default();
+        app.set_active_scan_id_for_test(scan_id);
+        app
+    }
+
     #[test]
     fn incremental_messages_build_tree_correctly() {
-        let mut app = DiskMapApp {
-            active_scan_id: 1,
-            ..Default::default()
-        };
+        let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started(1));
         app.apply_scan_message_for_test(ScanMessage::Batch {
             scan_id: 1,
@@ -1792,22 +1846,16 @@ mod tests {
 
     #[test]
     fn stale_scan_messages_are_ignored() {
-        let mut app = DiskMapApp {
-            active_scan_id: 2,
-            ..Default::default()
-        };
+        let mut app = app_for_scan(2);
         app.apply_scan_message_for_test(root_started(1));
         assert!(app.tree.root.is_none());
     }
 
     #[test]
     fn cancel_like_new_scan_keeps_old_events_out() {
-        let mut app = DiskMapApp {
-            active_scan_id: 2,
-            ..Default::default()
-        };
+        let mut app = app_for_scan(2);
         app.apply_scan_message_for_test(root_started(2));
-        app.active_scan_id = 3;
+        app.set_active_scan_id_for_test(3);
         app.apply_scan_message_for_test(ScanMessage::Batch {
             scan_id: 2,
             batch: ScanBatch {
@@ -1832,11 +1880,165 @@ mod tests {
     }
 
     #[test]
+    fn default_scan_options_keep_cache_disabled() {
+        assert_eq!(DEFAULT_SCAN_OPTIONS.cache_mode, CacheMode::Disabled);
+    }
+
+    #[test]
+    fn platform_errors_update_status_without_starting_scan() {
+        let mut app = app_for_scan(7);
+
+        app.apply_platform_result("Open", Err(anyhow::anyhow!("boom")));
+
+        assert_eq!(app.scan.active_id(), 7);
+        assert!(!app.scan.has_handle());
+        assert_eq!(app.status, "Open failed: boom");
+    }
+
+    #[test]
+    fn return_to_scan_root_pushes_previous_focus_to_back_history() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![DiscoveredNode {
+                    node_id: 1,
+                    parent_id: 0,
+                    node: NodeRecord {
+                        name: "child-dir".into(),
+                        kind: NodeKind::Dir,
+                        size: 10,
+                        scanned: true,
+                        error: None,
+                    },
+                }],
+                size_deltas: vec![(0, 10)],
+                scanned_nodes: vec![1],
+                progress: None,
+            },
+        });
+        app.enter_root(1, false);
+        app.layout_dirty = false;
+
+        app.return_to_scan_root();
+
+        assert_eq!(app.navigation.focused_root(), Some(0));
+        assert_eq!(app.navigation.selected_id(), Some(0));
+        assert_eq!(app.navigation.back_history(), &[1]);
+        assert!(app.navigation.forward_history().is_empty());
+        assert!(app.layout_dirty);
+    }
+
+    #[test]
+    fn return_to_scan_root_is_noop_when_already_at_scan_root() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.navigation.push_back_for_test(42);
+
+        app.return_to_scan_root();
+
+        assert_eq!(app.navigation.focused_root(), Some(0));
+        assert_eq!(app.navigation.back_history(), &[42]);
+        assert!(!app.navigation.can_return_to_scan_root(&app.tree));
+    }
+
+    #[test]
+    fn apply_progress_keeps_current_scan_path() {
+        let mut app = DiskMapApp::default();
+
+        app.apply_progress(ProgressSnapshot {
+            files_scanned: 3,
+            dirs_scanned: 2,
+            bytes_seen: 128,
+            current_path: "/root/current/file.txt".into(),
+        });
+
+        let progress = app.scan.progress().expect("progress summary");
+        assert_eq!(progress.files_scanned, 3);
+        assert_eq!(progress.dirs_scanned, 2);
+        assert_eq!(progress.bytes_seen, 128);
+        assert_eq!(
+            progress.current_path,
+            PathBuf::from("/root/current/file.txt")
+        );
+        assert_eq!(app.status, "Scanning...");
+    }
+
+    #[test]
+    fn search_next_cycles_through_ordered_matches() {
+        let mut app = app_with_search_matches();
+
+        app.navigate_search_match(SearchDirection::Next);
+        assert_eq!(app.search.active_match(), Some(0));
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(app.navigation.selected_id(), Some(1));
+
+        app.navigate_search_match(SearchDirection::Next);
+        assert_eq!(app.search.active_match(), Some(1));
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(app.navigation.selected_id(), Some(2));
+
+        app.navigate_search_match(SearchDirection::Next);
+        assert_eq!(app.search.active_match(), Some(2));
+        assert_eq!(app.navigation.focused_root(), Some(0));
+        assert_eq!(app.navigation.selected_id(), Some(3));
+
+        app.navigate_search_match(SearchDirection::Next);
+        assert_eq!(app.search.active_match(), Some(0));
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(app.navigation.selected_id(), Some(1));
+    }
+
+    #[test]
+    fn search_previous_cycles_from_no_active_match_to_last_match() {
+        let mut app = app_with_search_matches();
+
+        app.navigate_search_match(SearchDirection::Previous);
+        assert_eq!(app.search.active_match(), Some(2));
+        assert_eq!(app.navigation.focused_root(), Some(0));
+        assert_eq!(app.navigation.selected_id(), Some(3));
+
+        app.navigate_search_match(SearchDirection::Previous);
+        assert_eq!(app.search.active_match(), Some(1));
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(app.navigation.selected_id(), Some(2));
+    }
+
+    #[test]
+    fn search_jump_preserves_results() {
+        let mut app = app_with_search_matches();
+        app.navigate_search_match(SearchDirection::Next);
+
+        assert_eq!(app.search.state().matches(), &[1, 2, 3]);
+        assert_eq!(app.navigation.focused_root(), Some(1));
+    }
+
+    #[test]
+    fn manual_navigation_rebuilds_search_scope() {
+        let mut app = app_with_search_matches();
+
+        app.enter_root(1, false);
+
+        assert_eq!(app.search.state().matches(), &[1, 2]);
+        assert_eq!(app.search.active_match(), None);
+    }
+
+    #[test]
+    fn clear_search_clears_active_match_cursor() {
+        let mut app = app_with_search_matches();
+        app.navigate_search_match(SearchDirection::Next);
+
+        app.clear_search();
+
+        assert!(app.search.input().is_empty());
+        assert!(app.search.state().matches().is_empty());
+        assert_eq!(app.search.active_match(), None);
+    }
+
+    #[test]
     fn search_rebuild_marks_matches_in_current_root() {
-        let mut app = DiskMapApp {
-            active_scan_id: 1,
-            ..Default::default()
-        };
+        let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started(1));
         app.apply_scan_message_for_test(ScanMessage::Batch {
             scan_id: 1,
@@ -1857,11 +2059,11 @@ mod tests {
                 progress: None,
             },
         });
-        app.search_input = "match".into();
+        *app.search.input_mut() = "match".into();
         app.refresh_search_matches();
 
-        assert_eq!(app.search_state.match_count(), 1);
-        assert!(app.search_state.is_match(1));
+        assert_eq!(app.search.state().match_count(), 1);
+        assert!(app.search.state().is_match(1));
     }
 
     #[test]

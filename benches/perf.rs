@@ -3,7 +3,7 @@ use disk_map::scanner::{
     CacheMode, DiscoveredNode, PerfStats, ProgressSnapshot, ScanBatch, ScanOptions,
 };
 use disk_map::tree::{NodeKind, NodeRecord, TreeStore};
-use disk_map::treemap::{layout_treemap, Camera, LayoutScratch, SearchState};
+use disk_map::treemap::{layout_treemap, Camera, LayoutScratch, SearchState, TreemapLayoutParams};
 use egui::Rect;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
@@ -17,12 +17,7 @@ fn build_tree(node_count: usize) -> (TreeStore, usize) {
 
     for index in 0..node_count {
         let size = (node_count - index) as u64 + 1;
-        tree.add_node(
-            Some(root),
-            format!("file-{index}"),
-            NodeKind::File,
-            size,
-        );
+        tree.add_node(Some(root), format!("file-{index}"), NodeKind::File, size);
         total += size;
     }
 
@@ -86,12 +81,16 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                 db_flush_count: 0,
             };
 
-            black_box((batch, stats, ScanOptions {
-                batch_flush_interval: Duration::from_millis(33),
-                max_pending_nodes: 2048,
-                max_pending_size_deltas: 4096,
-                cache_mode: CacheMode::Disabled,
-            }));
+            black_box((
+                batch,
+                stats,
+                ScanOptions {
+                    batch_flush_interval: Duration::from_millis(33),
+                    max_pending_nodes: 2048,
+                    max_pending_size_deltas: 4096,
+                    cache_mode: CacheMode::Disabled,
+                },
+            ));
         })
     });
 }
@@ -144,13 +143,15 @@ fn treemap_layout_bench(c: &mut Criterion) {
             b.iter(|| {
                 layout_treemap(
                     &mut tree,
-                    root,
-                    canvas,
-                    Camera::default(),
-                    2,
-                    &search_state,
-                    &mut visuals,
-                    &mut scratch,
+                    TreemapLayoutParams {
+                        root,
+                        canvas_rect: canvas,
+                        camera: Camera::default(),
+                        max_depth: 2,
+                        search_state: &search_state,
+                        out: &mut visuals,
+                        scratch: &mut scratch,
+                    },
                 );
                 black_box(visuals.len())
             })
