@@ -187,10 +187,11 @@ struct TreeStore {
 ### Phase 3: Scan Controls
 - [x] Add scan exclude rules for common noisy folders and user patterns, such as `.git`, `node_modules`, build outputs, and cache directories
 - Exclude input accepts comma, semicolon, or newline separated patterns. Plain names match path components; patterns containing `/` match the normalized path; `*` wildcard is supported.
-- [ ] Add safe scan mode options:
-  - [ ] Do not cross filesystem or mount boundaries
-  - [ ] Include or exclude hidden files
-  - [ ] Follow or do not follow symlinks
+- [x] Add safe scan mode options:
+  - [x] Do not cross filesystem or mount boundaries where platform device IDs are available
+  - [x] Include or exclude hidden files
+  - [x] Follow or do not follow symlinks
+- Safe scan options are persisted with other user-facing scan options. Defaults preserve the original scan behavior: hidden files included, symlinks not followed, and filesystem boundaries not restricted until enabled.
 - [ ] Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
 
 ### Phase 4: Reporting and Size Model

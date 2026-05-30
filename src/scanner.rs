@@ -27,6 +27,9 @@ pub struct ScanOptions {
     pub max_pending_size_deltas: usize,
     pub cache_mode: CacheMode,
     pub exclude_patterns: Vec<String>,
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+    pub stay_on_filesystem: bool,
 }
 
 impl Default for ScanOptions {
@@ -37,6 +40,9 @@ impl Default for ScanOptions {
             max_pending_size_deltas: 4_096,
             cache_mode: CacheMode::Disabled,
             exclude_patterns: Vec::new(),
+            include_hidden: true,
+            follow_symlinks: false,
+            stay_on_filesystem: false,
         }
     }
 }
@@ -351,6 +357,26 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     pattern.ends_with('*') || value.ends_with(parts.last().copied().unwrap_or_default())
 }
 
+#[cfg(unix)]
+fn root_device_id(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn root_device_id(_path: &Path) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn metadata_is_on_device(metadata: &Metadata, device_id: u64) -> bool {
+    metadata.dev() == device_id
+}
+
+#[cfg(not(unix))]
+fn metadata_is_on_device(_metadata: &Metadata, _device_id: u64) -> bool {
+    true
+}
+
 impl AggregateState {
     fn add_file(&mut self, parent_id: NodeId, size: u64) {
         let bucket = self.buckets.entry(parent_id).or_default();
@@ -466,15 +492,32 @@ fn run_scan(
     let walker_prefetch_perf = Arc::clone(&prefetch_perf);
     let cache_enabled = matches!(options.cache_mode, CacheMode::Enabled);
     let exclude_matcher = ExcludeMatcher::new(options.exclude_patterns.clone());
+    let same_filesystem_device = if options.stay_on_filesystem {
+        root_device_id(&path)
+    } else {
+        None
+    };
+    let include_hidden = options.include_hidden;
+    let follow_symlinks = options.follow_symlinks;
     let walker = WalkDirGeneric::<ScanWalkState>::new(&path)
-        .skip_hidden(false)
-        .follow_links(false)
+        .skip_hidden(!include_hidden)
+        .follow_links(follow_symlinks)
         .process_read_dir(move |_depth, _path, _state, children| {
-            if !exclude_matcher.is_empty() {
+            if !exclude_matcher.is_empty() || same_filesystem_device.is_some() {
                 children.retain(|child| {
-                    child
-                        .as_ref()
-                        .map_or(true, |entry| !exclude_matcher.matches_path(&entry.path()))
+                    let Ok(entry) = child.as_ref() else {
+                        return true;
+                    };
+                    if !exclude_matcher.is_empty() && exclude_matcher.matches_path(&entry.path()) {
+                        return false;
+                    }
+                    if let Some(device_id) = same_filesystem_device {
+                        return entry
+                            .metadata()
+                            .map(|metadata| metadata_is_on_device(&metadata, device_id))
+                            .unwrap_or(true);
+                    }
+                    true
                 });
             }
 
@@ -1113,6 +1156,15 @@ mod tests {
     }
 
     #[test]
+    fn default_scan_options_keep_current_safe_scan_behavior() {
+        let options = ScanOptions::default();
+
+        assert!(options.include_hidden);
+        assert!(!options.follow_symlinks);
+        assert!(!options.stay_on_filesystem);
+    }
+
+    #[test]
     fn parse_exclude_patterns_trims_splits_and_deduplicates() {
         let patterns = parse_exclude_patterns(".git, node_modules; target\n.git");
 
@@ -1139,6 +1191,20 @@ mod tests {
         let measured = size_on_disk_bytes(&metadata);
 
         assert_eq!(measured, metadata.blocks().saturating_mul(512));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_device_id_matches_metadata_device() {
+        let path = temp_path("root-device");
+        write(&path, b"disk-map").unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+
+        assert_eq!(root_device_id(&path), Some(metadata.dev()));
+        assert!(metadata_is_on_device(&metadata, metadata.dev()));
 
         let _ = std::fs::remove_file(path);
     }

@@ -28,6 +28,9 @@ const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
 const STORAGE_PATH_INPUT: &str = "disk_map.path_input";
 const STORAGE_EXCLUDE_INPUT: &str = "disk_map.exclude_input";
+const STORAGE_INCLUDE_HIDDEN: &str = "disk_map.include_hidden";
+const STORAGE_FOLLOW_SYMLINKS: &str = "disk_map.follow_symlinks";
+const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 
@@ -219,6 +222,9 @@ fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
 pub struct DiskMapApp {
     path_input: String,
     exclude_input: String,
+    include_hidden: bool,
+    follow_symlinks: bool,
+    stay_on_filesystem: bool,
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
@@ -247,6 +253,9 @@ impl Default for DiskMapApp {
         Self {
             path_input: dirs_home_fallback(),
             exclude_input: String::new(),
+            include_hidden: ScanOptions::default().include_hidden,
+            follow_symlinks: ScanOptions::default().follow_symlinks,
+            stay_on_filesystem: ScanOptions::default().stay_on_filesystem,
             initial_scan_pending: true,
             tx,
             rx,
@@ -296,6 +305,27 @@ impl DiskMapApp {
             self.exclude_input = exclude_input;
         }
 
+        if let Some(include_hidden) = storage
+            .get_string(STORAGE_INCLUDE_HIDDEN)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.include_hidden = include_hidden;
+        }
+
+        if let Some(follow_symlinks) = storage
+            .get_string(STORAGE_FOLLOW_SYMLINKS)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.follow_symlinks = follow_symlinks;
+        }
+
+        if let Some(stay_on_filesystem) = storage
+            .get_string(STORAGE_STAY_ON_FILESYSTEM)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.stay_on_filesystem = stay_on_filesystem;
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -311,6 +341,12 @@ impl DiskMapApp {
     fn save_preferences(&self, storage: &mut dyn eframe::Storage) {
         storage.set_string(STORAGE_PATH_INPUT, self.path_input.clone());
         storage.set_string(STORAGE_EXCLUDE_INPUT, self.exclude_input.clone());
+        storage.set_string(STORAGE_INCLUDE_HIDDEN, self.include_hidden.to_string());
+        storage.set_string(STORAGE_FOLLOW_SYMLINKS, self.follow_symlinks.to_string());
+        storage.set_string(
+            STORAGE_STAY_ON_FILESYSTEM,
+            self.stay_on_filesystem.to_string(),
+        );
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
             storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
@@ -320,6 +356,9 @@ impl DiskMapApp {
     fn scan_options(&self) -> ScanOptions {
         ScanOptions {
             exclude_patterns: parse_exclude_patterns(&self.exclude_input),
+            include_hidden: self.include_hidden,
+            follow_symlinks: self.follow_symlinks,
+            stay_on_filesystem: self.stay_on_filesystem,
             ..ScanOptions::default()
         }
     }
@@ -453,6 +492,14 @@ impl DiskMapApp {
                 egui::TextEdit::singleline(&mut self.exclude_input)
                     .hint_text(".git,node_modules,target"),
             );
+
+            ui.add_space(4.0);
+            ui.checkbox(&mut self.include_hidden, "Hidden")
+                .on_hover_text("Include hidden files and folders");
+            ui.checkbox(&mut self.follow_symlinks, "Links")
+                .on_hover_text("Follow symlinked directories during scan");
+            ui.checkbox(&mut self.stay_on_filesystem, "Same FS")
+                .on_hover_text("Stay on the scan root filesystem when supported");
 
             ui.add_space(6.0);
 
@@ -1845,6 +1892,14 @@ fn parse_theme_preference(value: &str) -> Option<Theme> {
     }
 }
 
+fn parse_storage_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn theme_preference_name(theme: Theme) -> &'static str {
     match theme {
         Theme::Dark => "dark",
@@ -2147,6 +2202,15 @@ mod tests {
     }
 
     #[test]
+    fn default_scan_options_preserve_safe_scan_defaults() {
+        let options = DiskMapApp::default().scan_options();
+
+        assert!(options.include_hidden);
+        assert!(!options.follow_symlinks);
+        assert!(!options.stay_on_filesystem);
+    }
+
+    #[test]
     fn preferences_restore_path_depth_and_theme() {
         let mut storage = TestStorage::default();
         storage
@@ -2155,6 +2219,15 @@ mod tests {
         storage
             .values
             .insert(STORAGE_EXCLUDE_INPUT.into(), ".git,target".into());
+        storage
+            .values
+            .insert(STORAGE_INCLUDE_HIDDEN.into(), "false".into());
+        storage
+            .values
+            .insert(STORAGE_FOLLOW_SYMLINKS.into(), "true".into());
+        storage
+            .values
+            .insert(STORAGE_STAY_ON_FILESYSTEM.into(), "true".into());
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2163,6 +2236,9 @@ mod tests {
 
         assert_eq!(app.path_input, "/restored");
         assert_eq!(app.exclude_input, ".git,target");
+        assert!(!app.include_hidden);
+        assert!(app.follow_symlinks);
+        assert!(app.stay_on_filesystem);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2173,6 +2249,9 @@ mod tests {
         let app = DiskMapApp {
             path_input: "/next".into(),
             exclude_input: "node_modules;target".into(),
+            include_hidden: false,
+            follow_symlinks: true,
+            stay_on_filesystem: true,
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2196,6 +2275,27 @@ mod tests {
             Some("node_modules;target")
         );
         assert_eq!(
+            storage
+                .values
+                .get(STORAGE_INCLUDE_HIDDEN)
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            storage
+                .values
+                .get(STORAGE_FOLLOW_SYMLINKS)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            storage
+                .values
+                .get(STORAGE_STAY_ON_FILESYSTEM)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
             storage.values.get(STORAGE_THEME).map(String::as_str),
             Some("light")
         );
@@ -2212,6 +2312,21 @@ mod tests {
             app.scan_options().exclude_patterns,
             vec![".git", "node_modules", "target"]
         );
+    }
+
+    #[test]
+    fn scan_options_include_safe_scan_flags() {
+        let app = DiskMapApp {
+            include_hidden: false,
+            follow_symlinks: true,
+            stay_on_filesystem: true,
+            ..Default::default()
+        };
+        let options = app.scan_options();
+
+        assert!(!options.include_hidden);
+        assert!(options.follow_symlinks);
+        assert!(options.stay_on_filesystem);
     }
 
     #[test]
