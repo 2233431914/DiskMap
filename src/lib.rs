@@ -4,6 +4,7 @@ pub mod export;
 pub mod format;
 pub mod platform;
 pub mod scanner;
+pub mod snapshot;
 pub mod tree;
 pub mod treemap;
 pub mod watcher;

@@ -5,6 +5,9 @@ use crate::scanner::{
     parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, CacheMode,
     PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
 };
+use crate::snapshot::{
+    capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotChange, SnapshotDiff,
+};
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{
     layout_treemap, Camera, LayoutScratch, TreemapLayoutParams, VisualKind, VisualNode,
@@ -45,6 +48,7 @@ const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 const MAX_RECENT_ROOTS: usize = 10;
 const MAX_PINNED_ROOTS: usize = 12;
+const SNAPSHOT_DIFF_LIMIT: usize = 5;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -260,6 +264,8 @@ pub struct DiskMapApp {
     color_by_extension: bool,
     recent_roots: Vec<String>,
     pinned_roots: Vec<String>,
+    last_snapshot: Option<ScanSnapshot>,
+    snapshot_diff: Option<SnapshotDiff>,
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
@@ -304,6 +310,8 @@ impl Default for DiskMapApp {
             color_by_extension: false,
             recent_roots: Vec::new(),
             pinned_roots: Vec::new(),
+            last_snapshot: None,
+            snapshot_diff: None,
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -1075,6 +1083,7 @@ impl DiskMapApp {
 
         self.show_progress_section(ui, p);
         self.show_scan_issue_section(ui, p);
+        self.show_snapshot_diff_section(ui, p);
         self.show_search_section(ui, p);
     }
 
@@ -1201,6 +1210,49 @@ impl DiskMapApp {
                     p.text_muted
                 }),
         );
+    }
+
+    fn show_snapshot_diff_section(&self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(diff) = &self.snapshot_diff else {
+            return;
+        };
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("SNAPSHOT DIFF")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "{} total change",
+                format_signed_bytes(diff.total_delta())
+            ))
+            .small()
+            .monospace()
+            .color(if diff.total_delta() >= 0 {
+                p.accent
+            } else {
+                p.text_muted
+            }),
+        )
+        .on_hover_text(diff.root_path.display().to_string());
+
+        if !diff.has_changes() {
+            ui.label(
+                RichText::new("No path-level changes since previous scan.")
+                    .small()
+                    .color(p.text_muted),
+            );
+            return;
+        }
+
+        snapshot_change_group(ui, p, "Added", &diff.added);
+        snapshot_change_group(ui, p, "Grown", &diff.grown);
+        snapshot_change_group(ui, p, "Shrunk", &diff.shrunk);
+        snapshot_change_group(ui, p, "Removed", &diff.removed);
     }
 
     fn show_status_bar(&self, ui: &mut egui::Ui) {
@@ -1699,6 +1751,7 @@ impl DiskMapApp {
                     self.refresh_search_matches();
                     self.layout_dirty = true;
                     self.status = self.finished_status(total_bytes);
+                    self.update_snapshot_comparison();
                     self.update_watch_state();
                     self.pending_repaint = true;
                     eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
@@ -1826,6 +1879,24 @@ impl DiskMapApp {
             path.display().to_string(),
             MAX_RECENT_ROOTS,
         );
+    }
+
+    fn update_snapshot_comparison(&mut self) {
+        let Some(root_id) = self.tree.root else {
+            self.snapshot_diff = None;
+            return;
+        };
+        let Some(current_snapshot) = capture_snapshot(&mut self.tree, root_id) else {
+            self.snapshot_diff = None;
+            return;
+        };
+
+        self.snapshot_diff = self
+            .last_snapshot
+            .as_ref()
+            .filter(|previous| previous.root_path == current_snapshot.root_path)
+            .map(|previous| compare_snapshots(previous, &current_snapshot, SNAPSHOT_DIFF_LIMIT));
+        self.last_snapshot = Some(current_snapshot);
     }
 
     fn finished_status(&self, total_bytes: u64) -> String {
@@ -2042,6 +2113,7 @@ impl DiskMapApp {
         self.context_menu_target_id = None;
         self.trash_confirm_target_id = None;
         self.hovered_visual_kind = None;
+        self.snapshot_diff = None;
         self.search.clear(0);
         self.cached_visuals.clear();
         self.reset_camera();
@@ -2349,9 +2421,8 @@ impl DiskMapApp {
                 self.navigation.rebuild_breadcrumb_cache(&self.tree);
             }
             ScanMessage::Batch { batch, .. } => self.apply_scan_batch(batch),
-            ScanMessage::Finished { .. }
-            | ScanMessage::Cancelled { .. }
-            | ScanMessage::Error { .. } => {}
+            ScanMessage::Finished { .. } => self.update_snapshot_comparison(),
+            ScanMessage::Cancelled { .. } | ScanMessage::Error { .. } => {}
         }
     }
 
@@ -2755,6 +2826,48 @@ fn accent_button(
     )
 }
 
+fn snapshot_change_group(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    label: &str,
+    changes: &[SnapshotChange],
+) {
+    if changes.is_empty() {
+        return;
+    }
+
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("{label}: {}", changes.len()))
+            .small()
+            .strong()
+            .color(palette.text_muted),
+    );
+    for change in changes {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format_signed_bytes(change.delta))
+                    .small()
+                    .monospace()
+                    .color(if change.delta >= 0 {
+                        palette.accent
+                    } else {
+                        palette.text_muted
+                    }),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(truncate_middle(&change.path, 34))
+                        .small()
+                        .color(palette.text_faint),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&change.path);
+        });
+    }
+}
+
 fn dirs_home_fallback() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
@@ -2784,6 +2897,14 @@ fn pluralize(count: u64, singular: &str, plural: &str) -> String {
         format!("{count} {singular}")
     } else {
         format!("{count} {plural}")
+    }
+}
+
+fn format_signed_bytes(delta: i128) -> String {
+    if delta >= 0 {
+        format!("+{}", format_bytes(delta as u64))
+    } else {
+        format!("-{}", format_bytes(delta.unsigned_abs() as u64))
     }
 }
 
@@ -2860,6 +2981,22 @@ mod tests {
             scan_id,
             path: "/root".into(),
             root_node: TreeStore::root_record("root".into()),
+        }
+    }
+
+    fn root_started_at(scan_id: u64, path: &str) -> ScanMessage {
+        ScanMessage::Started {
+            scan_id,
+            path: path.into(),
+            root_node: TreeStore::root_record("root".into()),
+        }
+    }
+
+    fn finished(scan_id: u64, total_bytes: u64) -> ScanMessage {
+        ScanMessage::Finished {
+            scan_id,
+            total_bytes,
+            perf_stats: PerfStats::default(),
         }
     }
 
@@ -3205,6 +3342,99 @@ mod tests {
         app.apply_scan_message_for_test(root_started(1));
 
         assert_eq!(app.recent_roots, vec!["/root"]);
+    }
+
+    #[test]
+    fn repeated_scan_of_same_root_builds_snapshot_diff() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![DiscoveredNode {
+                    node_id: 1,
+                    parent_id: 0,
+                    node: NodeRecord {
+                        name: "file.txt".into(),
+                        kind: NodeKind::File,
+                        size: 4,
+                        scanned: true,
+                        error: None,
+                    },
+                }],
+                size_deltas: vec![(0, 4)],
+                scanned_nodes: vec![1],
+                progress: None,
+            },
+        });
+        app.apply_scan_message_for_test(finished(1, 4));
+        assert!(app.snapshot_diff.is_none());
+
+        app.set_active_scan_id_for_test(2);
+        app.apply_scan_message_for_test(root_started(2));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 2,
+            batch: ScanBatch {
+                discovered_nodes: vec![
+                    DiscoveredNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "file.txt".into(),
+                            kind: NodeKind::File,
+                            size: 9,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 2,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "new.txt".into(),
+                            kind: NodeKind::File,
+                            size: 3,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                ],
+                size_deltas: vec![(0, 12)],
+                scanned_nodes: vec![1, 2],
+                progress: None,
+            },
+        });
+        app.apply_scan_message_for_test(finished(2, 12));
+
+        let diff = app.snapshot_diff.as_ref().expect("snapshot diff");
+        assert_eq!(diff.total_delta(), 8);
+        assert!(diff
+            .grown
+            .iter()
+            .any(|change| change.path == "/root/file.txt"));
+        assert!(diff
+            .added
+            .iter()
+            .any(|change| change.path == "/root/new.txt"));
+    }
+
+    #[test]
+    fn snapshot_diff_is_not_built_across_different_roots() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started_at(1, "/root-a"));
+        app.apply_scan_message_for_test(finished(1, 0));
+
+        app.set_active_scan_id_for_test(2);
+        app.apply_scan_message_for_test(root_started_at(2, "/root-b"));
+        app.apply_scan_message_for_test(finished(2, 0));
+
+        assert!(app.snapshot_diff.is_none());
+        assert_eq!(
+            app.last_snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.root_path),
+            Some(&PathBuf::from("/root-b"))
+        );
     }
 
     #[test]

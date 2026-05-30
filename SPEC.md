@@ -239,7 +239,8 @@ struct TreeStore {
 ### Phase 8: Analysis Workflows
 - [x] Recent scan roots and pinned favorites for repeat analysis
 - The `Roots` menu keeps successful scan roots in a capped recent list and stores pinned favorites separately in local preferences. Selecting a root starts a new scan with the current scan options.
-- [ ] Snapshot comparison to show growth, shrinkage, and newly added large paths between scans
+- [x] Snapshot comparison to show growth, shrinkage, and newly added large paths between scans
+- Snapshot diff is read-only and compares the latest completed scan with the previous in-memory snapshot for the same root. It reports total delta plus top added, grown, shrunk, and removed paths by byte impact.
 - [ ] Optional duplicate-file candidate analysis as a read-only report before any cleanup workflow
 - [ ] File age and file type insights, including modified-time filters and category summaries
 - [ ] Export/share a focused report with enough metadata to reproduce the visible result
