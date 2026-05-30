@@ -24,6 +24,7 @@
 - [x] Input/select scan directory path
 - [x] Background scanning with jwalk parallel traversal
 - [x] Real-time UI refresh during scan (snapshots at depth <= 1)
+- [x] Scan exclude rules with persisted user patterns
 - [x] Treemap visualization by area (Squarified Treemap algorithm)
 - [x] Hover tooltip showing path and size
 - [x] Left-click to select, double-click to drill into directory
@@ -37,8 +38,8 @@
 - FSEvents real-time monitoring
 - Animations
 - File deletion / Move to Trash
-- Scan exclude rules and persisted preferences
 - Export/reporting workflows
+- Advanced scan safety toggles and manual rescan shortcuts
 
 ### 3.3 Sidebar Features
 - [x] Current directory path display
@@ -49,6 +50,10 @@
 - [x] Breadcrumb path display
 - [x] Root button to return to scan root
 - [x] Status bar showing scan progress
+
+### 3.5 Preferences
+- [x] Persist last scan path, window size, theme, depth, and current user-facing scan options
+- [x] Restore persisted preferences on startup
 
 ## 4. Architecture
 
@@ -207,3 +212,22 @@ struct TreeStore {
 - [ ] Search and filter
 - [ ] Extension-based coloring
 - [ ] Move to Trash functionality with confirmation and reliable platform adapter
+
+### Phase 8: Analysis Workflows
+- [ ] Recent scan roots and pinned favorites for repeat analysis
+- [ ] Snapshot comparison to show growth, shrinkage, and newly added large paths between scans
+- [ ] Optional duplicate-file candidate analysis as a read-only report before any cleanup workflow
+- [ ] File age and file type insights, including modified-time filters and category summaries
+- [ ] Export/share a focused report with enough metadata to reproduce the visible result
+
+### Phase 9: Cleanup Workflow Safety
+- [ ] Add a review queue for cleanup candidates before any destructive action
+- [ ] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
+- [ ] Require explicit confirmation with path, size, and affected item count before Move to Trash
+- [ ] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
+
+### Phase 10: Accessibility and Packaging
+- [ ] Keyboard shortcuts for primary navigation, search navigation, rescan, and focused export
+- [ ] Accessible labels and focus order for toolbar, treemap selection, and context menu actions
+- [ ] Performance regression benchmarks for large trees, search rebuilds, and layout generation
+- [ ] macOS packaging, signing/notarization, and release checklist
