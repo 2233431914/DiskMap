@@ -77,6 +77,7 @@ pub struct TreemapLayoutParams<'a, 'b> {
     pub camera: Camera,
     pub max_depth: usize,
     pub search_state: &'a SearchState,
+    pub filter_to_search: bool,
     pub out: &'b mut Vec<VisualNode>,
     pub scratch: &'b mut LayoutScratch,
 }
@@ -87,6 +88,7 @@ struct LayoutContext<'a> {
     total_size: u64,
     max_depth: usize,
     search_state: &'a SearchState,
+    filter_to_search: bool,
     out: &'a mut Vec<VisualNode>,
     scratch: &'a mut LayoutScratch,
 }
@@ -181,6 +183,14 @@ impl SearchState {
         &self.matched_ids
     }
 
+    pub fn has_query(&self) -> bool {
+        !self.query_lower.is_empty()
+    }
+
+    pub fn visible_in_filter(&self, node_id: NodeId) -> bool {
+        !self.has_query() || self.is_match(node_id) || self.is_ancestor_of_match(node_id)
+    }
+
     fn ingest_node_if_matches(&mut self, tree: &mut TreeStore, node_id: NodeId) -> bool {
         if self.query_lower.is_empty() || node_id >= tree.len() {
             return false;
@@ -248,6 +258,7 @@ pub fn layout_treemap(tree: &mut TreeStore, params: TreemapLayoutParams<'_, '_>)
         total_size,
         max_depth: params.max_depth,
         search_state: params.search_state,
+        filter_to_search: params.filter_to_search && params.search_state.has_query(),
         out: params.out,
         scratch: params.scratch,
     };
@@ -281,6 +292,9 @@ fn layout_node_squarified(
 
     let total_child_size: u64 = children
         .iter()
+        .filter(|child_id| {
+            !context.filter_to_search || context.search_state.visible_in_filter(**child_id)
+        })
         .map(|child_id| context.tree.node(*child_id).size)
         .filter(|size| *size > 0)
         .sum();
@@ -294,6 +308,9 @@ fn layout_node_squarified(
         items.reserve(children.len() - items.capacity());
     }
     for &node_id in children {
+        if context.filter_to_search && !context.search_state.visible_in_filter(node_id) {
+            continue;
+        }
         let size = context.tree.node(node_id).size;
         if size > 0 {
             items.push(LayoutItem {
@@ -696,6 +713,7 @@ mod tests {
                 camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
+                filter_to_search: false,
                 out: &mut visuals,
                 scratch: &mut scratch,
             },
@@ -763,6 +781,49 @@ mod tests {
     }
 
     #[test]
+    fn filtered_layout_only_emits_matches_and_ancestors() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/".into());
+        let dir = tree.add_node(Some(root), "dir".into(), NodeKind::Dir, 0);
+        let matching = tree.add_node(Some(dir), "target-file".into(), NodeKind::File, 10);
+        let hidden = tree.add_node(Some(root), "other-file".into(), NodeKind::File, 50);
+        tree.apply_direct_size_delta(dir, 10);
+        tree.apply_direct_size_delta(root, 60);
+        tree.repair_sorted_children(&[root, dir]);
+
+        let mut search_state = SearchState::default();
+        search_state.rebuild(&mut tree, Some(root), "target");
+        let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 700.0));
+        let mut visuals = Vec::new();
+        let mut scratch = LayoutScratch::default();
+
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: canvas,
+                camera: Camera::default(),
+                max_depth: 2,
+                search_state: &search_state,
+                filter_to_search: true,
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
+
+        let emitted_ids: Vec<NodeId> = visuals
+            .iter()
+            .map(|visual| match visual.kind {
+                VisualKind::Node(node_id) => node_id,
+            })
+            .collect();
+        assert!(emitted_ids.contains(&dir));
+        assert!(emitted_ids.contains(&matching));
+        assert!(!emitted_ids.contains(&hidden));
+    }
+
+    #[test]
     fn layout_handles_zero_sizes_and_tiny_rectangles() {
         let mut tree = TreeStore::new();
         let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
@@ -782,6 +843,7 @@ mod tests {
                 camera: Camera::default(),
                 max_depth: 2,
                 search_state: &SearchState::default(),
+                filter_to_search: false,
                 out: &mut visuals,
                 scratch: &mut scratch,
             },
@@ -804,6 +866,7 @@ mod tests {
                 camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
+                filter_to_search: false,
                 out: &mut visuals,
                 scratch: &mut scratch,
             },
@@ -834,6 +897,7 @@ mod tests {
                 camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
+                filter_to_search: false,
                 out: &mut visuals,
                 scratch: &mut scratch,
             },
@@ -859,6 +923,7 @@ mod tests {
                 camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
+                filter_to_search: false,
                 out: &mut visuals,
                 scratch: &mut scratch,
             },

@@ -153,6 +153,7 @@ fn treemap_layout_bench(c: &mut Criterion) {
                         camera: Camera::default(),
                         max_depth: 2,
                         search_state: &search_state,
+                        filter_to_search: false,
                         out: &mut visuals,
                         scratch: &mut scratch,
                     },

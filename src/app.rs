@@ -37,6 +37,7 @@ const STORAGE_FOLLOW_SYMLINKS: &str = "disk_map.follow_symlinks";
 const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
 const STORAGE_REALTIME_WATCH: &str = "disk_map.realtime_watch";
 const STORAGE_SQLITE_CACHE: &str = "disk_map.sqlite_cache";
+const STORAGE_SEARCH_FILTER: &str = "disk_map.search_filter";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 
@@ -250,6 +251,7 @@ pub struct DiskMapApp {
     tree: TreeStore,
     navigation: NavigationState,
     search: SearchController,
+    search_filter_enabled: bool,
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
@@ -288,6 +290,7 @@ impl Default for DiskMapApp {
             tree: TreeStore::new(),
             navigation: NavigationState::default(),
             search: SearchController::default(),
+            search_filter_enabled: false,
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -366,6 +369,13 @@ impl DiskMapApp {
             self.sqlite_cache_enabled = sqlite_cache_enabled;
         }
 
+        if let Some(search_filter_enabled) = storage
+            .get_string(STORAGE_SEARCH_FILTER)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.search_filter_enabled = search_filter_enabled;
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -392,6 +402,10 @@ impl DiskMapApp {
             self.realtime_watch_enabled.to_string(),
         );
         storage.set_string(STORAGE_SQLITE_CACHE, self.sqlite_cache_enabled.to_string());
+        storage.set_string(
+            STORAGE_SEARCH_FILTER,
+            self.search_filter_enabled.to_string(),
+        );
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
             storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
@@ -635,6 +649,13 @@ impl DiskMapApp {
                     .clicked()
             {
                 self.clear_search();
+            }
+            if ui
+                .checkbox(&mut self.search_filter_enabled, "Filter")
+                .on_hover_text("Show only search matches and their ancestor folders")
+                .changed()
+            {
+                self.mark_layout_dirty_now();
             }
 
             ui.add_space(6.0);
@@ -1227,6 +1248,7 @@ impl DiskMapApp {
                     camera: self.camera,
                     max_depth: self.max_depth,
                     search_state: self.search.state(),
+                    filter_to_search: self.search_filter_enabled,
                     out: &mut self.cached_visuals,
                     scratch: &mut self.layout_scratch,
                 },
@@ -2733,6 +2755,9 @@ mod tests {
         storage
             .values
             .insert(STORAGE_SQLITE_CACHE.into(), "true".into());
+        storage
+            .values
+            .insert(STORAGE_SEARCH_FILTER.into(), "true".into());
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2746,6 +2771,7 @@ mod tests {
         assert!(app.stay_on_filesystem);
         assert!(app.realtime_watch_enabled);
         assert!(app.sqlite_cache_enabled);
+        assert!(app.search_filter_enabled);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2761,6 +2787,7 @@ mod tests {
             stay_on_filesystem: true,
             realtime_watch_enabled: true,
             sqlite_cache_enabled: true,
+            search_filter_enabled: true,
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2813,6 +2840,13 @@ mod tests {
         );
         assert_eq!(
             storage.values.get(STORAGE_SQLITE_CACHE).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            storage
+                .values
+                .get(STORAGE_SEARCH_FILTER)
+                .map(String::as_str),
             Some("true")
         );
         assert_eq!(

@@ -30,6 +30,7 @@
 - [x] Left-click to select, double-click to drill into directory
 - [x] Right-click context menu: Reveal in Finder / Copy Path / Open
 - [x] Search result navigation with Previous/Next and Enter/Shift+Enter
+- [x] Search filter mode showing only matches and ancestor folders
 - [x] Small-file aggregation as virtual "Other Files" nodes
 
 ### 3.2 Excluded from MVP
@@ -220,7 +221,8 @@ struct TreeStore {
 ### Phase 7: Productization
 - [x] Enable SQLite index for faster rescans behind a user setting
 - SQLite remains disabled by default. The experimental `SQLite` toolbar setting switches scan cache mode to `Enabled` and is persisted with other scan options.
-- [ ] Search and filter
+- [x] Search and filter
+- Filter mode is an optional search display mode. It does not change search scope; it only removes non-matching branches from treemap layout while preserving the current focused subtree.
 - [ ] Extension-based coloring
 - [ ] Move to Trash functionality with confirmation and reliable platform adapter
 
