@@ -1,7 +1,7 @@
 use crate::db::ScanDb;
 use crate::tree::{NodeId, NodeKind, NodeRecord, TreeStore};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{unbounded, Sender};
 use jwalk::{ClientState, WalkDirGeneric};
 use rustc_hash::FxHashMap;
 use std::fs::Metadata;
@@ -463,6 +463,54 @@ pub fn start_scan(
     });
 
     ScanHandle { cancel }
+}
+
+pub fn scan_path_to_tree(path: PathBuf, options: ScanOptions) -> anyhow::Result<TreeStore> {
+    let (tx, rx) = unbounded();
+    run_scan(
+        path.clone(),
+        0,
+        options,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let mut tree = TreeStore::new();
+    while let Ok(message) = rx.recv() {
+        match message {
+            ScanMessage::Started {
+                path, root_node, ..
+            } => {
+                tree.clear();
+                tree.push_node(None, root_node);
+                tree.set_root_path(path);
+            }
+            ScanMessage::Batch { batch, .. } => {
+                for discovered in batch.discovered_nodes {
+                    tree.insert_node(
+                        discovered.node_id,
+                        Some(discovered.parent_id),
+                        discovered.node,
+                    );
+                }
+                for (node_id, delta) in batch.size_deltas {
+                    if node_id < tree.len() {
+                        tree.apply_direct_size_delta(node_id, delta);
+                    }
+                }
+                for node_id in batch.scanned_nodes {
+                    if node_id < tree.len() {
+                        tree.mark_scanned(node_id);
+                    }
+                }
+            }
+            ScanMessage::Finished { .. } => return Ok(tree),
+            ScanMessage::Cancelled { .. } => anyhow::bail!("scan cancelled"),
+            ScanMessage::Error { message, .. } => anyhow::bail!(message),
+        }
+    }
+
+    anyhow::bail!("scan ended without a result for {}", path.display())
 }
 
 fn run_scan(
@@ -1197,6 +1245,24 @@ mod tests {
         assert_eq!(size_basis_label(), "Apparent size");
 
         assert!(!size_basis_detail().is_empty());
+    }
+
+    #[test]
+    fn scan_path_to_tree_returns_complete_tree_for_directory() {
+        let dir = temp_path("sync-tree");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(dir.join("file.txt"), b"disk-map").unwrap();
+
+        let tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
+
+        assert!(tree.root.is_some());
+        assert_eq!(
+            tree.node(tree.root.unwrap()).name,
+            dir.file_name().unwrap().to_string_lossy()
+        );
+        assert!(!tree.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

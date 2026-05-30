@@ -2,8 +2,8 @@ use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
 use crate::platform::{open_path, reveal_in_finder};
 use crate::scanner::{
-    parse_exclude_patterns, size_basis_detail, size_basis_label, PerfStats, ProgressSnapshot,
-    ScanBatch, ScanMessage, ScanOptions,
+    parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, PerfStats,
+    ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
 };
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{
@@ -24,7 +24,7 @@ use eframe::egui;
 use egui::{
     Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme, Vec2,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
@@ -60,6 +60,13 @@ struct Palette {
 struct StateMessage {
     title: &'static str,
     detail: String,
+}
+
+#[derive(Debug)]
+struct IncrementalScanResult {
+    target_id: NodeId,
+    path: PathBuf,
+    result: anyhow::Result<TreeStore>,
 }
 
 const DARK_PALETTE: Palette = Palette {
@@ -235,6 +242,9 @@ pub struct DiskMapApp {
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
+    incremental_tx: Sender<IncrementalScanResult>,
+    incremental_rx: Receiver<IncrementalScanResult>,
+    incremental_scan_active: bool,
     tree: TreeStore,
     navigation: NavigationState,
     search: SearchController,
@@ -257,6 +267,7 @@ pub struct DiskMapApp {
 impl Default for DiskMapApp {
     fn default() -> Self {
         let (tx, rx) = unbounded();
+        let (incremental_tx, incremental_rx) = unbounded();
         Self {
             path_input: dirs_home_fallback(),
             exclude_input: String::new(),
@@ -268,6 +279,9 @@ impl Default for DiskMapApp {
             initial_scan_pending: true,
             tx,
             rx,
+            incremental_tx,
+            incremental_rx,
+            incremental_scan_active: false,
             tree: TreeStore::new(),
             navigation: NavigationState::default(),
             search: SearchController::default(),
@@ -392,6 +406,7 @@ impl eframe::App for DiskMapApp {
         }
         self.handle_keyboard(ctx);
         self.handle_scan_messages();
+        self.handle_incremental_scan_results();
         self.handle_watch_events();
         self.maybe_refresh_search(ctx);
         self.maybe_request_deferred_repaint(ctx);
@@ -1623,7 +1638,7 @@ impl DiskMapApp {
             }
             WatchPoll::Ready(change) => {
                 let change_count = change.paths.len();
-                if self.scan.is_scanning() {
+                if self.scan.is_scanning() || self.incremental_scan_active {
                     self.status = format!(
                         "Watch noticed {} while scan is running",
                         pluralize(change_count as u64, "change", "changes")
@@ -1631,11 +1646,10 @@ impl DiskMapApp {
                     self.pending_repaint = true;
                     return;
                 }
-                if let Some(path) = self.scan_root_rescan_path() {
-                    self.status = format!(
-                        "Watch rescan after {}",
-                        pluralize(change_count as u64, "change", "changes")
-                    );
+                if let Some((target_id, path)) = self.incremental_rescan_target(&change.paths) {
+                    self.start_incremental_scan(target_id, path, change_count);
+                } else if let Some(path) = self.scan_root_rescan_path() {
+                    self.status = "Watch fallback rescan after unresolved change".to_string();
                     self.start_scan_path(path);
                 }
             }
@@ -1647,6 +1661,111 @@ impl DiskMapApp {
         }
     }
 
+    fn handle_incremental_scan_results(&mut self) {
+        while let Ok(result) = self.incremental_rx.try_recv() {
+            self.incremental_scan_active = false;
+            match result.result {
+                Ok(source_tree) => {
+                    let Some(new_ids) = self
+                        .tree
+                        .replace_children_from(result.target_id, &source_tree)
+                    else {
+                        self.status = format!(
+                            "Incremental rescan skipped: target changed {}",
+                            result.path.display()
+                        );
+                        self.pending_repaint = true;
+                        continue;
+                    };
+                    let mut dirty_nodes = new_ids;
+                    dirty_nodes.push(result.target_id);
+                    dirty_nodes.extend(self.tree.ancestors(result.target_id));
+                    dirty_nodes.sort_unstable();
+                    dirty_nodes.dedup();
+                    self.tree.repair_sorted_children(&dirty_nodes);
+                    self.navigation.prune_invalid(&self.tree);
+                    self.navigation.rebuild_breadcrumb_cache(&self.tree);
+                    self.refresh_search_matches();
+                    self.layout_dirty = true;
+                    self.status = format!("Updated {}", result.path.display());
+                    self.pending_repaint = true;
+                }
+                Err(error) => {
+                    self.status = format!(
+                        "Incremental rescan failed for {}: {error}",
+                        result.path.display()
+                    );
+                    self.pending_repaint = true;
+                }
+            }
+        }
+    }
+
+    fn start_incremental_scan(&mut self, target_id: NodeId, path: PathBuf, change_count: usize) {
+        self.incremental_scan_active = true;
+        self.status = format!(
+            "Updating {} after {}",
+            path.display(),
+            pluralize(change_count as u64, "change", "changes")
+        );
+        let options = self.scan_options();
+        let tx = self.incremental_tx.clone();
+        std::thread::spawn(move || {
+            let result = scan_path_to_tree(path.clone(), options);
+            let _ = tx.send(IncrementalScanResult {
+                target_id,
+                path,
+                result,
+            });
+        });
+        self.pending_repaint = true;
+    }
+
+    fn incremental_rescan_target(
+        &mut self,
+        changed_paths: &[PathBuf],
+    ) -> Option<(NodeId, PathBuf)> {
+        let mut best: Option<(NodeId, PathBuf, usize)> = None;
+        for changed_path in changed_paths {
+            let Some((node_id, node_path)) = self.closest_known_directory(changed_path) else {
+                continue;
+            };
+            let depth = node_path.components().count();
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, best_depth)| depth > *best_depth)
+            {
+                best = Some((node_id, node_path, depth));
+            }
+        }
+        best.map(|(node_id, path, _)| (node_id, path))
+    }
+
+    fn closest_known_directory(&mut self, changed_path: &Path) -> Option<(NodeId, PathBuf)> {
+        let root = self.tree.root?;
+        let mut best: Option<(NodeId, PathBuf, usize)> = None;
+        for node_id in 0..self.tree.len() {
+            if !matches!(self.tree.node(node_id).kind, NodeKind::Dir) {
+                continue;
+            }
+            if !self.tree.is_descendant_or_same(node_id, root) {
+                continue;
+            }
+            let path = self.tree.node_real_path(node_id)?;
+            if !changed_path.starts_with(&path) {
+                continue;
+            }
+            let depth = path.components().count();
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, best_depth)| depth > *best_depth)
+            {
+                best = Some((node_id, path, depth));
+            }
+        }
+        best.map(|(node_id, path, _)| (node_id, path))
+    }
+
     fn start_scan(&mut self) {
         let path = std::path::PathBuf::from(self.path_input.trim());
         self.start_scan_path(path);
@@ -1654,6 +1773,7 @@ impl DiskMapApp {
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
         self.stop_watching();
+        self.incremental_scan_active = false;
         self.scan
             .start(path.clone(), self.scan_options(), self.tx.clone());
 
@@ -2692,6 +2812,27 @@ mod tests {
 
         assert!(!app.can_rescan_scan_root());
         assert!(!app.can_rescan_focused_subtree());
+    }
+
+    #[test]
+    fn incremental_rescan_target_uses_deepest_known_directory() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+
+        let target =
+            app.incremental_rescan_target(&[PathBuf::from("/root/match-dir/nested/file.txt")]);
+
+        assert_eq!(target, Some((1, PathBuf::from("/root/match-dir"))));
+    }
+
+    #[test]
+    fn incremental_rescan_target_falls_back_to_scan_root_for_unknown_child() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+
+        let target = app.incremental_rescan_target(&[PathBuf::from("/root/new-dir/file.txt")]);
+
+        assert_eq!(target, Some((0, PathBuf::from("/root"))));
     }
 
     #[test]

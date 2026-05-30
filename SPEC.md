@@ -208,8 +208,9 @@ struct TreeStore {
 - [x] Add notify crate (FSEvents/kqueue)
 - [x] Debounce 300-1000ms
 - [x] Add default-off Watch control for debounced scan-root rescans after filesystem changes
-- Watch is disabled by default and only observes the current scan root when enabled. Current implementation performs a safe full rescan after debounced events; true changed-directory subtree replacement remains separate work.
-- [ ] Incremental rescan of changed directories
+- Watch is disabled by default and only observes the current scan root when enabled.
+- [x] Incremental rescan of changed directories
+- Debounced events are mapped to the deepest known directory containing the changed path. The app rescans that directory off the UI thread and replaces its in-memory subtree; unresolved changes fall back to the scan root.
 
 ### Phase 6: Treemap Upgrade
 - [x] Preserve Squarified Treemap interface
