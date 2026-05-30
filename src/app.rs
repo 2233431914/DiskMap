@@ -1,3 +1,4 @@
+use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
 use crate::platform::{open_path, reveal_in_finder};
 use crate::scanner::{
@@ -21,6 +22,7 @@ use eframe::egui;
 use egui::{
     Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme, Vec2,
 };
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
@@ -778,6 +780,60 @@ impl DiskMapApp {
             if let Some(path) = &node_path {
                 ui.ctx().copy_text(path.display().to_string());
             }
+        }
+        ui.add_space(4.0);
+        let focused_export_id = self.navigation.focused_root();
+        let scan_root_export_id = self.tree.root;
+        let scan_root_is_focused =
+            focused_export_id.is_some() && focused_export_id == scan_root_export_id;
+        ui.columns(2, |cols| {
+            let can_export = focused_export_id.is_some();
+            let w0 = cols[0].available_width();
+            if cols[0]
+                .add_enabled(
+                    can_export,
+                    egui::Button::new("Export View CSV").min_size(Vec2::new(w0, 28.0)),
+                )
+                .clicked()
+            {
+                self.export_focused_subtree(ExportFormat::Csv);
+            }
+            let w1 = cols[1].available_width();
+            if cols[1]
+                .add_enabled(
+                    can_export,
+                    egui::Button::new("Export View JSON").min_size(Vec2::new(w1, 28.0)),
+                )
+                .clicked()
+            {
+                self.export_focused_subtree(ExportFormat::Json);
+            }
+        });
+        if !scan_root_is_focused {
+            ui.add_space(4.0);
+            ui.columns(2, |cols| {
+                let can_export = scan_root_export_id.is_some();
+                let w0 = cols[0].available_width();
+                if cols[0]
+                    .add_enabled(
+                        can_export,
+                        egui::Button::new("Export Root CSV").min_size(Vec2::new(w0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    self.export_scan_root(ExportFormat::Csv);
+                }
+                let w1 = cols[1].available_width();
+                if cols[1]
+                    .add_enabled(
+                        can_export,
+                        egui::Button::new("Export Root JSON").min_size(Vec2::new(w1, 28.0)),
+                    )
+                    .clicked()
+                {
+                    self.export_scan_root(ExportFormat::Json);
+                }
+            });
         }
 
         if let Some(parent) = node_parent {
@@ -1580,6 +1636,57 @@ impl DiskMapApp {
             .and_then(|root_id| self.tree.node_real_path(root_id))
     }
 
+    fn export_focused_subtree(&mut self, format: ExportFormat) {
+        let Some(root_id) = self.navigation.focused_root() else {
+            self.status = "Export unavailable: no focused directory".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        match self.write_focused_export(root_id, format) {
+            Ok(path) => {
+                self.status = format!("Exported {} to {}", format.label(), path.display());
+            }
+            Err(error) => {
+                self.status = format!("Export failed: {error}");
+            }
+        }
+        self.pending_repaint = true;
+    }
+
+    fn export_scan_root(&mut self, format: ExportFormat) {
+        let Some(root_id) = self.tree.root else {
+            self.status = "Export unavailable: no scan root".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        match self.write_focused_export(root_id, format) {
+            Ok(path) => {
+                self.status = format!("Exported {} to {}", format.label(), path.display());
+            }
+            Err(error) => {
+                self.status = format!("Export failed: {error}");
+            }
+        }
+        self.pending_repaint = true;
+    }
+
+    fn write_focused_export(
+        &mut self,
+        root_id: NodeId,
+        format: ExportFormat,
+    ) -> anyhow::Result<PathBuf> {
+        if root_id >= self.tree.len() {
+            anyhow::bail!("focused directory is no longer available");
+        }
+
+        let content = export_subtree(&mut self.tree, root_id, format);
+        let output_path = default_export_path(format);
+        std::fs::write(&output_path, content)?;
+        Ok(output_path)
+    }
+
     fn cancel_scan(&mut self) {
         if self.scan.cancel() {
             self.status = "Cancelling scan...".to_string();
@@ -2077,6 +2184,17 @@ fn pluralize(count: u64, singular: &str, plural: &str) -> String {
     } else {
         format!("{count} {plural}")
     }
+}
+
+fn default_export_path(format: ExportFormat) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!(
+        "disk-map-export-{timestamp}.{}",
+        format.extension()
+    ))
 }
 
 fn format_perf_stats(stats: &PerfStats) -> String {

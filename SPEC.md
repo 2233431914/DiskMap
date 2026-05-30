@@ -90,6 +90,7 @@ disk-map/
     ├── scanner.rs
     ├── tree.rs
     ├── treemap.rs
+    ├── export.rs
     ├── platform.rs
     └── format.rs
 ```
@@ -196,7 +197,8 @@ struct TreeStore {
 - Manual rescan reuses the active scan options and starts a new scan for either the original scan root or the currently focused directory.
 
 ### Phase 4: Reporting and Size Model
-- [ ] Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
+- [x] Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
+- Export actions write timestamped `disk-map-export-*` files to the current working directory and report the saved path in status.
 - [ ] Clearly display the active size basis, such as apparent size or allocated size on disk
 - [ ] Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
 

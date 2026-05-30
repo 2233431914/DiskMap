@@ -1,5 +1,6 @@
 pub mod app;
 pub mod db;
+pub mod export;
 pub mod format;
 pub mod platform;
 pub mod scanner;
