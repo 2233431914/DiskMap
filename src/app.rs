@@ -2,7 +2,8 @@ use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
 use crate::platform::{open_path, reveal_in_finder};
 use crate::scanner::{
-    parse_exclude_patterns, PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
+    parse_exclude_patterns, size_basis_detail, size_basis_label, PerfStats, ProgressSnapshot,
+    ScanBatch, ScanMessage, ScanOptions,
 };
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{
@@ -679,6 +680,12 @@ impl DiskMapApp {
                         );
                     }
                 });
+                ui.label(
+                    RichText::new(size_basis_label())
+                        .small()
+                        .color(p.text_faint),
+                )
+                .on_hover_text(size_basis_detail());
                 ui.add_space(4.0);
                 let meta = if child_count > 0 {
                     format!("{kind_label} · {} items", child_count)
@@ -888,6 +895,12 @@ impl DiskMapApp {
                 .monospace()
                 .color(p.text),
         );
+        ui.label(
+            RichText::new(size_basis_label())
+                .small()
+                .color(p.text_faint),
+        )
+        .on_hover_text(size_basis_detail());
         let current_path = truncate_middle(&progress.current_path.display().to_string(), 42);
         ui.add(
             egui::Label::new(

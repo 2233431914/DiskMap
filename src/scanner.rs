@@ -61,6 +61,30 @@ pub fn parse_exclude_patterns(input: &str) -> Vec<String> {
     patterns
 }
 
+pub fn size_basis_label() -> &'static str {
+    #[cfg(unix)]
+    {
+        "Allocated size"
+    }
+
+    #[cfg(not(unix))]
+    {
+        "Apparent size"
+    }
+}
+
+pub fn size_basis_detail() -> &'static str {
+    #[cfg(unix)]
+    {
+        "Uses filesystem allocated blocks when available, with apparent byte length as fallback."
+    }
+
+    #[cfg(not(unix))]
+    {
+        "Uses apparent byte length reported by file metadata."
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PerfStats {
     pub messages_sent: u64,
@@ -1162,6 +1186,17 @@ mod tests {
         assert!(options.include_hidden);
         assert!(!options.follow_symlinks);
         assert!(!options.stay_on_filesystem);
+    }
+
+    #[test]
+    fn size_basis_label_describes_current_measurement_mode() {
+        #[cfg(unix)]
+        assert_eq!(size_basis_label(), "Allocated size");
+
+        #[cfg(not(unix))]
+        assert_eq!(size_basis_label(), "Apparent size");
+
+        assert!(!size_basis_detail().is_empty());
     }
 
     #[test]

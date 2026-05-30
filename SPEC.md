@@ -199,7 +199,8 @@ struct TreeStore {
 ### Phase 4: Reporting and Size Model
 - [x] Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
 - Export actions write timestamped `disk-map-export-*` files to the current working directory and report the saved path in status.
-- [ ] Clearly display the active size basis, such as apparent size or allocated size on disk
+- [x] Clearly display the active size basis, such as apparent size or allocated size on disk
+- Current size basis is shown in details/progress UI. On Unix it is allocated size from filesystem blocks when available, with apparent byte length fallback; on other platforms it is apparent byte length from metadata.
 - [ ] Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
 
 ### Phase 5: Real-time Monitoring
