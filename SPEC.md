@@ -18,7 +18,7 @@
 - **Preference persistence:** eframe native storage/window persistence
 - **Experimental cache:** rusqlite (implemented, disabled by default)
 
-## 3. Features (MVP Scope)
+## 3. Features (Current Implemented Scope)
 
 ### 3.1 Core Features
 - [x] Input/select scan directory path
@@ -32,15 +32,21 @@
 - [x] Search result navigation with Previous/Next and Enter/Shift+Enter
 - [x] Search filter mode showing only matches and ancestor folders
 - [x] Small-file aggregation as virtual "Other Files" nodes
+- [x] Manual rescan for scan root and focused subtree
+- [x] Default-off filesystem watch with debounced incremental subtree rescan
+- [x] CSV/JSON export for scan root or focused subtree
+- [x] Active size basis display
+- [x] Optional SQLite scan cache setting, disabled by default
+- [x] Extension-based color mode
+- [x] Runtime-gated Move to Trash with two-step confirmation
 
-### 3.2 Excluded from MVP
+### 3.2 Explicitly Out of Current Default Path
 - SQLite storage enabled by default
-- Duplicate file detection
-- FSEvents real-time monitoring
+- Duplicate file detection as a cleanup signal
+- FSEvents real-time monitoring enabled by default
 - Animations
-- File deletion / Move to Trash
-- Export/reporting workflows
-- Advanced scan safety toggles and manual rescan shortcuts
+- Immediate one-click file deletion or always-visible Move to Trash
+- Cleanup automation that mutates scan/search state
 
 ### 3.3 Sidebar Features
 - [x] Current directory path display
@@ -151,8 +157,9 @@ struct TreeStore {
 - Copy full path string through egui clipboard integration
 
 ### 7.3 Destructive Actions
-- Move to Trash is not exposed in the default MVP UI.
-- Experimental trash support must report errors and must not silently trigger a rescan.
+- Move to Trash is disabled by default and hidden until the user enables `Allow Trash`.
+- Trash requires a second confirmation click for the selected real filesystem path.
+- Trash uses the platform trash adapter, reports errors, and must not silently trigger a rescan.
 
 ## 8. UI Layout
 
@@ -175,7 +182,7 @@ struct TreeStore {
 - UI responsive during scan (60fps capable)
 - Memory efficient (no duplicate tree structures)
 
-## 10. Future Phases
+## 10. Roadmap
 
 ### Phase 2: Stabilization and Usability
 - [x] Keep destructive actions disabled by default
@@ -225,7 +232,8 @@ struct TreeStore {
 - Filter mode is an optional search display mode. It does not change search scope; it only removes non-matching branches from treemap layout while preserving the current focused subtree.
 - [x] Extension-based coloring
 - The optional `Ext` color mode keeps directory colors unchanged and assigns files stable colors based on lowercase extension.
-- [ ] Move to Trash functionality with confirmation and reliable platform adapter
+- [x] Move to Trash functionality with confirmation and reliable platform adapter
+- Trash remains runtime-gated by `Allow Trash`, is not persisted as enabled, and is unavailable for virtual aggregate nodes.
 
 ### Phase 8: Analysis Workflows
 - [ ] Recent scan roots and pinned favorites for repeat analysis
@@ -245,3 +253,42 @@ struct TreeStore {
 - [ ] Accessible labels and focus order for toolbar, treemap selection, and context menu actions
 - [ ] Performance regression benchmarks for large trees, search rebuilds, and layout generation
 - [ ] macOS packaging, signing/notarization, and release checklist
+
+### Phase 11: Practical Analysis Additions
+- [ ] Size anomaly hints: highlight unexpectedly large caches, build artifacts, and log folders using configurable read-only rules
+- [ ] Type/category breakdown: summarize file categories such as media, archives, code, documents, dependencies, caches, and system artifacts
+- [ ] Age cleanup view: show old large files and stale directories by modified time without selecting them for destructive action automatically
+- [ ] Scan session notes: let users attach short local notes to saved roots, snapshots, or reports
+- [ ] Ignore suggestions: propose exclude patterns for repeated noisy folders, but require user confirmation before adding rules
+- [ ] Open containing terminal for real paths where the platform supports it
+
+### Phase 12: Comparison and History
+- [ ] Persist lightweight scan metadata history for recent roots, including timestamp, size basis, option summary, and root path
+- [ ] Snapshot diff view with added, removed, grown, and shrunk paths grouped by impact
+- [ ] Trend chart for recent scans of the same root
+- [ ] Export comparison reports as CSV/JSON with enough metadata to reproduce the comparison
+- [ ] Optional baseline pinning so one snapshot can be reused as the comparison target
+
+### Phase 13: Cleanup Assistant
+- [ ] Read-only candidate rules for common cleanup targets, such as dependency folders, build outputs, old archives, large logs, and duplicate-name clusters
+- [ ] Review queue with include/exclude decisions, total selected size, item count, and affected roots
+- [ ] Protected path policy that blocks system locations, mounted volumes, home root, and user-configured deny lists
+- [ ] Confirmation dialog that requires visible path, selected byte size, affected item count, and operation type before platform trash
+- [ ] Cleanup audit log recording requested action, result, failures, timestamp, and target paths
+- [ ] Dry-run export for cleanup plans before any platform action is enabled
+
+### Phase 14: Power User Workflow
+- [ ] Command palette for navigation, scan, export, filter, and view-mode actions
+- [ ] Saved filter presets for extension, category, size threshold, modified age, hidden files, symlink policy, and exclude patterns
+- [ ] Multi-root comparison workspace for comparing several scan roots side by side
+- [ ] Bookmark selected nodes inside a scan for later review
+- [ ] Deep-link style local references to reopen a saved root, snapshot, focused node, and view mode
+- [ ] Configurable color palettes for directory depth, extension mode, and category mode
+
+### Phase 15: Reliability and Distribution
+- [ ] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs
+- [ ] Large-tree benchmark suite with fixed fixtures and regression thresholds
+- [ ] UI smoke tests for scan, navigation, search, export, watch, cache, and trash confirmation flows
+- [ ] macOS app bundle release profile with signing and notarization documentation
+- [ ] Import/export settings bundle for migrating preferences between machines
+- [ ] Privacy statement documenting that scans, histories, caches, and reports are local-only unless the user exports files manually
