@@ -19,6 +19,7 @@ pub struct Node {
     pub name: String,
     pub kind: NodeKind,
     pub size: u64,
+    pub modified_secs: Option<u64>,
     pub children: Vec<NodeId>,
     pub scanned: bool,
     pub error: Option<String>,
@@ -31,6 +32,7 @@ pub struct NodeRecord {
     pub name: String,
     pub kind: NodeKind,
     pub size: u64,
+    pub modified_secs: Option<u64>,
     pub scanned: bool,
     pub error: Option<String>,
 }
@@ -84,10 +86,22 @@ impl TreeStore {
         kind: NodeKind,
         size: u64,
     ) -> NodeId {
+        self.add_node_with_modified(parent, name, kind, size, None)
+    }
+
+    pub fn add_node_with_modified(
+        &mut self,
+        parent: Option<NodeId>,
+        name: String,
+        kind: NodeKind,
+        size: u64,
+        modified_secs: Option<u64>,
+    ) -> NodeId {
         let record = NodeRecord {
             name,
             kind,
             size,
+            modified_secs,
             scanned: false,
             error: None,
         };
@@ -113,6 +127,7 @@ impl TreeStore {
             lower_name: String::new(),
             kind: record.kind,
             size: record.size,
+            modified_secs: record.modified_secs,
             children: Vec::new(),
             scanned: record.scanned,
             error: record.error,
@@ -252,6 +267,7 @@ impl TreeStore {
             name: source_node.name.clone(),
             kind: source_node.kind,
             size: source_node.size,
+            modified_secs: source_node.modified_secs,
             scanned: source_node.scanned,
             error: source_node.error.clone(),
         };
@@ -336,6 +352,7 @@ impl TreeStore {
             name,
             kind: NodeKind::Dir,
             size: 0,
+            modified_secs: None,
             scanned: false,
             error: None,
         }
@@ -414,5 +431,36 @@ mod tests {
         replacement.add_node(None, "file.txt".into(), NodeKind::Dir, 0);
 
         assert!(tree.replace_children_from(file, &replacement).is_none());
+    }
+
+    #[test]
+    fn node_records_preserve_modified_time_through_insert_and_replacement() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        let file = tree.add_node_with_modified(
+            Some(root),
+            "file.txt".into(),
+            NodeKind::File,
+            4,
+            Some(123),
+        );
+
+        assert_eq!(tree.node(file).modified_secs, Some(123));
+
+        let mut replacement = TreeStore::new();
+        let replacement_root = replacement.add_node(None, "root".into(), NodeKind::Dir, 0);
+        replacement.add_node_with_modified(
+            Some(replacement_root),
+            "new.txt".into(),
+            NodeKind::File,
+            5,
+            Some(456),
+        );
+
+        let appended = tree
+            .replace_children_from(root, &replacement)
+            .expect("replacement");
+
+        assert_eq!(tree.node(appended[0]).modified_secs, Some(456));
     }
 }

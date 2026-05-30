@@ -35,6 +35,7 @@
 - [x] Manual rescan for scan root and focused subtree
 - [x] Default-off filesystem watch with debounced incremental subtree rescan
 - [x] CSV/JSON export for scan root or focused subtree
+- [x] Manual read-only file age/type insight report for the focused subtree
 - [x] Active size basis display
 - [x] Optional SQLite scan cache setting, disabled by default
 - [x] Extension-based color mode
@@ -99,6 +100,7 @@ disk-map/
     ├── tree.rs
     ├── treemap.rs
     ├── export.rs
+    ├── insights.rs
     ├── platform.rs
     └── format.rs
 ```
@@ -119,6 +121,7 @@ struct Node {
     name: String,
     kind: NodeKind,
     size: u64,
+    modified_secs: Option<u64>,
     children: Vec<NodeId>,
     scanned: bool,
     error: Option<String>,
@@ -245,7 +248,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - Snapshot diff is read-only and compares the latest completed scan with the previous in-memory snapshot for the same root. It reports total delta plus top added, grown, shrunk, and removed paths by byte impact.
 - [x] Optional duplicate-file candidate analysis as a read-only report before any cleanup workflow
 - Duplicate analysis is manual and read-only. The current heuristic groups files by same normalized file name and same measured size inside the focused subtree; it does not hash file contents and does not enable cleanup actions.
-- [ ] File age and file type insights, including modified-time filters and category summaries
+- [x] File age and file type insights, including modified-time filters and category summaries
+- Insight analysis is manual and read-only for the current focused subtree. File modified times are captured when available; category summaries are extension-based, and age buckets are best-effort with unknown mtime reported separately.
 - [ ] Export/share a focused report with enough metadata to reproduce the visible result
 
 ### Phase 9: Cleanup Workflow Safety

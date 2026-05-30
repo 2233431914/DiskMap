@@ -3,6 +3,7 @@ pub mod db;
 pub mod duplicates;
 pub mod export;
 pub mod format;
+pub mod insights;
 pub mod platform;
 pub mod scanner;
 pub mod snapshot;

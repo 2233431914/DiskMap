@@ -39,6 +39,7 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                         name: format!("node-{index}"),
                         kind: NodeKind::File,
                         size: 1,
+                        modified_secs: None,
                         scanned: true,
                         error: None,
                     },

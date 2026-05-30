@@ -186,6 +186,7 @@ struct EntryClientState {
 struct PrefetchedFileInfo {
     metadata: Metadata,
     cached_mtime: Option<u64>,
+    modified_secs: Option<u64>,
     measured_size: u64,
 }
 
@@ -636,21 +637,12 @@ fn run_scan(
                     Ordering::Relaxed,
                 );
 
-                let cached_mtime = if cache_enabled {
-                    let mtime_start = Instant::now();
-                    let mtime = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    walker_prefetch_perf
-                        .mtime_ns
-                        .fetch_add(mtime_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    Some(mtime)
-                } else {
-                    None
-                };
+                let mtime_start = Instant::now();
+                let modified_secs = modified_secs_for_metadata(&metadata);
+                walker_prefetch_perf
+                    .mtime_ns
+                    .fetch_add(mtime_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let cached_mtime = cached_mtime_for_modified_secs(modified_secs, cache_enabled);
 
                 let size_start = Instant::now();
                 let measured_size = size_on_disk_bytes(&metadata);
@@ -661,6 +653,7 @@ fn run_scan(
                 dir_entry.client_state.prefetched_file = Some(Ok(PrefetchedFileInfo {
                     metadata,
                     cached_mtime,
+                    modified_secs,
                     measured_size,
                 }));
             }
@@ -704,6 +697,7 @@ fn run_scan(
 
         let file_type = entry.file_type();
         let mut node_error = None;
+        let mut modified_secs = None;
         let kind = if entry.path_is_symlink() || file_type.is_symlink() {
             NodeKind::Symlink
         } else if file_type.is_dir() {
@@ -718,6 +712,7 @@ fn run_scan(
             match entry.client_state.prefetched_file {
                 Some(Ok(prefetched)) => {
                     perf_stats.prefetched_files += 1;
+                    modified_secs = prefetched.modified_secs;
                     let size_start = Instant::now();
                     let size = measured_size_for_file(
                         &entry_path,
@@ -748,6 +743,7 @@ fn run_scan(
                                 name,
                                 kind: NodeKind::Error,
                                 size: 0,
+                                modified_secs: None,
                                 scanned: true,
                                 error: node_error.clone(),
                             };
@@ -774,8 +770,10 @@ fn run_scan(
                         }
                     };
                     perf_stats.metadata_total_ms += metadata_start.elapsed().as_secs_f64() * 1000.0;
-                    let cached_mtime =
-                        cached_mtime_for_metadata(&metadata, db.is_some(), &mut perf_stats);
+                    let mtime_start = Instant::now();
+                    modified_secs = modified_secs_for_metadata(&metadata);
+                    perf_stats.mtime_total_ms += mtime_start.elapsed().as_secs_f64() * 1000.0;
+                    let cached_mtime = cached_mtime_for_modified_secs(modified_secs, db.is_some());
                     let measured_size = size_on_disk_bytes(&metadata);
                     let size_start = Instant::now();
                     let size = measured_size_for_file(
@@ -804,6 +802,7 @@ fn run_scan(
                     kind
                 },
                 size,
+                modified_secs: None,
                 scanned: false,
                 error: node_error,
             };
@@ -849,6 +848,7 @@ fn run_scan(
                         kind
                     },
                     size,
+                    modified_secs,
                     scanned: true,
                     error: node_error,
                 };
@@ -870,6 +870,7 @@ fn run_scan(
                     kind
                 },
                 size,
+                modified_secs,
                 scanned: true,
                 error: node_error,
             };
@@ -1062,6 +1063,7 @@ fn emit_aggregate_nodes(
             name: format!("{AGGREGATE_LABEL} ({})", bucket.file_count),
             kind: NodeKind::Aggregate,
             size: bucket.total_size,
+            modified_secs: None,
             scanned: true,
             error: None,
         };
@@ -1100,24 +1102,16 @@ fn measured_size_for_file(
     measured_size
 }
 
-fn cached_mtime_for_metadata(
-    metadata: &Metadata,
-    cache_enabled: bool,
-    perf_stats: &mut PerfStats,
-) -> Option<u64> {
-    if !cache_enabled {
-        return None;
-    }
-
-    let mtime_start = Instant::now();
-    let mtime = metadata
+fn modified_secs_for_metadata(metadata: &Metadata) -> Option<u64> {
+    metadata
         .modified()
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    perf_stats.mtime_total_ms += mtime_start.elapsed().as_secs_f64() * 1000.0;
-    Some(mtime)
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+}
+
+fn cached_mtime_for_modified_secs(modified_secs: Option<u64>, cache_enabled: bool) -> Option<u64> {
+    cache_enabled.then_some(modified_secs.unwrap_or(0))
 }
 
 fn size_on_disk_bytes(metadata: &Metadata) -> u64 {
@@ -1167,6 +1161,7 @@ mod tests {
                             name: "child".into(),
                             kind: NodeKind::File,
                             size: 42,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -1261,6 +1256,28 @@ mod tests {
             dir.file_name().unwrap().to_string_lossy()
         );
         assert!(!tree.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_path_to_tree_records_file_modified_time_when_available() {
+        let dir = temp_path("sync-mtime");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(
+            dir.join("large.bin"),
+            vec![1_u8; (AGGREGATE_SMALL_FILE_THRESHOLD_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
+        let file = tree
+            .nodes
+            .iter()
+            .find(|node| node.name == "large.bin")
+            .expect("large file node");
+
+        assert!(file.modified_secs.is_some());
 
         let _ = std::fs::remove_dir_all(dir);
     }

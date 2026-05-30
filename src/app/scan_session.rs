@@ -271,6 +271,7 @@ mod tests {
             name: "private".into(),
             kind: NodeKind::Error,
             size: 0,
+            modified_secs: None,
             scanned: true,
             error: Some("Permission denied (os error 13)".into()),
         });
@@ -278,6 +279,7 @@ mod tests {
             name: "linked".into(),
             kind: NodeKind::Symlink,
             size: 0,
+            modified_secs: None,
             scanned: true,
             error: None,
         });

@@ -1,6 +1,10 @@
 use crate::duplicates::{find_duplicate_candidates, DuplicateCandidate, DuplicateReport};
 use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
+use crate::insights::{
+    analyze_insights, AgeBucketSummary, FileTypeSummary, InsightReport, OldLargeFile,
+    INSIGHT_REPORT_LIMIT,
+};
 use crate::platform::{move_to_trash, open_path, reveal_in_finder};
 use crate::scanner::{
     parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, CacheMode,
@@ -269,6 +273,7 @@ pub struct DiskMapApp {
     last_snapshot: Option<ScanSnapshot>,
     snapshot_diff: Option<SnapshotDiff>,
     duplicate_report: Option<DuplicateReport>,
+    insight_report: Option<InsightReport>,
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
@@ -316,6 +321,7 @@ impl Default for DiskMapApp {
             last_snapshot: None,
             snapshot_diff: None,
             duplicate_report: None,
+            insight_report: None,
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -1074,6 +1080,18 @@ impl DiskMapApp {
         {
             self.analyze_duplicate_candidates();
         }
+        ui.add_space(4.0);
+        let insight_width = ui.available_width();
+        if ui
+            .add_enabled(
+                focused_export_id.is_some() && !self.scan.is_scanning(),
+                egui::Button::new("Analyze Insights").min_size(Vec2::new(insight_width, 28.0)),
+            )
+            .on_hover_text("Read-only age buckets and extension category summary for this view")
+            .clicked()
+        {
+            self.analyze_file_insights();
+        }
 
         if let Some(parent) = node_parent {
             ui.add_space(10.0);
@@ -1101,6 +1119,7 @@ impl DiskMapApp {
         self.show_scan_issue_section(ui, p);
         self.show_snapshot_diff_section(ui, p);
         self.show_duplicate_report_section(ui, p);
+        self.show_insight_report_section(ui, p);
         self.show_search_section(ui, p);
     }
 
@@ -1309,6 +1328,45 @@ impl DiskMapApp {
         for candidate in &report.candidates {
             duplicate_candidate_row(ui, p, candidate);
         }
+    }
+
+    fn show_insight_report_section(&self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(report) = &self.insight_report else {
+            return;
+        };
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("INSIGHTS")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "{} files · {} known mtimes · {}",
+                report.file_count,
+                report.known_mtime_count,
+                format_bytes(report.total_size)
+            ))
+            .small()
+            .color(p.text_muted),
+        )
+        .on_hover_text(report.root_path.display().to_string());
+
+        if report.file_count == 0 {
+            ui.label(
+                RichText::new("No files in this view.")
+                    .small()
+                    .color(p.text_muted),
+            );
+            return;
+        }
+
+        insight_type_group(ui, p, &report.type_summaries);
+        insight_age_group(ui, p, &report.age_buckets);
+        insight_old_files_group(ui, p, &report.old_large_files);
     }
 
     fn show_status_bar(&self, ui: &mut egui::Ui) {
@@ -2171,6 +2229,7 @@ impl DiskMapApp {
         self.hovered_visual_kind = None;
         self.snapshot_diff = None;
         self.duplicate_report = None;
+        self.insight_report = None;
         self.search.clear(0);
         self.cached_visuals.clear();
         self.reset_camera();
@@ -2322,6 +2381,35 @@ impl DiskMapApp {
             None => {
                 self.duplicate_report = None;
                 self.status = "Duplicate analysis unavailable for this view".to_string();
+            }
+        }
+        self.pending_repaint = true;
+    }
+
+    fn analyze_file_insights(&mut self) {
+        let Some(root_id) = self.navigation.focused_root() else {
+            self.insight_report = None;
+            self.status = "Insights unavailable: no focused directory".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        match analyze_insights(
+            &mut self.tree,
+            root_id,
+            current_unix_secs(),
+            INSIGHT_REPORT_LIMIT,
+        ) {
+            Some(report) => {
+                self.status = format!(
+                    "Insights analyzed {}",
+                    pluralize(report.file_count as u64, "file", "files")
+                );
+                self.insight_report = Some(report);
+            }
+            None => {
+                self.insight_report = None;
+                self.status = "Insights unavailable for this view".to_string();
             }
         }
         self.pending_repaint = true;
@@ -2993,6 +3081,129 @@ fn duplicate_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &Dup
     }
 }
 
+fn insight_type_group(ui: &mut egui::Ui, palette: &Palette, summaries: &[FileTypeSummary]) {
+    if summaries.is_empty() {
+        return;
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("By type")
+            .small()
+            .strong()
+            .color(palette.text_muted),
+    );
+    for summary in summaries.iter().take(INSIGHT_REPORT_LIMIT) {
+        let ext = if summary.extension == "(none)" {
+            "no ext".to_string()
+        } else {
+            format!(".{}", summary.extension)
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format_bytes(summary.total_size))
+                    .small()
+                    .monospace()
+                    .color(palette.accent),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} {ext} · {}",
+                    summary.category,
+                    pluralize(summary.file_count as u64, "file", "files")
+                ))
+                .small()
+                .color(palette.text_faint),
+            );
+        });
+    }
+}
+
+fn insight_age_group(ui: &mut egui::Ui, palette: &Palette, summaries: &[AgeBucketSummary]) {
+    if summaries.iter().all(|summary| summary.file_count == 0) {
+        return;
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("By modified age")
+            .small()
+            .strong()
+            .color(palette.text_muted),
+    );
+    for summary in summaries {
+        if summary.file_count == 0 {
+            continue;
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format_bytes(summary.total_size))
+                    .small()
+                    .monospace()
+                    .color(if summary.bucket.label() == "unknown" {
+                        palette.text_faint
+                    } else {
+                        palette.accent
+                    }),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} · {}",
+                    summary.bucket.label(),
+                    pluralize(summary.file_count as u64, "file", "files")
+                ))
+                .small()
+                .color(palette.text_faint),
+            );
+        });
+    }
+}
+
+fn insight_old_files_group(ui: &mut egui::Ui, palette: &Palette, files: &[OldLargeFile]) {
+    if files.is_empty() {
+        return;
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("Old large files")
+            .small()
+            .strong()
+            .color(palette.text_muted),
+    );
+    for file in files.iter().take(INSIGHT_REPORT_LIMIT) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format_bytes(file.size))
+                    .small()
+                    .monospace()
+                    .color(palette.accent),
+            );
+            ui.label(
+                RichText::new(format!("{}d · {}", file.age_days, file.category))
+                    .small()
+                    .color(palette.text_muted),
+            );
+        });
+        ui.add(
+            egui::Label::new(
+                RichText::new(truncate_middle(&file.path, 38))
+                    .small()
+                    .color(palette.text_faint),
+            )
+            .truncate(),
+        )
+        .on_hover_text(&file.path);
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn dirs_home_fallback() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
@@ -3139,6 +3350,7 @@ mod tests {
                             name: "match-dir".into(),
                             kind: NodeKind::Dir,
                             size: 10,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3150,6 +3362,7 @@ mod tests {
                             name: "match-file".into(),
                             kind: NodeKind::File,
                             size: 1,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3161,6 +3374,7 @@ mod tests {
                             name: "match-root-file".into(),
                             kind: NodeKind::File,
                             size: 1,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3196,6 +3410,7 @@ mod tests {
                         name: "child".into(),
                         kind: NodeKind::File,
                         size: 5,
+                        modified_secs: None,
                         scanned: false,
                         error: None,
                     },
@@ -3233,6 +3448,7 @@ mod tests {
                         name: "old".into(),
                         kind: NodeKind::File,
                         size: 1,
+                        modified_secs: None,
                         scanned: true,
                         error: None,
                     },
@@ -3483,6 +3699,7 @@ mod tests {
                         name: "file.txt".into(),
                         kind: NodeKind::File,
                         size: 4,
+                        modified_secs: None,
                         scanned: true,
                         error: None,
                     },
@@ -3508,6 +3725,7 @@ mod tests {
                             name: "file.txt".into(),
                             kind: NodeKind::File,
                             size: 9,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3519,6 +3737,7 @@ mod tests {
                             name: "new.txt".into(),
                             kind: NodeKind::File,
                             size: 3,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3577,6 +3796,7 @@ mod tests {
                             name: "a".into(),
                             kind: NodeKind::Dir,
                             size: 0,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3588,6 +3808,7 @@ mod tests {
                             name: "b".into(),
                             kind: NodeKind::Dir,
                             size: 0,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3599,6 +3820,7 @@ mod tests {
                             name: "same.bin".into(),
                             kind: NodeKind::File,
                             size: 5,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3610,6 +3832,7 @@ mod tests {
                             name: "same.bin".into(),
                             kind: NodeKind::File,
                             size: 5,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3643,6 +3866,71 @@ mod tests {
             app.status,
             "Duplicate analysis unavailable: no focused directory"
         );
+    }
+
+    #[test]
+    fn insight_analysis_reports_age_and_type_without_scan_state_changes() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![
+                    DiscoveredNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "photo.jpg".into(),
+                            kind: NodeKind::File,
+                            size: 100,
+                            modified_secs: Some(current_unix_secs()),
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 2,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "archive.zip".into(),
+                            kind: NodeKind::File,
+                            size: 200,
+                            modified_secs: None,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                ],
+                size_deltas: vec![(0, 300)],
+                scanned_nodes: vec![1, 2],
+                progress: None,
+            },
+        });
+        let active_scan_id = app.scan.active_id();
+        let layout_dirty = app.layout_dirty;
+
+        app.analyze_file_insights();
+
+        let report = app.insight_report.as_ref().expect("insight report");
+        assert_eq!(report.file_count, 2);
+        assert_eq!(report.known_mtime_count, 1);
+        assert!(report
+            .type_summaries
+            .iter()
+            .any(|summary| summary.category == "Archives" && summary.extension == "zip"));
+        assert_eq!(app.scan.active_id(), active_scan_id);
+        assert_eq!(app.layout_dirty, layout_dirty);
+        assert_eq!(app.status, "Insights analyzed 2 files");
+    }
+
+    #[test]
+    fn insight_analysis_is_unavailable_without_focused_root() {
+        let mut app = DiskMapApp::default();
+
+        app.analyze_file_insights();
+
+        assert!(app.insight_report.is_none());
+        assert_eq!(app.status, "Insights unavailable: no focused directory");
     }
 
     #[test]
@@ -3870,6 +4158,7 @@ mod tests {
                             name: "private".into(),
                             kind: NodeKind::Error,
                             size: 0,
+                            modified_secs: None,
                             scanned: true,
                             error: Some("Operation not permitted".into()),
                         },
@@ -3881,6 +4170,7 @@ mod tests {
                             name: "linked".into(),
                             kind: NodeKind::Symlink,
                             size: 0,
+                            modified_secs: None,
                             scanned: true,
                             error: None,
                         },
@@ -3941,6 +4231,7 @@ mod tests {
                         name: "child-dir".into(),
                         kind: NodeKind::Dir,
                         size: 10,
+                        modified_secs: None,
                         scanned: true,
                         error: None,
                     },
@@ -4082,6 +4373,7 @@ mod tests {
                         name: "match-me".into(),
                         kind: NodeKind::File,
                         size: 1,
+                        modified_secs: None,
                         scanned: true,
                         error: None,
                     },
