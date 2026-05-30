@@ -633,10 +633,7 @@ impl DiskMapApp {
                 )
                 .changed()
             {
-                self.layout_dirty = true;
-                self.last_layout_refresh = Instant::now()
-                    .checked_sub(LAYOUT_REFRESH_INTERVAL)
-                    .unwrap_or_else(Instant::now);
+                self.mark_layout_dirty_now();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1439,11 +1436,7 @@ impl DiskMapApp {
         if !ctx.egui_wants_keyboard_input()
             && ctx.input(|input| input.key_pressed(egui::Key::Enter))
         {
-            if let Some(selected_id) = self.navigation.selected_id() {
-                if !self.tree.node(selected_id).children.is_empty() {
-                    self.enter_root(selected_id, true);
-                }
-            }
+            self.enter_selected_directory();
         }
 
         if !ctx.egui_wants_keyboard_input()
@@ -1458,6 +1451,18 @@ impl DiskMapApp {
 
         if ctx.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::ArrowRight)) {
             self.navigate_forward();
+        }
+
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input(|input| input.key_pressed(egui::Key::CloseBracket))
+        {
+            self.increase_depth();
+        }
+
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input(|input| input.key_pressed(egui::Key::OpenBracket))
+        {
+            self.decrease_depth();
         }
 
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -1949,6 +1954,10 @@ impl DiskMapApp {
 
     fn reset_camera(&mut self) {
         self.camera = Camera::default();
+        self.mark_layout_dirty_now();
+    }
+
+    fn mark_layout_dirty_now(&mut self) {
         self.layout_dirty = true;
         self.last_layout_refresh = Instant::now()
             .checked_sub(LAYOUT_REFRESH_INTERVAL)
@@ -2005,6 +2014,35 @@ impl DiskMapApp {
             let outcome = self.navigation.focus_search_match(&self.tree, node_id);
             self.apply_navigation_outcome(outcome);
         }
+    }
+
+    fn enter_selected_directory(&mut self) -> bool {
+        let Some(selected_id) = self.navigation.selected_id() else {
+            return false;
+        };
+        if selected_id >= self.tree.len() || self.tree.node(selected_id).children.is_empty() {
+            return false;
+        }
+        self.enter_root(selected_id, true);
+        true
+    }
+
+    fn increase_depth(&mut self) -> bool {
+        if self.max_depth >= 10 {
+            return false;
+        }
+        self.max_depth += 1;
+        self.mark_layout_dirty_now();
+        true
+    }
+
+    fn decrease_depth(&mut self) -> bool {
+        if self.max_depth <= 1 {
+            return false;
+        }
+        self.max_depth -= 1;
+        self.mark_layout_dirty_now();
+        true
     }
 
     fn prune_invalid_selection(&mut self) {
@@ -2833,6 +2871,45 @@ mod tests {
         let target = app.incremental_rescan_target(&[PathBuf::from("/root/new-dir/file.txt")]);
 
         assert_eq!(target, Some((0, PathBuf::from("/root"))));
+    }
+
+    #[test]
+    fn enter_selected_directory_focuses_selected_dir() {
+        let mut app = app_with_search_matches();
+        app.navigation.set_selected_id(Some(1));
+
+        assert!(app.enter_selected_directory());
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(app.navigation.selected_id(), Some(1));
+    }
+
+    #[test]
+    fn enter_selected_directory_ignores_files() {
+        let mut app = app_with_search_matches();
+        app.navigation.set_selected_id(Some(2));
+
+        assert!(!app.enter_selected_directory());
+        assert_eq!(app.navigation.focused_root(), Some(0));
+    }
+
+    #[test]
+    fn depth_keyboard_helpers_clamp_and_mark_layout_dirty() {
+        let mut app = DiskMapApp {
+            max_depth: 1,
+            layout_dirty: false,
+            ..Default::default()
+        };
+
+        assert!(!app.decrease_depth());
+        assert!(app.increase_depth());
+        assert_eq!(app.max_depth, 2);
+        assert!(app.layout_dirty);
+
+        app.max_depth = 10;
+        app.layout_dirty = false;
+        assert!(!app.increase_depth());
+        assert_eq!(app.max_depth, 10);
+        assert!(!app.layout_dirty);
     }
 
     #[test]

@@ -214,7 +214,8 @@ struct TreeStore {
 
 ### Phase 6: Treemap Upgrade
 - [x] Preserve Squarified Treemap interface
-- [ ] Evaluate deeper zoom/search workflows
+- [x] Evaluate deeper zoom/search workflows
+- Current workflow keeps the Squarified layout and adds keyboard-driven depth control (`[` / `]`) plus Enter-to-drill for selected directories. Search navigation remains scoped to the focused subtree and can move focus to matching directories or parent directories for file matches.
 
 ### Phase 7: Productization
 - [ ] Enable SQLite index for faster rescans behind a user setting
