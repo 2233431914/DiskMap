@@ -33,7 +33,7 @@
 - [x] Small-file aggregation as virtual "Other Files" nodes
 
 ### 3.2 Excluded from MVP
-- SQLite storage enabled in the default UI
+- SQLite storage enabled by default
 - Duplicate file detection
 - FSEvents real-time monitoring
 - Animations
@@ -218,7 +218,8 @@ struct TreeStore {
 - Current workflow keeps the Squarified layout and adds keyboard-driven depth control (`[` / `]`) plus Enter-to-drill for selected directories. Search navigation remains scoped to the focused subtree and can move focus to matching directories or parent directories for file matches.
 
 ### Phase 7: Productization
-- [ ] Enable SQLite index for faster rescans behind a user setting
+- [x] Enable SQLite index for faster rescans behind a user setting
+- SQLite remains disabled by default. The experimental `SQLite` toolbar setting switches scan cache mode to `Enabled` and is persisted with other scan options.
 - [ ] Search and filter
 - [ ] Extension-based coloring
 - [ ] Move to Trash functionality with confirmation and reliable platform adapter

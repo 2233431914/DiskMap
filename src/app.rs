@@ -2,8 +2,8 @@ use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
 use crate::platform::{open_path, reveal_in_finder};
 use crate::scanner::{
-    parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, PerfStats,
-    ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
+    parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, CacheMode,
+    PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
 };
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{
@@ -36,6 +36,7 @@ const STORAGE_INCLUDE_HIDDEN: &str = "disk_map.include_hidden";
 const STORAGE_FOLLOW_SYMLINKS: &str = "disk_map.follow_symlinks";
 const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
 const STORAGE_REALTIME_WATCH: &str = "disk_map.realtime_watch";
+const STORAGE_SQLITE_CACHE: &str = "disk_map.sqlite_cache";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 
@@ -238,6 +239,7 @@ pub struct DiskMapApp {
     follow_symlinks: bool,
     stay_on_filesystem: bool,
     realtime_watch_enabled: bool,
+    sqlite_cache_enabled: bool,
     watcher: Option<WatchSession>,
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
@@ -275,6 +277,7 @@ impl Default for DiskMapApp {
             follow_symlinks: ScanOptions::default().follow_symlinks,
             stay_on_filesystem: ScanOptions::default().stay_on_filesystem,
             realtime_watch_enabled: false,
+            sqlite_cache_enabled: false,
             watcher: None,
             initial_scan_pending: true,
             tx,
@@ -356,6 +359,13 @@ impl DiskMapApp {
             self.realtime_watch_enabled = realtime_watch_enabled;
         }
 
+        if let Some(sqlite_cache_enabled) = storage
+            .get_string(STORAGE_SQLITE_CACHE)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.sqlite_cache_enabled = sqlite_cache_enabled;
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -381,6 +391,7 @@ impl DiskMapApp {
             STORAGE_REALTIME_WATCH,
             self.realtime_watch_enabled.to_string(),
         );
+        storage.set_string(STORAGE_SQLITE_CACHE, self.sqlite_cache_enabled.to_string());
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
             storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
@@ -390,6 +401,11 @@ impl DiskMapApp {
     fn scan_options(&self) -> ScanOptions {
         ScanOptions {
             exclude_patterns: parse_exclude_patterns(&self.exclude_input),
+            cache_mode: if self.sqlite_cache_enabled {
+                CacheMode::Enabled
+            } else {
+                CacheMode::Disabled
+            },
             include_hidden: self.include_hidden,
             follow_symlinks: self.follow_symlinks,
             stay_on_filesystem: self.stay_on_filesystem,
@@ -571,6 +587,8 @@ impl DiskMapApp {
             if self.realtime_watch_enabled != before_watch {
                 self.update_watch_state();
             }
+            ui.checkbox(&mut self.sqlite_cache_enabled, "SQLite")
+                .on_hover_text("Experimental scan cache for faster rescans");
 
             ui.add_space(6.0);
 
@@ -2665,6 +2683,16 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_cache_setting_enables_cache_mode() {
+        let app = DiskMapApp {
+            sqlite_cache_enabled: true,
+            ..Default::default()
+        };
+
+        assert_eq!(app.scan_options().cache_mode, CacheMode::Enabled);
+    }
+
+    #[test]
     fn default_scan_options_preserve_safe_scan_defaults() {
         let options = DiskMapApp::default().scan_options();
 
@@ -2702,6 +2730,9 @@ mod tests {
         storage
             .values
             .insert(STORAGE_REALTIME_WATCH.into(), "true".into());
+        storage
+            .values
+            .insert(STORAGE_SQLITE_CACHE.into(), "true".into());
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2714,6 +2745,7 @@ mod tests {
         assert!(app.follow_symlinks);
         assert!(app.stay_on_filesystem);
         assert!(app.realtime_watch_enabled);
+        assert!(app.sqlite_cache_enabled);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2728,6 +2760,7 @@ mod tests {
             follow_symlinks: true,
             stay_on_filesystem: true,
             realtime_watch_enabled: true,
+            sqlite_cache_enabled: true,
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2776,6 +2809,10 @@ mod tests {
                 .values
                 .get(STORAGE_REALTIME_WATCH)
                 .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            storage.values.get(STORAGE_SQLITE_CACHE).map(String::as_str),
             Some("true")
         );
         assert_eq!(
