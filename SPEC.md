@@ -185,6 +185,8 @@ struct TreeStore {
 
 ## 10. Roadmap
 
+Unchecked items below are accepted product backlog, not current behavior. Analysis features should stay read-only by default. Destructive workflows must remain gated behind review, protected-path checks, explicit confirmation, and audit logging.
+
 ### Phase 2: Stabilization and Usability
 - [x] Keep destructive actions disabled by default
 - [x] Keep SQLite cache disabled by default
@@ -262,6 +264,10 @@ struct TreeStore {
 - [ ] Size anomaly hints: highlight unexpectedly large caches, build artifacts, and log folders using configurable read-only rules
 - [ ] Type/category breakdown: summarize file categories such as media, archives, code, documents, dependencies, caches, and system artifacts
 - [ ] Age cleanup view: show old large files and stale directories by modified time without selecting them for destructive action automatically
+- [ ] Quick filters for size threshold, modified age, file category, extension, hidden files, symlinks, error nodes, and virtual aggregate nodes
+- [ ] Selected-node metadata summary with modified time, child counts, file category, extension, real-path availability, and percent of current focus size
+- [ ] Permission and scan-error insight summary with retry, reveal, or exclude suggestions that never mutate scan options automatically
+- [ ] Explainable read-only recommendation scoring for likely cleanup candidates, showing the exact rule and evidence behind each suggestion
 - [ ] Scan session notes: let users attach short local notes to saved roots, snapshots, or reports
 - [ ] Ignore suggestions: propose exclude patterns for repeated noisy folders, but require user confirmation before adding rules
 - [ ] Open containing terminal for real paths where the platform supports it
@@ -269,7 +275,11 @@ struct TreeStore {
 ### Phase 12: Comparison and History
 - [ ] Persist lightweight scan metadata history for recent roots, including timestamp, size basis, option summary, and root path
 - [ ] Snapshot diff view with added, removed, grown, and shrunk paths grouped by impact
+- [ ] Compare any two saved snapshots for the same root, not only the latest completed pair
+- [ ] Compare two independently scanned roots as a read-only side-by-side analysis when their paths differ
+- [ ] Group comparison results by folder, file category, extension, and modified-age bucket
 - [ ] Trend chart for recent scans of the same root
+- [ ] Saved report library for generated duplicate, insight, export, and comparison summaries
 - [ ] Export comparison reports as CSV/JSON with enough metadata to reproduce the comparison
 - [ ] Optional baseline pinning so one snapshot can be reused as the comparison target
 
@@ -277,22 +287,49 @@ struct TreeStore {
 - [ ] Read-only candidate rules for common cleanup targets, such as dependency folders, build outputs, old archives, large logs, and duplicate-name clusters
 - [ ] Review queue with include/exclude decisions, total selected size, item count, and affected roots
 - [ ] Protected path policy that blocks system locations, mounted volumes, home root, and user-configured deny lists
+- [ ] Queue-level dry-run validation that checks path existence, real-path availability, protected-path status, and size drift before any platform operation
 - [ ] Confirmation dialog that requires visible path, selected byte size, affected item count, and operation type before platform trash
 - [ ] Cleanup audit log recording requested action, result, failures, timestamp, and target paths
 - [ ] Dry-run export for cleanup plans before any platform action is enabled
+- [ ] Post-action verification that reports moved, missing, skipped, and failed paths without silently changing scan/search state
+- [ ] Undo guidance that explains platform Trash recovery options when supported, without promising guaranteed restoration
 
 ### Phase 14: Power User Workflow
 - [ ] Command palette for navigation, scan, export, filter, and view-mode actions
+- [ ] Keyboard-first triage flow for moving between search matches, report rows, and selected treemap nodes
 - [ ] Saved filter presets for extension, category, size threshold, modified age, hidden files, symlink policy, and exclude patterns
 - [ ] Multi-root comparison workspace for comparing several scan roots side by side
 - [ ] Bookmark selected nodes inside a scan for later review
+- [ ] Saved views that remember focused node, depth, search/filter state, color mode, and selected report mode
 - [ ] Deep-link style local references to reopen a saved root, snapshot, focused node, and view mode
 - [ ] Configurable color palettes for directory depth, extension mode, and category mode
+- [ ] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI
 
 ### Phase 15: Reliability and Distribution
 - [ ] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs
 - [ ] Large-tree benchmark suite with fixed fixtures and regression thresholds
 - [ ] UI smoke tests for scan, navigation, search, export, watch, cache, and trash confirmation flows
+- [ ] Diagnostics bundle export with app version, platform, scan options, perf counters, recent errors, and redacted local paths where requested
 - [ ] macOS app bundle release profile with signing and notarization documentation
+- [ ] Release checklist for upgrades, preference migration, cache compatibility, and rollback testing
 - [ ] Import/export settings bundle for migrating preferences between machines
 - [ ] Privacy statement documenting that scans, histories, caches, and reports are local-only unless the user exports files manually
+
+### Phase 16: Visualization and Review Ergonomics
+- [ ] Category and age color modes that reuse the same category and modified-time model as the insight reports
+- [ ] Size histogram for the focused subtree, with buckets that can feed the quick filter controls
+- [ ] Report-row-to-treemap linking so selecting a duplicate, insight, comparison, or cleanup candidate row selects the corresponding node when it is still present
+- [ ] Breadcrumb and minimap-style orientation aids for very deep focused subtrees, kept compact and optional
+- [ ] Empty-space and tiny-file explanations so aggregate nodes and skipped tiny rectangles are understandable without adding visual clutter
+
+### Phase 17: Automation and Scheduled Analysis
+- [ ] Default-off scheduled scans for pinned roots, with local-only results and no cleanup automation
+- [ ] Change summary notification after a scheduled scan when growth, new large files, or errors exceed user-configured thresholds
+- [ ] Exportable scheduled report templates for focused roots, comparisons, category summaries, and cleanup dry runs
+- [ ] Background work throttling so scheduled scans never compete aggressively with active interactive scans
+
+### Phase 18: Extensibility and Rule Management
+- [ ] User-editable rule sets for categories, anomaly hints, cleanup candidates, and protected paths
+- [ ] Import/export rule bundles with validation and preview before applying changes
+- [ ] Per-root option profiles for exclude rules, safe scan options, watch/cache settings, and report defaults
+- [ ] Rule test fixtures that let users validate matching behavior against example paths before enabling a rule set
