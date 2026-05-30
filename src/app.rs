@@ -1,6 +1,6 @@
 use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
-use crate::platform::{open_path, reveal_in_finder};
+use crate::platform::{move_to_trash, open_path, reveal_in_finder};
 use crate::scanner::{
     parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, CacheMode,
     PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
@@ -257,6 +257,8 @@ pub struct DiskMapApp {
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
+    trash_confirm_target_id: Option<NodeId>,
+    destructive_actions_enabled: bool,
     hovered_visual_kind: Option<VisualKind>,
     camera: Camera,
     max_depth: usize,
@@ -297,6 +299,8 @@ impl Default for DiskMapApp {
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
+            trash_confirm_target_id: None,
+            destructive_actions_enabled: false,
             hovered_visual_kind: None,
             camera: Camera::default(),
             max_depth: 1,
@@ -883,6 +887,33 @@ impl DiskMapApp {
         {
             if let Some(path) = &node_path {
                 ui.ctx().copy_text(path.display().to_string());
+            }
+        }
+        ui.add_space(4.0);
+        if ui
+            .checkbox(&mut self.destructive_actions_enabled, "Allow Trash")
+            .on_hover_text("Enable two-step Move to Trash for the selected real filesystem path")
+            .changed()
+            && !self.destructive_actions_enabled
+        {
+            self.trash_confirm_target_id = None;
+        }
+        if self.destructive_actions_enabled {
+            let trash_enabled = path_available;
+            let label = if self.trash_confirm_target_id == Some(node_id) {
+                "Confirm Trash"
+            } else {
+                "Move to Trash"
+            };
+            let trash_width = ui.available_width();
+            if ui
+                .add_enabled(
+                    trash_enabled,
+                    egui::Button::new(label).min_size(Vec2::new(trash_width, 28.0)),
+                )
+                .clicked()
+            {
+                self.arm_or_confirm_trash(node_id);
             }
         }
         ui.add_space(4.0);
@@ -1708,6 +1739,38 @@ impl DiskMapApp {
         }
     }
 
+    fn arm_or_confirm_trash(&mut self, node_id: NodeId) {
+        if !self.destructive_actions_enabled {
+            self.status = "Move to Trash is disabled".to_string();
+            self.pending_repaint = true;
+            return;
+        }
+
+        let Some(path) = self.tree.node_real_path(node_id) else {
+            self.status = "Move to Trash unavailable for virtual nodes".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        if self.trash_confirm_target_id != Some(node_id) {
+            self.trash_confirm_target_id = Some(node_id);
+            self.status = format!("Confirm Move to Trash for {}", path.display());
+            self.pending_repaint = true;
+            return;
+        }
+
+        self.trash_confirm_target_id = None;
+        match move_to_trash(&path) {
+            Ok(()) => {
+                self.status = format!("Moved to Trash: {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("Move to Trash failed: {error}");
+            }
+        }
+        self.pending_repaint = true;
+    }
+
     fn handle_watch_events(&mut self) {
         let Some(watcher) = &mut self.watcher else {
             return;
@@ -1863,6 +1926,7 @@ impl DiskMapApp {
         self.navigation.clear_for_new_scan();
         self.hovered_id = None;
         self.context_menu_target_id = None;
+        self.trash_confirm_target_id = None;
         self.hovered_visual_kind = None;
         self.search.clear(0);
         self.cached_visuals.clear();
@@ -2945,6 +3009,45 @@ mod tests {
     #[test]
     fn extension_key_is_empty_without_extension() {
         assert_eq!(file_extension_key("README"), "");
+    }
+
+    #[test]
+    fn trash_action_is_disabled_by_default() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+
+        app.arm_or_confirm_trash(2);
+
+        assert_eq!(app.status, "Move to Trash is disabled");
+        assert!(app.trash_confirm_target_id.is_none());
+    }
+
+    #[test]
+    fn trash_action_requires_confirmation_for_real_path() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+        app.destructive_actions_enabled = true;
+
+        app.arm_or_confirm_trash(2);
+
+        assert_eq!(app.trash_confirm_target_id, Some(2));
+        assert!(app.status.starts_with("Confirm Move to Trash for "));
+    }
+
+    #[test]
+    fn trash_action_rejects_virtual_aggregate_nodes() {
+        let mut app = DiskMapApp::default();
+        let root = app.tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        app.tree.set_root_path("/root".into());
+        let aggregate =
+            app.tree
+                .add_node(Some(root), "Other Files (2)".into(), NodeKind::Aggregate, 8);
+        app.destructive_actions_enabled = true;
+
+        app.arm_or_confirm_trash(aggregate);
+
+        assert_eq!(app.status, "Move to Trash unavailable for virtual nodes");
+        assert!(app.trash_confirm_target_id.is_none());
     }
 
     #[test]

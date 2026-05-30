@@ -14,7 +14,6 @@ pub fn open_path(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn move_to_trash(path: &Path) -> anyhow::Result<()> {
-    let url = format!("trash://{}", path.display());
-    open::that(&url)?;
+    trash::delete(path)?;
     Ok(())
 }
