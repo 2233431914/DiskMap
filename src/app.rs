@@ -1,3 +1,4 @@
+use crate::duplicates::{find_duplicate_candidates, DuplicateCandidate, DuplicateReport};
 use crate::export::{export_subtree, ExportFormat};
 use crate::format::format_bytes;
 use crate::platform::{move_to_trash, open_path, reveal_in_finder};
@@ -49,6 +50,7 @@ const STORAGE_THEME: &str = "disk_map.theme";
 const MAX_RECENT_ROOTS: usize = 10;
 const MAX_PINNED_ROOTS: usize = 12;
 const SNAPSHOT_DIFF_LIMIT: usize = 5;
+const DUPLICATE_REPORT_LIMIT: usize = 8;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -266,6 +268,7 @@ pub struct DiskMapApp {
     pinned_roots: Vec<String>,
     last_snapshot: Option<ScanSnapshot>,
     snapshot_diff: Option<SnapshotDiff>,
+    duplicate_report: Option<DuplicateReport>,
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
@@ -312,6 +315,7 @@ impl Default for DiskMapApp {
             pinned_roots: Vec::new(),
             last_snapshot: None,
             snapshot_diff: None,
+            duplicate_report: None,
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -1058,6 +1062,18 @@ impl DiskMapApp {
                 }
             });
         }
+        ui.add_space(4.0);
+        let duplicate_width = ui.available_width();
+        if ui
+            .add_enabled(
+                focused_export_id.is_some() && !self.scan.is_scanning(),
+                egui::Button::new("Analyze Duplicates").min_size(Vec2::new(duplicate_width, 28.0)),
+            )
+            .on_hover_text("Read-only heuristic: same file name and same size in the current view")
+            .clicked()
+        {
+            self.analyze_duplicate_candidates();
+        }
 
         if let Some(parent) = node_parent {
             ui.add_space(10.0);
@@ -1084,6 +1100,7 @@ impl DiskMapApp {
         self.show_progress_section(ui, p);
         self.show_scan_issue_section(ui, p);
         self.show_snapshot_diff_section(ui, p);
+        self.show_duplicate_report_section(ui, p);
         self.show_search_section(ui, p);
     }
 
@@ -1253,6 +1270,45 @@ impl DiskMapApp {
         snapshot_change_group(ui, p, "Grown", &diff.grown);
         snapshot_change_group(ui, p, "Shrunk", &diff.shrunk);
         snapshot_change_group(ui, p, "Removed", &diff.removed);
+    }
+
+    fn show_duplicate_report_section(&self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(report) = &self.duplicate_report else {
+            return;
+        };
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("DUPLICATE CANDIDATES")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "{} groups · {} files · up to {} candidates",
+                report.group_count,
+                report.file_count,
+                format_bytes(report.total_reclaimable_bytes)
+            ))
+            .small()
+            .color(p.text_muted),
+        )
+        .on_hover_text(report.root_path.display().to_string());
+
+        if report.candidates.is_empty() {
+            ui.label(
+                RichText::new("No same-name same-size candidates in this view.")
+                    .small()
+                    .color(p.text_muted),
+            );
+            return;
+        }
+
+        for candidate in &report.candidates {
+            duplicate_candidate_row(ui, p, candidate);
+        }
     }
 
     fn show_status_bar(&self, ui: &mut egui::Ui) {
@@ -2114,6 +2170,7 @@ impl DiskMapApp {
         self.trash_confirm_target_id = None;
         self.hovered_visual_kind = None;
         self.snapshot_diff = None;
+        self.duplicate_report = None;
         self.search.clear(0);
         self.cached_visuals.clear();
         self.reset_camera();
@@ -2232,6 +2289,39 @@ impl DiskMapApp {
             }
             Err(error) => {
                 self.status = format!("Export failed: {error}");
+            }
+        }
+        self.pending_repaint = true;
+    }
+
+    fn analyze_duplicate_candidates(&mut self) {
+        let Some(root_id) = self.navigation.focused_root() else {
+            self.duplicate_report = None;
+            self.status = "Duplicate analysis unavailable: no focused directory".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        match find_duplicate_candidates(&mut self.tree, root_id, DUPLICATE_REPORT_LIMIT) {
+            Some(report) => {
+                let status = if report.group_count == 0 {
+                    "Duplicate analysis found no candidates".to_string()
+                } else {
+                    format!(
+                        "Duplicate analysis found {}",
+                        pluralize(
+                            report.group_count as u64,
+                            "candidate group",
+                            "candidate groups"
+                        )
+                    )
+                };
+                self.duplicate_report = Some(report);
+                self.status = status;
+            }
+            None => {
+                self.duplicate_report = None;
+                self.status = "Duplicate analysis unavailable for this view".to_string();
             }
         }
         self.pending_repaint = true;
@@ -2868,6 +2958,41 @@ fn snapshot_change_group(
     }
 }
 
+fn duplicate_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &DuplicateCandidate) {
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!(
+            "{} · {} files · {} each",
+            truncate_middle(&candidate.name, 28),
+            candidate.paths.len(),
+            format_bytes(candidate.size)
+        ))
+        .small()
+        .strong()
+        .color(palette.text_muted),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Potential reclaim: {}",
+            format_bytes(candidate.reclaimable_bytes)
+        ))
+        .small()
+        .monospace()
+        .color(palette.accent),
+    );
+    for path in candidate.paths.iter().take(3) {
+        ui.add(
+            egui::Label::new(
+                RichText::new(truncate_middle(path, 38))
+                    .small()
+                    .color(palette.text_faint),
+            )
+            .truncate(),
+        )
+        .on_hover_text(path);
+    }
+}
+
 fn dirs_home_fallback() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
@@ -3434,6 +3559,89 @@ mod tests {
                 .as_ref()
                 .map(|snapshot| &snapshot.root_path),
             Some(&PathBuf::from("/root-b"))
+        );
+    }
+
+    #[test]
+    fn duplicate_analysis_reports_candidates_without_scan_state_changes() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![
+                    DiscoveredNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "a".into(),
+                            kind: NodeKind::Dir,
+                            size: 0,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 2,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "b".into(),
+                            kind: NodeKind::Dir,
+                            size: 0,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 3,
+                        parent_id: 1,
+                        node: NodeRecord {
+                            name: "same.bin".into(),
+                            kind: NodeKind::File,
+                            size: 5,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 4,
+                        parent_id: 2,
+                        node: NodeRecord {
+                            name: "same.bin".into(),
+                            kind: NodeKind::File,
+                            size: 5,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                ],
+                size_deltas: vec![(0, 10), (1, 5), (2, 5)],
+                scanned_nodes: vec![1, 2, 3, 4],
+                progress: None,
+            },
+        });
+        let active_scan_id = app.scan.active_id();
+
+        app.analyze_duplicate_candidates();
+
+        let report = app.duplicate_report.as_ref().expect("duplicate report");
+        assert_eq!(report.group_count, 1);
+        assert_eq!(report.file_count, 2);
+        assert_eq!(report.total_reclaimable_bytes, 5);
+        assert_eq!(app.scan.active_id(), active_scan_id);
+        assert!(app.status.contains("1 candidate group"));
+    }
+
+    #[test]
+    fn duplicate_analysis_is_unavailable_without_focused_root() {
+        let mut app = DiskMapApp::default();
+
+        app.analyze_duplicate_candidates();
+
+        assert!(app.duplicate_report.is_none());
+        assert_eq!(
+            app.status,
+            "Duplicate analysis unavailable: no focused directory"
         );
     }
 
