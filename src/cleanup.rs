@@ -1,0 +1,186 @@
+use crate::tree::{NodeId, NodeKind};
+use std::path::{Component, Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupCandidate {
+    pub node_id: NodeId,
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub item_count: usize,
+    pub kind: NodeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAddResult {
+    Added,
+    AlreadyQueued,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CleanupQueue {
+    candidates: Vec<CleanupCandidate>,
+}
+
+impl CleanupQueue {
+    pub fn candidates(&self) -> &[CleanupCandidate] {
+        &self.candidates
+    }
+
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.candidates.iter().map(|candidate| candidate.size).sum()
+    }
+
+    pub fn add(&mut self, candidate: CleanupCandidate) -> QueueAddResult {
+        if self
+            .candidates
+            .iter()
+            .any(|existing| existing.path == candidate.path)
+        {
+            return QueueAddResult::AlreadyQueued;
+        }
+
+        self.candidates.push(candidate);
+        QueueAddResult::Added
+    }
+
+    pub fn get(&self, node_id: NodeId) -> Option<&CleanupCandidate> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.node_id == node_id)
+    }
+
+    pub fn contains_node(&self, node_id: NodeId) -> bool {
+        self.get(node_id).is_some()
+    }
+
+    pub fn remove(&mut self, node_id: NodeId) -> Option<CleanupCandidate> {
+        let index = self
+            .candidates
+            .iter()
+            .position(|candidate| candidate.node_id == node_id)?;
+        Some(self.candidates.remove(index))
+    }
+
+    pub fn clear(&mut self) {
+        self.candidates.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectedPathReason {
+    FilesystemRoot,
+    HomeRoot,
+    SystemLocation,
+    MountedVolumeRoot,
+}
+
+impl ProtectedPathReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FilesystemRoot => "filesystem root",
+            Self::HomeRoot => "home folder root",
+            Self::SystemLocation => "system location",
+            Self::MountedVolumeRoot => "mounted volume root",
+        }
+    }
+}
+
+pub fn protected_path_reason(path: &Path) -> Option<ProtectedPathReason> {
+    if path == Path::new("/") {
+        return Some(ProtectedPathReason::FilesystemRoot);
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if path == home {
+            return Some(ProtectedPathReason::HomeRoot);
+        }
+    }
+
+    let components = path.components().collect::<Vec<_>>();
+    let [Component::RootDir, Component::Normal(first), rest @ ..] = components.as_slice() else {
+        return None;
+    };
+    let first = first.to_string_lossy();
+
+    if first == "Volumes" && rest.len() <= 1 {
+        return Some(ProtectedPathReason::MountedVolumeRoot);
+    }
+
+    if matches!(
+        first.as_ref(),
+        "Applications" | "Library" | "System" | "bin" | "etc" | "private" | "sbin" | "usr" | "var"
+    ) {
+        return Some(ProtectedPathReason::SystemLocation);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_queue_deduplicates_by_path() {
+        let mut queue = CleanupQueue::default();
+        let candidate = CleanupCandidate {
+            node_id: 1,
+            name: "file.txt".into(),
+            path: "/tmp/file.txt".into(),
+            size: 10,
+            item_count: 1,
+            kind: NodeKind::File,
+        };
+
+        assert_eq!(queue.add(candidate.clone()), QueueAddResult::Added);
+        assert_eq!(queue.add(candidate), QueueAddResult::AlreadyQueued);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.total_size(), 10);
+    }
+
+    #[test]
+    fn cleanup_queue_removes_by_node_id() {
+        let mut queue = CleanupQueue::default();
+        queue.add(CleanupCandidate {
+            node_id: 1,
+            name: "file.txt".into(),
+            path: "/tmp/file.txt".into(),
+            size: 10,
+            item_count: 1,
+            kind: NodeKind::File,
+        });
+
+        assert!(queue.contains_node(1));
+        assert_eq!(
+            queue.remove(1).map(|candidate| candidate.name),
+            Some("file.txt".into())
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn protected_paths_include_roots_system_locations_and_volume_roots() {
+        assert_eq!(
+            protected_path_reason(Path::new("/")),
+            Some(ProtectedPathReason::FilesystemRoot)
+        );
+        assert_eq!(
+            protected_path_reason(Path::new("/System/Library")),
+            Some(ProtectedPathReason::SystemLocation)
+        );
+        assert_eq!(
+            protected_path_reason(Path::new("/Volumes/External")),
+            Some(ProtectedPathReason::MountedVolumeRoot)
+        );
+        assert_eq!(protected_path_reason(Path::new("/tmp/file.txt")), None);
+    }
+}

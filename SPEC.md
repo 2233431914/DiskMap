@@ -41,6 +41,7 @@
 - [x] Optional SQLite scan cache setting, disabled by default
 - [x] Extension-based color mode
 - [x] Runtime-gated Move to Trash with two-step confirmation
+- [x] Cleanup review queue before platform Trash actions
 
 ### 3.2 Explicitly Out of Current Default Path
 - SQLite storage enabled by default
@@ -100,6 +101,7 @@ disk-map/
     ├── scanner.rs
     ├── tree.rs
     ├── treemap.rs
+    ├── cleanup.rs
     ├── export.rs
     ├── insights.rs
     ├── platform.rs
@@ -163,7 +165,8 @@ struct TreeStore {
 
 ### 7.3 Destructive Actions
 - Move to Trash is disabled by default and hidden until the user enables `Allow Trash`.
-- Trash requires a second confirmation click for the selected real filesystem path.
+- Trash candidates must first be added to the cleanup review queue.
+- Trash requires a second confirmation click from the queued candidate and shows path, size, and affected item count.
 - Trash uses the platform trash adapter, reports errors, and must not silently trigger a rescan.
 
 ## 8. UI Layout
@@ -255,8 +258,10 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - Focused reports export JSON with generated time, scan root path, focused path, size basis, depth, search/filter state, color mode, scan options, exclude patterns, and the focused subtree entries.
 
 ### Phase 9: Cleanup Workflow Safety
-- [ ] Add a review queue for cleanup candidates before any destructive action
+- [x] Add a review queue for cleanup candidates before any destructive action
+- The selected node can only be queued for Trash; actual platform Trash actions are launched from the cleanup queue after a second confirmation. Queue rows show path, size, kind, and affected item count.
 - [ ] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
+- Built-in guardrails currently block filesystem root, the home root, common system locations, and mounted volume roots. User-configured deny lists remain pending.
 - [ ] Require explicit confirmation with path, size, and affected item count before Move to Trash
 - [ ] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
 

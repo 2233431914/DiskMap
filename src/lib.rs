@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cleanup;
 pub mod db;
 pub mod duplicates;
 pub mod export;

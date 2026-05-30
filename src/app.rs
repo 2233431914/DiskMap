@@ -1,3 +1,6 @@
+use crate::cleanup::{
+    protected_path_reason, CleanupCandidate, CleanupQueue, ProtectedPathReason, QueueAddResult,
+};
 use crate::duplicates::{find_duplicate_candidates, DuplicateCandidate, DuplicateReport};
 use crate::export::{export_focused_report, export_subtree, ExportFormat, FocusedReportMetadata};
 use crate::format::format_bytes;
@@ -278,6 +281,7 @@ pub struct DiskMapApp {
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
     trash_confirm_target_id: Option<NodeId>,
+    cleanup_queue: CleanupQueue,
     destructive_actions_enabled: bool,
     hovered_visual_kind: Option<VisualKind>,
     camera: Camera,
@@ -326,6 +330,7 @@ impl Default for DiskMapApp {
             hovered_id: None,
             context_menu_target_id: None,
             trash_confirm_target_id: None,
+            cleanup_queue: CleanupQueue::default(),
             destructive_actions_enabled: false,
             hovered_visual_kind: None,
             camera: Camera::default(),
@@ -990,28 +995,28 @@ impl DiskMapApp {
         ui.add_space(4.0);
         if ui
             .checkbox(&mut self.destructive_actions_enabled, "Allow Trash")
-            .on_hover_text("Enable two-step Move to Trash for the selected real filesystem path")
+            .on_hover_text("Enable cleanup review queue and two-step Move to Trash")
             .changed()
             && !self.destructive_actions_enabled
         {
             self.trash_confirm_target_id = None;
         }
         if self.destructive_actions_enabled {
-            let trash_enabled = path_available;
-            let label = if self.trash_confirm_target_id == Some(node_id) {
-                "Confirm Trash"
+            let queue_enabled = path_available;
+            let label = if self.cleanup_queue.contains_node(node_id) {
+                "Queued for Trash"
             } else {
-                "Move to Trash"
+                "Queue for Trash"
             };
-            let trash_width = ui.available_width();
+            let queue_width = ui.available_width();
             if ui
                 .add_enabled(
-                    trash_enabled,
-                    egui::Button::new(label).min_size(Vec2::new(trash_width, 28.0)),
+                    queue_enabled,
+                    egui::Button::new(label).min_size(Vec2::new(queue_width, 28.0)),
                 )
                 .clicked()
             {
-                self.arm_or_confirm_trash(node_id);
+                self.queue_cleanup_candidate(node_id);
             }
         }
         ui.add_space(4.0);
@@ -1129,6 +1134,7 @@ impl DiskMapApp {
 
         self.show_progress_section(ui, p);
         self.show_scan_issue_section(ui, p);
+        self.show_cleanup_queue_section(ui, p);
         self.show_snapshot_diff_section(ui, p);
         self.show_duplicate_report_section(ui, p);
         self.show_insight_report_section(ui, p);
@@ -1217,6 +1223,62 @@ impl DiskMapApp {
                     .small()
                     .color(color),
             );
+        }
+    }
+
+    fn show_cleanup_queue_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if self.cleanup_queue.is_empty() {
+            return;
+        }
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("CLEANUP QUEUE")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "{} · {}",
+                pluralize(self.cleanup_queue.len() as u64, "candidate", "candidates"),
+                format_bytes(self.cleanup_queue.total_size())
+            ))
+            .small()
+            .color(p.text_muted),
+        );
+
+        let candidates = self.cleanup_queue.candidates().to_vec();
+        for candidate in candidates {
+            cleanup_candidate_row(ui, p, &candidate);
+            ui.columns(2, |cols| {
+                let w0 = cols[0].available_width();
+                if cols[0]
+                    .add_enabled(
+                        self.destructive_actions_enabled,
+                        egui::Button::new(
+                            if self.trash_confirm_target_id == Some(candidate.node_id) {
+                                "Confirm Trash"
+                            } else {
+                                "Trash"
+                            },
+                        )
+                        .min_size(Vec2::new(w0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    self.arm_or_confirm_queued_trash(candidate.node_id);
+                }
+                let w1 = cols[1].available_width();
+                if cols[1]
+                    .add(egui::Button::new("Remove").min_size(Vec2::new(w1, 24.0)))
+                    .clicked()
+                {
+                    self.remove_cleanup_candidate(candidate.node_id);
+                }
+            });
+            ui.add_space(4.0);
         }
     }
 
@@ -2050,7 +2112,7 @@ impl DiskMapApp {
         }
     }
 
-    fn arm_or_confirm_trash(&mut self, node_id: NodeId) {
+    fn queue_cleanup_candidate(&mut self, node_id: NodeId) {
         if !self.destructive_actions_enabled {
             self.status = "Move to Trash is disabled".to_string();
             self.pending_repaint = true;
@@ -2058,28 +2120,105 @@ impl DiskMapApp {
         }
 
         let Some(path) = self.tree.node_real_path(node_id) else {
-            self.status = "Move to Trash unavailable for virtual nodes".to_string();
+            self.status = "Cleanup queue unavailable for virtual nodes".to_string();
             self.pending_repaint = true;
             return;
         };
 
+        if let Some(reason) = protected_path_reason(&path) {
+            self.status = protected_path_status(reason, &path);
+            self.pending_repaint = true;
+            return;
+        }
+
+        let node = self.tree.node(node_id);
+        let candidate = CleanupCandidate {
+            node_id,
+            name: node.name.clone(),
+            path: path.clone(),
+            size: node.size,
+            item_count: self.cleanup_item_count(node_id),
+            kind: node.kind,
+        };
+        self.status = match self.cleanup_queue.add(candidate) {
+            QueueAddResult::Added => format!("Queued cleanup candidate: {}", path.display()),
+            QueueAddResult::AlreadyQueued => {
+                format!("Cleanup candidate already queued: {}", path.display())
+            }
+        };
+        self.pending_repaint = true;
+    }
+
+    fn arm_or_confirm_queued_trash(&mut self, node_id: NodeId) {
+        if !self.destructive_actions_enabled {
+            self.status = "Move to Trash is disabled".to_string();
+            self.pending_repaint = true;
+            return;
+        }
+
+        let Some(candidate) = self.cleanup_queue.get(node_id).cloned() else {
+            self.status = "Move to Trash unavailable: candidate is not queued".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        if let Some(reason) = protected_path_reason(&candidate.path) {
+            self.trash_confirm_target_id = None;
+            self.status = protected_path_status(reason, &candidate.path);
+            self.pending_repaint = true;
+            return;
+        }
+
         if self.trash_confirm_target_id != Some(node_id) {
             self.trash_confirm_target_id = Some(node_id);
-            self.status = format!("Confirm Move to Trash for {}", path.display());
+            self.status = format!(
+                "Confirm Trash: {} · {} · {}",
+                candidate.path.display(),
+                format_bytes(candidate.size),
+                pluralize(candidate.item_count as u64, "item", "items")
+            );
             self.pending_repaint = true;
             return;
         }
 
         self.trash_confirm_target_id = None;
-        match move_to_trash(&path) {
+        match move_to_trash(&candidate.path) {
             Ok(()) => {
-                self.status = format!("Moved to Trash: {}", path.display());
+                self.cleanup_queue.remove(node_id);
+                self.status = format!("Moved to Trash: {}", candidate.path.display());
             }
             Err(error) => {
                 self.status = format!("Move to Trash failed: {error}");
             }
         }
         self.pending_repaint = true;
+    }
+
+    fn remove_cleanup_candidate(&mut self, node_id: NodeId) {
+        if let Some(candidate) = self.cleanup_queue.remove(node_id) {
+            if self.trash_confirm_target_id == Some(node_id) {
+                self.trash_confirm_target_id = None;
+            }
+            self.status = format!("Removed cleanup candidate: {}", candidate.path.display());
+            self.pending_repaint = true;
+        }
+    }
+
+    fn cleanup_item_count(&self, node_id: NodeId) -> usize {
+        if node_id >= self.tree.len() {
+            return 0;
+        }
+
+        let mut count = 1usize;
+        let mut stack = self.tree.node(node_id).children.clone();
+        while let Some(id) = stack.pop() {
+            if id >= self.tree.len() {
+                continue;
+            }
+            count += 1;
+            stack.extend(self.tree.node(id).children.iter().copied());
+        }
+        count
     }
 
     fn handle_watch_events(&mut self) {
@@ -2238,6 +2377,7 @@ impl DiskMapApp {
         self.hovered_id = None;
         self.context_menu_target_id = None;
         self.trash_confirm_target_id = None;
+        self.cleanup_queue.clear();
         self.hovered_visual_kind = None;
         self.snapshot_diff = None;
         self.duplicate_report = None;
@@ -3162,6 +3302,44 @@ fn duplicate_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &Dup
     }
 }
 
+fn cleanup_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &CleanupCandidate) {
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(format!(
+            "{} · {} · {}",
+            truncate_middle(&candidate.name, 28),
+            describe_node_kind(candidate.kind, candidate.item_count > 1),
+            pluralize(candidate.item_count as u64, "item", "items")
+        ))
+        .small()
+        .strong()
+        .color(palette.text_muted),
+    );
+    ui.label(
+        RichText::new(format_bytes(candidate.size))
+            .small()
+            .monospace()
+            .color(palette.accent),
+    );
+    ui.add(
+        egui::Label::new(
+            RichText::new(truncate_middle(&candidate.path.display().to_string(), 38))
+                .small()
+                .color(palette.text_faint),
+        )
+        .truncate(),
+    )
+    .on_hover_text(candidate.path.display().to_string());
+}
+
+fn protected_path_status(reason: ProtectedPathReason, path: &Path) -> String {
+    format!(
+        "Protected path blocked: {} ({})",
+        path.display(),
+        reason.label()
+    )
+}
+
 fn insight_type_group(ui: &mut egui::Ui, palette: &Palette, summaries: &[FileTypeSummary]) {
     if summaries.is_empty() {
         return;
@@ -4082,22 +4260,46 @@ mod tests {
         let mut app = app_with_search_matches();
         app.tree.set_root_path("/root".into());
 
-        app.arm_or_confirm_trash(2);
+        app.queue_cleanup_candidate(2);
 
         assert_eq!(app.status, "Move to Trash is disabled");
         assert!(app.trash_confirm_target_id.is_none());
+        assert!(app.cleanup_queue.is_empty());
     }
 
     #[test]
-    fn trash_action_requires_confirmation_for_real_path() {
+    fn trash_action_queues_real_path_before_confirmation() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+        app.destructive_actions_enabled = true;
+        let active_scan_id = app.scan.active_id();
+
+        app.queue_cleanup_candidate(2);
+
+        assert_eq!(app.cleanup_queue.len(), 1);
+        assert_eq!(
+            app.cleanup_queue.candidates()[0].path,
+            PathBuf::from("/root/match-dir/match-file")
+        );
+        assert_eq!(app.cleanup_queue.candidates()[0].item_count, 1);
+        assert_eq!(app.trash_confirm_target_id, None);
+        assert_eq!(app.scan.active_id(), active_scan_id);
+        assert!(app.status.starts_with("Queued cleanup candidate: "));
+    }
+
+    #[test]
+    fn queued_trash_requires_confirmation_with_path_size_and_item_count() {
         let mut app = app_with_search_matches();
         app.tree.set_root_path("/root".into());
         app.destructive_actions_enabled = true;
 
-        app.arm_or_confirm_trash(2);
+        app.queue_cleanup_candidate(2);
+        app.arm_or_confirm_queued_trash(2);
 
         assert_eq!(app.trash_confirm_target_id, Some(2));
-        assert!(app.status.starts_with("Confirm Move to Trash for "));
+        assert!(app.status.contains("/root/match-dir/match-file"));
+        assert!(app.status.contains("1 B"));
+        assert!(app.status.contains("1 item"));
     }
 
     #[test]
@@ -4110,10 +4312,24 @@ mod tests {
                 .add_node(Some(root), "Other Files (2)".into(), NodeKind::Aggregate, 8);
         app.destructive_actions_enabled = true;
 
-        app.arm_or_confirm_trash(aggregate);
+        app.queue_cleanup_candidate(aggregate);
 
-        assert_eq!(app.status, "Move to Trash unavailable for virtual nodes");
+        assert_eq!(app.status, "Cleanup queue unavailable for virtual nodes");
         assert!(app.trash_confirm_target_id.is_none());
+        assert!(app.cleanup_queue.is_empty());
+    }
+
+    #[test]
+    fn cleanup_queue_blocks_protected_paths() {
+        let mut app = DiskMapApp::default();
+        let root = app.tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        app.tree.set_root_path("/".into());
+        app.destructive_actions_enabled = true;
+
+        app.queue_cleanup_candidate(root);
+
+        assert!(app.status.starts_with("Protected path blocked: / "));
+        assert!(app.cleanup_queue.is_empty());
     }
 
     #[test]
