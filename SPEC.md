@@ -192,7 +192,8 @@ struct TreeStore {
   - [x] Include or exclude hidden files
   - [x] Follow or do not follow symlinks
 - Safe scan options are persisted with other user-facing scan options. Defaults preserve the original scan behavior: hidden files included, symlinks not followed, and filesystem boundaries not restricted until enabled.
-- [ ] Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
+- [x] Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
+- Manual rescan reuses the active scan options and starts a new scan for either the original scan root or the currently focused directory.
 
 ### Phase 4: Reporting and Size Model
 - [ ] Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields

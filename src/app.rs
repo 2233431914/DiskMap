@@ -479,6 +479,34 @@ impl DiskMapApp {
                 }
             }
 
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("RESCAN")
+                    .size(10.0)
+                    .color(palette(ui.ctx()).text_faint)
+                    .strong(),
+            );
+            if ui
+                .add_enabled(
+                    self.can_rescan_scan_root(),
+                    egui::Button::new("Root").min_size(Vec2::new(48.0, 28.0)),
+                )
+                .on_hover_text("Rescan the original scan root")
+                .clicked()
+            {
+                self.rescan_scan_root();
+            }
+            if ui
+                .add_enabled(
+                    self.can_rescan_focused_subtree(),
+                    egui::Button::new("View").min_size(Vec2::new(48.0, 28.0)),
+                )
+                .on_hover_text("Rescan the currently focused directory")
+                .clicked()
+            {
+                self.rescan_focused_subtree();
+            }
+
             ui.add_space(6.0);
 
             ui.label(
@@ -1489,11 +1517,13 @@ impl DiskMapApp {
     }
 
     fn start_scan(&mut self) {
-        self.scan.start(
-            std::path::PathBuf::from(self.path_input.trim()),
-            self.scan_options(),
-            self.tx.clone(),
-        );
+        let path = std::path::PathBuf::from(self.path_input.trim());
+        self.start_scan_path(path);
+    }
+
+    fn start_scan_path(&mut self, path: std::path::PathBuf) {
+        self.scan
+            .start(path.clone(), self.scan_options(), self.tx.clone());
 
         self.tree.clear();
         self.navigation.clear_for_new_scan();
@@ -1504,8 +1534,50 @@ impl DiskMapApp {
         self.cached_visuals.clear();
         self.reset_camera();
         self.layout_dirty = true;
-        self.status = format!("Scanning {}", self.path_input.trim());
+        self.path_input = path.display().to_string();
+        self.status = format!("Scanning {}", path.display());
         self.pending_repaint = true;
+    }
+
+    fn can_rescan_scan_root(&mut self) -> bool {
+        !self.scan.is_scanning() && self.scan_root_rescan_path().is_some()
+    }
+
+    fn can_rescan_focused_subtree(&mut self) -> bool {
+        !self.scan.is_scanning() && self.focused_subtree_rescan_path().is_some()
+    }
+
+    fn rescan_scan_root(&mut self) {
+        let Some(path) = self.scan_root_rescan_path() else {
+            self.status = "Rescan unavailable: no scan root".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+        self.start_scan_path(path);
+    }
+
+    fn rescan_focused_subtree(&mut self) {
+        let Some(path) = self.focused_subtree_rescan_path() else {
+            self.status = "Rescan unavailable: no focused directory".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+        self.start_scan_path(path);
+    }
+
+    fn scan_root_rescan_path(&mut self) -> Option<std::path::PathBuf> {
+        self.tree
+            .root
+            .and_then(|root_id| self.tree.node_real_path(root_id))
+    }
+
+    fn focused_subtree_rescan_path(&mut self) -> Option<std::path::PathBuf> {
+        self.navigation
+            .focused_root()
+            .filter(|&root_id| {
+                root_id < self.tree.len() && matches!(self.tree.node(root_id).kind, NodeKind::Dir)
+            })
+            .and_then(|root_id| self.tree.node_real_path(root_id))
     }
 
     fn cancel_scan(&mut self) {
@@ -2327,6 +2399,46 @@ mod tests {
         assert!(!options.include_hidden);
         assert!(options.follow_symlinks);
         assert!(options.stay_on_filesystem);
+    }
+
+    #[test]
+    fn rescan_paths_target_scan_root_and_focused_directory() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+
+        assert_eq!(app.scan_root_rescan_path(), Some(PathBuf::from("/root")));
+        app.enter_root(1, true);
+
+        assert_eq!(
+            app.focused_subtree_rescan_path(),
+            Some(PathBuf::from("/root/match-dir"))
+        );
+        assert!(app.can_rescan_scan_root());
+        assert!(app.can_rescan_focused_subtree());
+    }
+
+    #[test]
+    fn focused_rescan_uses_parent_directory_after_file_search_match() {
+        let mut app = app_with_search_matches();
+        app.tree.set_root_path("/root".into());
+
+        app.navigate_search_match(SearchDirection::Next);
+        app.navigate_search_match(SearchDirection::Next);
+
+        assert_eq!(app.navigation.selected_id(), Some(2));
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(
+            app.focused_subtree_rescan_path(),
+            Some(PathBuf::from("/root/match-dir"))
+        );
+    }
+
+    #[test]
+    fn rescan_is_unavailable_without_loaded_scan_root() {
+        let mut app = DiskMapApp::default();
+
+        assert!(!app.can_rescan_scan_root());
+        assert!(!app.can_rescan_focused_subtree());
     }
 
     #[test]
