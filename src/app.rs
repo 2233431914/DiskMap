@@ -38,6 +38,7 @@ const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
 const STORAGE_REALTIME_WATCH: &str = "disk_map.realtime_watch";
 const STORAGE_SQLITE_CACHE: &str = "disk_map.sqlite_cache";
 const STORAGE_SEARCH_FILTER: &str = "disk_map.search_filter";
+const STORAGE_COLOR_BY_EXTENSION: &str = "disk_map.color_by_extension";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 
@@ -252,6 +253,7 @@ pub struct DiskMapApp {
     navigation: NavigationState,
     search: SearchController,
     search_filter_enabled: bool,
+    color_by_extension: bool,
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
@@ -291,6 +293,7 @@ impl Default for DiskMapApp {
             navigation: NavigationState::default(),
             search: SearchController::default(),
             search_filter_enabled: false,
+            color_by_extension: false,
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -376,6 +379,13 @@ impl DiskMapApp {
             self.search_filter_enabled = search_filter_enabled;
         }
 
+        if let Some(color_by_extension) = storage
+            .get_string(STORAGE_COLOR_BY_EXTENSION)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.color_by_extension = color_by_extension;
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -405,6 +415,10 @@ impl DiskMapApp {
         storage.set_string(
             STORAGE_SEARCH_FILTER,
             self.search_filter_enabled.to_string(),
+        );
+        storage.set_string(
+            STORAGE_COLOR_BY_EXTENSION,
+            self.color_by_extension.to_string(),
         );
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
@@ -670,6 +684,13 @@ impl DiskMapApp {
                     [96.0, 18.0],
                     egui::Slider::new(&mut self.max_depth, 1..=10).text(""),
                 )
+                .changed()
+            {
+                self.mark_layout_dirty_now();
+            }
+            if ui
+                .checkbox(&mut self.color_by_extension, "Ext")
+                .on_hover_text("Color files by extension")
                 .changed()
             {
                 self.mark_layout_dirty_now();
@@ -1446,7 +1467,8 @@ impl DiskMapApp {
         let is_hovered =
             matches!(visual.kind, VisualKind::Node(node_id) if self.hovered_id == Some(node_id));
         let is_selected = matches!(visual.kind, VisualKind::Node(node_id) if self.navigation.selected_id() == Some(node_id));
-        let fill = fill_color_for_visual(visual, is_hovered, is_selected, palette);
+        let extension_color = self.extension_color_for_visual(visual);
+        let fill = fill_color_for_visual(visual, is_hovered, is_selected, palette, extension_color);
         let stroke = stroke_for_visual(visual, is_hovered, is_selected, palette);
 
         painter.rect_filled(visual.rect, 3.0, fill);
@@ -1470,6 +1492,21 @@ impl DiskMapApp {
                 pick_label_color(fill),
             );
         }
+    }
+
+    fn extension_color_for_visual(&self, visual: &VisualNode) -> Option<Color32> {
+        if !self.color_by_extension || visual.is_dir {
+            return None;
+        }
+        let VisualKind::Node(node_id) = visual.kind;
+        let node = self.tree.node(node_id);
+        if !matches!(
+            node.kind,
+            NodeKind::File | NodeKind::Symlink | NodeKind::Error
+        ) {
+            return None;
+        }
+        Some(color_for_extension(&node.name))
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
@@ -2154,11 +2191,12 @@ fn fill_color_for_visual(
     hovered: bool,
     selected: bool,
     palette: &Palette,
+    extension_color: Option<Color32>,
 ) -> Color32 {
     let mut color = if visual.is_dir {
         palette.dir_palette[visual.depth % palette.dir_palette.len()]
     } else {
-        palette.file_neutral
+        extension_color.unwrap_or(palette.file_neutral)
     };
 
     if visual.hidden_by_search {
@@ -2177,6 +2215,35 @@ fn fill_color_for_visual(
     }
 
     color
+}
+
+fn color_for_extension(name: &str) -> Color32 {
+    const COLORS: [Color32; 10] = [
+        Color32::from_rgb(0x6B, 0xA6, 0xD6),
+        Color32::from_rgb(0x5B, 0xB8, 0x8A),
+        Color32::from_rgb(0xD9, 0xA6, 0x4A),
+        Color32::from_rgb(0xD7, 0x6A, 0x6A),
+        Color32::from_rgb(0x9B, 0x7C, 0xD8),
+        Color32::from_rgb(0x4D, 0xB6, 0xAC),
+        Color32::from_rgb(0xC7, 0x78, 0xB7),
+        Color32::from_rgb(0x8D, 0xA3, 0x4F),
+        Color32::from_rgb(0x6F, 0x8F, 0xD8),
+        Color32::from_rgb(0xB8, 0x86, 0x5B),
+    ];
+    let ext = file_extension_key(name);
+    let mut hash = 0usize;
+    for byte in ext.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as usize);
+    }
+    COLORS[hash % COLORS.len()]
+}
+
+fn file_extension_key(name: &str) -> String {
+    let trimmed = name.trim();
+    let Some((_, ext)) = trimmed.rsplit_once('.') else {
+        return String::new();
+    };
+    ext.to_ascii_lowercase()
 }
 
 fn stroke_for_visual(
@@ -2758,6 +2825,9 @@ mod tests {
         storage
             .values
             .insert(STORAGE_SEARCH_FILTER.into(), "true".into());
+        storage
+            .values
+            .insert(STORAGE_COLOR_BY_EXTENSION.into(), "true".into());
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2772,6 +2842,7 @@ mod tests {
         assert!(app.realtime_watch_enabled);
         assert!(app.sqlite_cache_enabled);
         assert!(app.search_filter_enabled);
+        assert!(app.color_by_extension);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2788,6 +2859,7 @@ mod tests {
             realtime_watch_enabled: true,
             sqlite_cache_enabled: true,
             search_filter_enabled: true,
+            color_by_extension: true,
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2850,9 +2922,29 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            storage
+                .values
+                .get(STORAGE_COLOR_BY_EXTENSION)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
             storage.values.get(STORAGE_THEME).map(String::as_str),
             Some("light")
         );
+    }
+
+    #[test]
+    fn extension_color_is_stable_for_case_variants() {
+        assert_eq!(
+            color_for_extension("photo.JPG"),
+            color_for_extension("x.jpg")
+        );
+    }
+
+    #[test]
+    fn extension_key_is_empty_without_extension() {
+        assert_eq!(file_extension_key("README"), "");
     }
 
     #[test]

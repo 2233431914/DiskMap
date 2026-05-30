@@ -223,7 +223,8 @@ struct TreeStore {
 - SQLite remains disabled by default. The experimental `SQLite` toolbar setting switches scan cache mode to `Enabled` and is persisted with other scan options.
 - [x] Search and filter
 - Filter mode is an optional search display mode. It does not change search scope; it only removes non-matching branches from treemap layout while preserving the current focused subtree.
-- [ ] Extension-based coloring
+- [x] Extension-based coloring
+- The optional `Ext` color mode keeps directory colors unchanged and assigns files stable colors based on lowercase extension.
 - [ ] Move to Trash functionality with confirmation and reliable platform adapter
 
 ### Phase 8: Analysis Workflows
