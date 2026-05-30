@@ -61,6 +61,7 @@
 ### 3.5 Preferences
 - [x] Persist last scan path, window size, theme, depth, and current user-facing scan options
 - [x] Restore persisted preferences on startup
+- [x] Persist recent scan roots and pinned favorites for repeat analysis
 
 ## 4. Architecture
 
@@ -236,7 +237,8 @@ struct TreeStore {
 - Trash remains runtime-gated by `Allow Trash`, is not persisted as enabled, and is unavailable for virtual aggregate nodes.
 
 ### Phase 8: Analysis Workflows
-- [ ] Recent scan roots and pinned favorites for repeat analysis
+- [x] Recent scan roots and pinned favorites for repeat analysis
+- The `Roots` menu keeps successful scan roots in a capped recent list and stores pinned favorites separately in local preferences. Selecting a root starts a new scan with the current scan options.
 - [ ] Snapshot comparison to show growth, shrinkage, and newly added large paths between scans
 - [ ] Optional duplicate-file candidate analysis as a read-only report before any cleanup workflow
 - [ ] File age and file type insights, including modified-time filters and category summaries

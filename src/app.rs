@@ -39,8 +39,12 @@ const STORAGE_REALTIME_WATCH: &str = "disk_map.realtime_watch";
 const STORAGE_SQLITE_CACHE: &str = "disk_map.sqlite_cache";
 const STORAGE_SEARCH_FILTER: &str = "disk_map.search_filter";
 const STORAGE_COLOR_BY_EXTENSION: &str = "disk_map.color_by_extension";
+const STORAGE_RECENT_ROOTS: &str = "disk_map.recent_roots";
+const STORAGE_PINNED_ROOTS: &str = "disk_map.pinned_roots";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
+const MAX_RECENT_ROOTS: usize = 10;
+const MAX_PINNED_ROOTS: usize = 12;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -254,6 +258,8 @@ pub struct DiskMapApp {
     search: SearchController,
     search_filter_enabled: bool,
     color_by_extension: bool,
+    recent_roots: Vec<String>,
+    pinned_roots: Vec<String>,
     scan: ScanSession,
     hovered_id: Option<NodeId>,
     context_menu_target_id: Option<NodeId>,
@@ -296,6 +302,8 @@ impl Default for DiskMapApp {
             search: SearchController::default(),
             search_filter_enabled: false,
             color_by_extension: false,
+            recent_roots: Vec::new(),
+            pinned_roots: Vec::new(),
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -390,6 +398,14 @@ impl DiskMapApp {
             self.color_by_extension = color_by_extension;
         }
 
+        if let Some(recent_roots) = storage.get_string(STORAGE_RECENT_ROOTS) {
+            self.recent_roots = parse_stored_paths(&recent_roots, MAX_RECENT_ROOTS);
+        }
+
+        if let Some(pinned_roots) = storage.get_string(STORAGE_PINNED_ROOTS) {
+            self.pinned_roots = parse_stored_paths(&pinned_roots, MAX_PINNED_ROOTS);
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -424,6 +440,8 @@ impl DiskMapApp {
             STORAGE_COLOR_BY_EXTENSION,
             self.color_by_extension.to_string(),
         );
+        storage.set_string(STORAGE_RECENT_ROOTS, serialize_paths(&self.recent_roots));
+        storage.set_string(STORAGE_PINNED_ROOTS, serialize_paths(&self.pinned_roots));
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
             storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
@@ -546,6 +564,8 @@ impl DiskMapApp {
             if path_edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.start_scan();
             }
+
+            self.show_roots_menu(ui);
 
             let scan_label = if self.scan.is_scanning() {
                 "Cancel"
@@ -706,6 +726,66 @@ impl DiskMapApp {
                 }
             });
         });
+    }
+
+    fn show_roots_menu(&mut self, ui: &mut egui::Ui) {
+        let pin_candidate = self.current_root_candidate();
+        let is_pinned = pin_candidate
+            .as_deref()
+            .is_some_and(|path| self.is_root_pinned(path));
+
+        ui.menu_button("Roots", |ui| {
+            ui.set_min_width(280.0);
+            let can_pin = pin_candidate.is_some();
+            let pin_label = if is_pinned {
+                "Unpin Current"
+            } else {
+                "Pin Current"
+            };
+            if ui
+                .add_enabled(can_pin, egui::Button::new(pin_label))
+                .clicked()
+            {
+                if let Some(path) = pin_candidate.as_deref() {
+                    self.toggle_pinned_root(path);
+                }
+                ui.close();
+            }
+
+            ui.separator();
+            self.show_root_menu_group(ui, "Pinned", self.pinned_roots.clone());
+            self.show_root_menu_group(ui, "Recent", self.recent_roots.clone());
+        })
+        .response
+        .on_hover_text("Open recent and pinned scan roots");
+    }
+
+    fn show_root_menu_group(&mut self, ui: &mut egui::Ui, label: &str, roots: Vec<String>) {
+        ui.label(
+            RichText::new(label)
+                .size(10.0)
+                .strong()
+                .color(palette(ui.ctx()).text_faint),
+        );
+        if roots.is_empty() {
+            ui.label(
+                RichText::new("None")
+                    .small()
+                    .color(palette(ui.ctx()).text_faint),
+            );
+            return;
+        }
+
+        for path in roots {
+            if ui
+                .button(truncate_middle(&path, 54))
+                .on_hover_text(&path)
+                .clicked()
+            {
+                self.start_scan_path(PathBuf::from(path));
+                ui.close();
+            }
+        }
     }
 
     fn show_details_panel(&mut self, ui: &mut egui::Ui) {
@@ -1596,6 +1676,7 @@ impl DiskMapApp {
                 } => {
                     self.scan.mark_started();
                     self.status = format!("Scanning {}", path.display());
+                    self.record_recent_root(&path);
                     self.tree.clear();
                     self.tree.push_node(None, root_node);
                     self.tree.set_root_path(path);
@@ -1712,6 +1793,39 @@ impl DiskMapApp {
     fn apply_progress(&mut self, progress: ProgressSnapshot) {
         self.scan.apply_progress(progress);
         self.status = "Scanning...".to_string();
+    }
+
+    fn current_root_candidate(&mut self) -> Option<String> {
+        self.scan_root_rescan_path()
+            .or_else(|| normalized_path_candidate(&self.path_input).map(PathBuf::from))
+            .map(|path| path.display().to_string())
+    }
+
+    fn is_root_pinned(&self, path: &str) -> bool {
+        self.pinned_roots.iter().any(|existing| existing == path)
+    }
+
+    fn toggle_pinned_root(&mut self, path: &str) {
+        if let Some(index) = self
+            .pinned_roots
+            .iter()
+            .position(|existing| existing == path)
+        {
+            self.pinned_roots.remove(index);
+            self.status = format!("Unpinned {}", truncate_middle(path, 48));
+        } else {
+            push_unique_front(&mut self.pinned_roots, path.to_string(), MAX_PINNED_ROOTS);
+            self.status = format!("Pinned {}", truncate_middle(path, 48));
+        }
+        self.pending_repaint = true;
+    }
+
+    fn record_recent_root(&mut self, path: &Path) {
+        push_unique_front(
+            &mut self.recent_roots,
+            path.display().to_string(),
+            MAX_RECENT_ROOTS,
+        );
     }
 
     fn finished_status(&self, total_bytes: u64) -> String {
@@ -2224,9 +2338,13 @@ impl DiskMapApp {
         }
 
         match message {
-            ScanMessage::Started { root_node, .. } => {
+            ScanMessage::Started {
+                path, root_node, ..
+            } => {
                 self.tree.clear();
                 self.tree.push_node(None, root_node);
+                self.tree.set_root_path(path.clone());
+                self.record_recent_root(&path);
                 self.navigation.set_scan_root(self.tree.root);
                 self.navigation.rebuild_breadcrumb_cache(&self.tree);
             }
@@ -2521,6 +2639,45 @@ fn parse_storage_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn parse_stored_paths(value: &str, limit: usize) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in value.lines() {
+        let Some(path) = normalized_path_candidate(line) else {
+            continue;
+        };
+        if paths.iter().any(|existing| existing == &path) {
+            continue;
+        }
+        paths.push(path);
+        if paths.len() >= limit {
+            break;
+        }
+    }
+    paths
+}
+
+fn serialize_paths(paths: &[String]) -> String {
+    paths.join("\n")
+}
+
+fn normalized_path_candidate(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn push_unique_front(paths: &mut Vec<String>, path: String, limit: usize) {
+    if path.is_empty() || limit == 0 {
+        return;
+    }
+    paths.retain(|existing| existing != &path);
+    paths.insert(0, path);
+    paths.truncate(limit);
 }
 
 fn theme_preference_name(theme: Theme) -> &'static str {
@@ -2892,6 +3049,14 @@ mod tests {
         storage
             .values
             .insert(STORAGE_COLOR_BY_EXTENSION.into(), "true".into());
+        storage.values.insert(
+            STORAGE_RECENT_ROOTS.into(),
+            "/recent-a\n\n/recent-b\n/recent-a".into(),
+        );
+        storage.values.insert(
+            STORAGE_PINNED_ROOTS.into(),
+            "/pinned-a\n/pinned-b\n/pinned-a".into(),
+        );
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2907,6 +3072,8 @@ mod tests {
         assert!(app.sqlite_cache_enabled);
         assert!(app.search_filter_enabled);
         assert!(app.color_by_extension);
+        assert_eq!(app.recent_roots, vec!["/recent-a", "/recent-b"]);
+        assert_eq!(app.pinned_roots, vec!["/pinned-a", "/pinned-b"]);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2924,6 +3091,8 @@ mod tests {
             sqlite_cache_enabled: true,
             search_filter_enabled: true,
             color_by_extension: true,
+            recent_roots: vec!["/recent".into(), "/older".into()],
+            pinned_roots: vec!["/pinned".into()],
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2996,6 +3165,64 @@ mod tests {
             storage.values.get(STORAGE_THEME).map(String::as_str),
             Some("light")
         );
+        assert_eq!(
+            storage.values.get(STORAGE_RECENT_ROOTS).map(String::as_str),
+            Some("/recent\n/older")
+        );
+        assert_eq!(
+            storage.values.get(STORAGE_PINNED_ROOTS).map(String::as_str),
+            Some("/pinned")
+        );
+    }
+
+    #[test]
+    fn record_recent_root_deduplicates_and_caps_history() {
+        let mut app = DiskMapApp::default();
+
+        for index in 0..12 {
+            app.record_recent_root(&PathBuf::from(format!("/root-{index}")));
+        }
+        app.record_recent_root(&PathBuf::from("/root-4"));
+
+        assert_eq!(
+            app.recent_roots.first().map(String::as_str),
+            Some("/root-4")
+        );
+        assert_eq!(app.recent_roots.len(), MAX_RECENT_ROOTS);
+        assert_eq!(
+            app.recent_roots
+                .iter()
+                .filter(|path| path.as_str() == "/root-4")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn started_scan_message_records_recent_root() {
+        let mut app = app_for_scan(1);
+
+        app.apply_scan_message_for_test(root_started(1));
+
+        assert_eq!(app.recent_roots, vec!["/root"]);
+    }
+
+    #[test]
+    fn pinned_roots_toggle_without_touching_recent_roots() {
+        let mut app = DiskMapApp {
+            recent_roots: vec!["/root".into()],
+            ..Default::default()
+        };
+
+        app.toggle_pinned_root("/root");
+        assert_eq!(app.pinned_roots, vec!["/root"]);
+        assert_eq!(app.recent_roots, vec!["/root"]);
+        assert_eq!(app.status, "Pinned /root");
+
+        app.toggle_pinned_root("/root");
+        assert!(app.pinned_roots.is_empty());
+        assert_eq!(app.recent_roots, vec!["/root"]);
+        assert_eq!(app.status, "Unpinned /root");
     }
 
     #[test]
