@@ -201,7 +201,8 @@ struct TreeStore {
 - Export actions write timestamped `disk-map-export-*` files to the current working directory and report the saved path in status.
 - [x] Clearly display the active size basis, such as apparent size or allocated size on disk
 - Current size basis is shown in details/progress UI. On Unix it is allocated size from filesystem blocks when available, with apparent byte length fallback; on other platforms it is apparent byte length from metadata.
-- [ ] Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
+- [x] Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
+- Decision: do not expose a size basis toggle yet. `TreeStore` currently stores one canonical size per node, and scanner/cache/export paths do not retain both apparent and allocated sizes. A future toggle must first add dual-size fields and migration tests so switching basis changes aggregation, treemap area, progress, and exports consistently.
 
 ### Phase 5: Real-time Monitoring
 - [ ] Add notify crate (FSEvents/kqueue)
