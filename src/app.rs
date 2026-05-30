@@ -9,6 +9,7 @@ use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{
     layout_treemap, Camera, LayoutScratch, TreemapLayoutParams, VisualKind, VisualNode,
 };
+use crate::watcher::{WatchPoll, WatchSession};
 
 mod navigation;
 mod scan_session;
@@ -34,6 +35,7 @@ const STORAGE_EXCLUDE_INPUT: &str = "disk_map.exclude_input";
 const STORAGE_INCLUDE_HIDDEN: &str = "disk_map.include_hidden";
 const STORAGE_FOLLOW_SYMLINKS: &str = "disk_map.follow_symlinks";
 const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
+const STORAGE_REALTIME_WATCH: &str = "disk_map.realtime_watch";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 
@@ -228,6 +230,8 @@ pub struct DiskMapApp {
     include_hidden: bool,
     follow_symlinks: bool,
     stay_on_filesystem: bool,
+    realtime_watch_enabled: bool,
+    watcher: Option<WatchSession>,
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
@@ -259,6 +263,8 @@ impl Default for DiskMapApp {
             include_hidden: ScanOptions::default().include_hidden,
             follow_symlinks: ScanOptions::default().follow_symlinks,
             stay_on_filesystem: ScanOptions::default().stay_on_filesystem,
+            realtime_watch_enabled: false,
+            watcher: None,
             initial_scan_pending: true,
             tx,
             rx,
@@ -329,6 +335,13 @@ impl DiskMapApp {
             self.stay_on_filesystem = stay_on_filesystem;
         }
 
+        if let Some(realtime_watch_enabled) = storage
+            .get_string(STORAGE_REALTIME_WATCH)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.realtime_watch_enabled = realtime_watch_enabled;
+        }
+
         if let Some(depth) = storage
             .get_string(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
@@ -349,6 +362,10 @@ impl DiskMapApp {
         storage.set_string(
             STORAGE_STAY_ON_FILESYSTEM,
             self.stay_on_filesystem.to_string(),
+        );
+        storage.set_string(
+            STORAGE_REALTIME_WATCH,
+            self.realtime_watch_enabled.to_string(),
         );
         storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
@@ -375,6 +392,7 @@ impl eframe::App for DiskMapApp {
         }
         self.handle_keyboard(ctx);
         self.handle_scan_messages();
+        self.handle_watch_events();
         self.maybe_refresh_search(ctx);
         self.maybe_request_deferred_repaint(ctx);
         self.drive_background_updates(ctx);
@@ -531,6 +549,13 @@ impl DiskMapApp {
                 .on_hover_text("Follow symlinked directories during scan");
             ui.checkbox(&mut self.stay_on_filesystem, "Same FS")
                 .on_hover_text("Stay on the scan root filesystem when supported");
+
+            let before_watch = self.realtime_watch_enabled;
+            ui.checkbox(&mut self.realtime_watch_enabled, "Watch")
+                .on_hover_text("Watch the scan root and rescan after debounced filesystem changes");
+            if self.realtime_watch_enabled != before_watch {
+                self.update_watch_state();
+            }
 
             ui.add_space(6.0);
 
@@ -1465,6 +1490,7 @@ impl DiskMapApp {
                     self.refresh_search_matches();
                     self.layout_dirty = true;
                     self.status = self.finished_status(total_bytes);
+                    self.update_watch_state();
                     self.pending_repaint = true;
                     eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
@@ -1585,12 +1611,49 @@ impl DiskMapApp {
         }
     }
 
+    fn handle_watch_events(&mut self) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+
+        match watcher.poll(Instant::now()) {
+            WatchPoll::Noop => {}
+            WatchPoll::Pending => {
+                self.pending_repaint = true;
+            }
+            WatchPoll::Ready(change) => {
+                let change_count = change.paths.len();
+                if self.scan.is_scanning() {
+                    self.status = format!(
+                        "Watch noticed {} while scan is running",
+                        pluralize(change_count as u64, "change", "changes")
+                    );
+                    self.pending_repaint = true;
+                    return;
+                }
+                if let Some(path) = self.scan_root_rescan_path() {
+                    self.status = format!(
+                        "Watch rescan after {}",
+                        pluralize(change_count as u64, "change", "changes")
+                    );
+                    self.start_scan_path(path);
+                }
+            }
+            WatchPoll::Error(error) => {
+                self.status = format!("Watch failed: {error}");
+                self.watcher = None;
+                self.pending_repaint = true;
+            }
+        }
+    }
+
     fn start_scan(&mut self) {
         let path = std::path::PathBuf::from(self.path_input.trim());
         self.start_scan_path(path);
     }
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
+        self.stop_watching();
         self.scan
             .start(path.clone(), self.scan_options(), self.tx.clone());
 
@@ -1606,6 +1669,43 @@ impl DiskMapApp {
         self.path_input = path.display().to_string();
         self.status = format!("Scanning {}", path.display());
         self.pending_repaint = true;
+    }
+
+    fn update_watch_state(&mut self) {
+        if !self.realtime_watch_enabled {
+            self.stop_watching();
+            return;
+        }
+
+        let Some(root_path) = self.scan_root_rescan_path() else {
+            self.stop_watching();
+            return;
+        };
+
+        if self
+            .watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.root_path() == &root_path)
+        {
+            return;
+        }
+
+        match WatchSession::start(root_path.clone()) {
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                self.status = format!("Watching {}", root_path.display());
+                self.pending_repaint = true;
+            }
+            Err(error) => {
+                self.watcher = None;
+                self.status = format!("Watch failed: {error}");
+                self.pending_repaint = true;
+            }
+        }
+    }
+
+    fn stop_watching(&mut self) {
+        self.watcher = None;
     }
 
     fn can_rescan_scan_root(&mut self) -> bool {
@@ -1810,6 +1910,8 @@ impl DiskMapApp {
     fn drive_background_updates(&self, ctx: &egui::Context) {
         if self.scan.is_scanning() {
             // Keep the UI alive while scan batches arrive, even when there is no user input.
+            ctx.request_repaint_after(LAYOUT_REFRESH_INTERVAL);
+        } else if self.watcher.is_some() {
             ctx.request_repaint_after(LAYOUT_REFRESH_INTERVAL);
         } else if self.search.is_dirty() {
             ctx.request_repaint_after(SEARCH_REFRESH_INTERVAL);
@@ -2414,6 +2516,14 @@ mod tests {
     }
 
     #[test]
+    fn realtime_watch_defaults_to_disabled() {
+        let app = DiskMapApp::default();
+
+        assert!(!app.realtime_watch_enabled);
+        assert!(app.watcher.is_none());
+    }
+
+    #[test]
     fn preferences_restore_path_depth_and_theme() {
         let mut storage = TestStorage::default();
         storage
@@ -2431,6 +2541,9 @@ mod tests {
         storage
             .values
             .insert(STORAGE_STAY_ON_FILESYSTEM.into(), "true".into());
+        storage
+            .values
+            .insert(STORAGE_REALTIME_WATCH.into(), "true".into());
         storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
         storage.values.insert(STORAGE_THEME.into(), "dark".into());
         let mut app = DiskMapApp::default();
@@ -2442,6 +2555,7 @@ mod tests {
         assert!(!app.include_hidden);
         assert!(app.follow_symlinks);
         assert!(app.stay_on_filesystem);
+        assert!(app.realtime_watch_enabled);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
     }
@@ -2455,6 +2569,7 @@ mod tests {
             include_hidden: false,
             follow_symlinks: true,
             stay_on_filesystem: true,
+            realtime_watch_enabled: true,
             max_depth: 4,
             theme_preference: Some(Theme::Light),
             ..Default::default()
@@ -2495,6 +2610,13 @@ mod tests {
             storage
                 .values
                 .get(STORAGE_STAY_ON_FILESYSTEM)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            storage
+                .values
+                .get(STORAGE_REALTIME_WATCH)
                 .map(String::as_str),
             Some("true")
         );

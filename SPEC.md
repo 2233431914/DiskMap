@@ -205,8 +205,10 @@ struct TreeStore {
 - Decision: do not expose a size basis toggle yet. `TreeStore` currently stores one canonical size per node, and scanner/cache/export paths do not retain both apparent and allocated sizes. A future toggle must first add dual-size fields and migration tests so switching basis changes aggregation, treemap area, progress, and exports consistently.
 
 ### Phase 5: Real-time Monitoring
-- [ ] Add notify crate (FSEvents/kqueue)
-- [ ] Debounce 300-1000ms
+- [x] Add notify crate (FSEvents/kqueue)
+- [x] Debounce 300-1000ms
+- [x] Add default-off Watch control for debounced scan-root rescans after filesystem changes
+- Watch is disabled by default and only observes the current scan root when enabled. Current implementation performs a safe full rescan after debounced events; true changed-directory subtree replacement remains separate work.
 - [ ] Incremental rescan of changed directories
 
 ### Phase 6: Treemap Upgrade
