@@ -1,5 +1,6 @@
 use crate::cleanup::{
-    protected_path_reason, CleanupCandidate, CleanupQueue, ProtectedPathReason, QueueAddResult,
+    parse_protected_paths, protected_path_reason_with_deny_list, CleanupCandidate, CleanupQueue,
+    ProtectedPathReason, QueueAddResult,
 };
 use crate::duplicates::{find_duplicate_candidates, DuplicateCandidate, DuplicateReport};
 use crate::export::{export_focused_report, export_subtree, ExportFormat, FocusedReportMetadata};
@@ -43,6 +44,7 @@ const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
 const STORAGE_PATH_INPUT: &str = "disk_map.path_input";
 const STORAGE_EXCLUDE_INPUT: &str = "disk_map.exclude_input";
+const STORAGE_PROTECTED_PATHS: &str = "disk_map.protected_paths";
 const STORAGE_INCLUDE_HIDDEN: &str = "disk_map.include_hidden";
 const STORAGE_FOLLOW_SYMLINKS: &str = "disk_map.follow_symlinks";
 const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
@@ -254,6 +256,7 @@ fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
 pub struct DiskMapApp {
     path_input: String,
     exclude_input: String,
+    protected_paths_input: String,
     include_hidden: bool,
     follow_symlinks: bool,
     stay_on_filesystem: bool,
@@ -303,6 +306,7 @@ impl Default for DiskMapApp {
         Self {
             path_input: dirs_home_fallback(),
             exclude_input: String::new(),
+            protected_paths_input: String::new(),
             include_hidden: ScanOptions::default().include_hidden,
             follow_symlinks: ScanOptions::default().follow_symlinks,
             stay_on_filesystem: ScanOptions::default().stay_on_filesystem,
@@ -370,6 +374,10 @@ impl DiskMapApp {
 
         if let Some(exclude_input) = storage.get_string(STORAGE_EXCLUDE_INPUT) {
             self.exclude_input = exclude_input;
+        }
+
+        if let Some(protected_paths_input) = storage.get_string(STORAGE_PROTECTED_PATHS) {
+            self.protected_paths_input = protected_paths_input;
         }
 
         if let Some(include_hidden) = storage
@@ -444,6 +452,7 @@ impl DiskMapApp {
     fn save_preferences(&self, storage: &mut dyn eframe::Storage) {
         storage.set_string(STORAGE_PATH_INPUT, self.path_input.clone());
         storage.set_string(STORAGE_EXCLUDE_INPUT, self.exclude_input.clone());
+        storage.set_string(STORAGE_PROTECTED_PATHS, self.protected_paths_input.clone());
         storage.set_string(STORAGE_INCLUDE_HIDDEN, self.include_hidden.to_string());
         storage.set_string(STORAGE_FOLLOW_SYMLINKS, self.follow_symlinks.to_string());
         storage.set_string(
@@ -1002,6 +1011,14 @@ impl DiskMapApp {
             self.trash_confirm_target_id = None;
         }
         if self.destructive_actions_enabled {
+            ui.add_space(4.0);
+            ui.add_sized(
+                [ui.available_width(), 26.0],
+                egui::TextEdit::singleline(&mut self.protected_paths_input)
+                    .hint_text("Protected paths"),
+            )
+            .on_hover_text("Extra protected roots; comma, semicolon, or newline separated");
+
             let queue_enabled = path_available;
             let label = if self.cleanup_queue.contains_node(node_id) {
                 "Queued for Trash"
@@ -2125,7 +2142,7 @@ impl DiskMapApp {
             return;
         };
 
-        if let Some(reason) = protected_path_reason(&path) {
+        if let Some(reason) = self.protected_path_reason(&path) {
             self.status = protected_path_status(reason, &path);
             self.pending_repaint = true;
             return;
@@ -2162,7 +2179,7 @@ impl DiskMapApp {
             return;
         };
 
-        if let Some(reason) = protected_path_reason(&candidate.path) {
+        if let Some(reason) = self.protected_path_reason(&candidate.path) {
             self.trash_confirm_target_id = None;
             self.status = protected_path_status(reason, &candidate.path);
             self.pending_repaint = true;
@@ -2219,6 +2236,11 @@ impl DiskMapApp {
             stack.extend(self.tree.node(id).children.iter().copied());
         }
         count
+    }
+
+    fn protected_path_reason(&self, path: &Path) -> Option<ProtectedPathReason> {
+        let user_deny_list = parse_protected_paths(&self.protected_paths_input);
+        protected_path_reason_with_deny_list(path, &user_deny_list)
     }
 
     fn handle_watch_events(&mut self) {
@@ -3769,6 +3791,9 @@ mod tests {
             .insert(STORAGE_EXCLUDE_INPUT.into(), ".git,target".into());
         storage
             .values
+            .insert(STORAGE_PROTECTED_PATHS.into(), "/keep,/safe".into());
+        storage
+            .values
             .insert(STORAGE_INCLUDE_HIDDEN.into(), "false".into());
         storage
             .values
@@ -3804,6 +3829,7 @@ mod tests {
 
         assert_eq!(app.path_input, "/restored");
         assert_eq!(app.exclude_input, ".git,target");
+        assert_eq!(app.protected_paths_input, "/keep,/safe");
         assert!(!app.include_hidden);
         assert!(app.follow_symlinks);
         assert!(app.stay_on_filesystem);
@@ -3823,6 +3849,7 @@ mod tests {
         let app = DiskMapApp {
             path_input: "/next".into(),
             exclude_input: "node_modules;target".into(),
+            protected_paths_input: "/keep\n/safe".into(),
             include_hidden: false,
             follow_symlinks: true,
             stay_on_filesystem: true,
@@ -3853,6 +3880,13 @@ mod tests {
                 .get(STORAGE_EXCLUDE_INPUT)
                 .map(String::as_str),
             Some("node_modules;target")
+        );
+        assert_eq!(
+            storage
+                .values
+                .get(STORAGE_PROTECTED_PATHS)
+                .map(String::as_str),
+            Some("/keep\n/safe")
         );
         assert_eq!(
             storage
@@ -4329,6 +4363,21 @@ mod tests {
         app.queue_cleanup_candidate(root);
 
         assert!(app.status.starts_with("Protected path blocked: / "));
+        assert!(app.cleanup_queue.is_empty());
+    }
+
+    #[test]
+    fn cleanup_queue_blocks_user_protected_paths() {
+        let mut app = app_with_search_matches();
+        app.protected_paths_input = "/root/match-dir".into();
+        app.destructive_actions_enabled = true;
+
+        app.queue_cleanup_candidate(2);
+
+        assert!(app
+            .status
+            .contains("Protected path blocked: /root/match-dir/match-file"));
+        assert!(app.status.contains("user protected path"));
         assert!(app.cleanup_queue.is_empty());
     }
 

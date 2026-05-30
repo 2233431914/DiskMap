@@ -260,8 +260,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 ### Phase 9: Cleanup Workflow Safety
 - [x] Add a review queue for cleanup candidates before any destructive action
 - The selected node can only be queued for Trash; actual platform Trash actions are launched from the cleanup queue after a second confirmation. Queue rows show path, size, kind, and affected item count.
-- [ ] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
-- Built-in guardrails currently block filesystem root, the home root, common system locations, and mounted volume roots. User-configured deny lists remain pending.
+- [x] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
+- Guardrails block filesystem root, the home root, common system locations, mounted volume roots, and user-configured protected roots. User paths are comma, semicolon, or newline separated and apply to the path itself plus descendants.
 - [ ] Require explicit confirmation with path, size, and affected item count before Move to Trash
 - [ ] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
 

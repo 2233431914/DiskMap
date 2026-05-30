@@ -81,6 +81,7 @@ pub enum ProtectedPathReason {
     HomeRoot,
     SystemLocation,
     MountedVolumeRoot,
+    UserDenyList,
 }
 
 impl ProtectedPathReason {
@@ -90,11 +91,19 @@ impl ProtectedPathReason {
             Self::HomeRoot => "home folder root",
             Self::SystemLocation => "system location",
             Self::MountedVolumeRoot => "mounted volume root",
+            Self::UserDenyList => "user protected path",
         }
     }
 }
 
 pub fn protected_path_reason(path: &Path) -> Option<ProtectedPathReason> {
+    protected_path_reason_with_deny_list(path, &[])
+}
+
+pub fn protected_path_reason_with_deny_list(
+    path: &Path,
+    user_deny_list: &[PathBuf],
+) -> Option<ProtectedPathReason> {
     if path == Path::new("/") {
         return Some(ProtectedPathReason::FilesystemRoot);
     }
@@ -122,7 +131,29 @@ pub fn protected_path_reason(path: &Path) -> Option<ProtectedPathReason> {
         return Some(ProtectedPathReason::SystemLocation);
     }
 
+    if user_deny_list
+        .iter()
+        .any(|denied| path == denied || path.starts_with(denied))
+    {
+        return Some(ProtectedPathReason::UserDenyList);
+    }
+
     None
+}
+
+pub fn parse_protected_paths(input: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in input
+        .split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 #[cfg(test)]
@@ -182,5 +213,31 @@ mod tests {
             Some(ProtectedPathReason::MountedVolumeRoot)
         );
         assert_eq!(protected_path_reason(Path::new("/tmp/file.txt")), None);
+    }
+
+    #[test]
+    fn protected_paths_include_user_deny_list_descendants() {
+        let denied = vec![PathBuf::from("/Users/me/keep")];
+
+        assert_eq!(
+            protected_path_reason_with_deny_list(Path::new("/Users/me/keep/cache"), &denied),
+            Some(ProtectedPathReason::UserDenyList)
+        );
+        assert_eq!(
+            protected_path_reason_with_deny_list(Path::new("/Users/me/other"), &denied),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_protected_paths_splits_and_deduplicates() {
+        assert_eq!(
+            parse_protected_paths("/a, /b; /a\n/c"),
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c")
+            ]
+        );
     }
 }
