@@ -262,7 +262,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - The selected node can only be queued for Trash; actual platform Trash actions are launched from the cleanup queue after a second confirmation. Queue rows show path, size, kind, and affected item count.
 - [x] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
 - Guardrails block filesystem root, the home root, common system locations, mounted volume roots, and user-configured protected roots. User paths are comma, semicolon, or newline separated and apply to the path itself plus descendants.
-- [ ] Require explicit confirmation with path, size, and affected item count before Move to Trash
+- [x] Require explicit confirmation with path, size, and affected item count before Move to Trash
+- The queued Trash action first enters a confirmation state and reports the target path, selected byte size, and affected item count before the second click can call the platform Trash adapter.
 - [ ] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
 
 ### Phase 10: Accessibility and Packaging
