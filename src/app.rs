@@ -1,5 +1,5 @@
 use crate::duplicates::{find_duplicate_candidates, DuplicateCandidate, DuplicateReport};
-use crate::export::{export_subtree, ExportFormat};
+use crate::export::{export_focused_report, export_subtree, ExportFormat, FocusedReportMetadata};
 use crate::format::format_bytes;
 use crate::insights::{
     analyze_insights, AgeBucketSummary, FileTypeSummary, InsightReport, OldLargeFile,
@@ -1067,6 +1067,18 @@ impl DiskMapApp {
                     self.export_scan_root(ExportFormat::Json);
                 }
             });
+        }
+        ui.add_space(4.0);
+        let report_width = ui.available_width();
+        if ui
+            .add_enabled(
+                focused_export_id.is_some(),
+                egui::Button::new("Export Report JSON").min_size(Vec2::new(report_width, 28.0)),
+            )
+            .on_hover_text("Export current view data plus metadata needed to reproduce this view")
+            .clicked()
+        {
+            self.export_focused_report_json();
         }
         ui.add_space(4.0);
         let duplicate_width = ui.available_width();
@@ -2353,6 +2365,24 @@ impl DiskMapApp {
         self.pending_repaint = true;
     }
 
+    fn export_focused_report_json(&mut self) {
+        let Some(root_id) = self.navigation.focused_root() else {
+            self.status = "Report export unavailable: no focused directory".to_string();
+            self.pending_repaint = true;
+            return;
+        };
+
+        match self.write_focused_report(root_id) {
+            Ok(path) => {
+                self.status = format!("Exported report to {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("Report export failed: {error}");
+            }
+        }
+        self.pending_repaint = true;
+    }
+
     fn analyze_duplicate_candidates(&mut self) {
         let Some(root_id) = self.navigation.focused_root() else {
             self.duplicate_report = None;
@@ -2428,6 +2458,57 @@ impl DiskMapApp {
         let output_path = default_export_path(format);
         std::fs::write(&output_path, content)?;
         Ok(output_path)
+    }
+
+    fn write_focused_report(&mut self, root_id: NodeId) -> anyhow::Result<PathBuf> {
+        if root_id >= self.tree.len() {
+            anyhow::bail!("focused directory is no longer available");
+        }
+
+        let metadata = self.focused_report_metadata(root_id)?;
+        let content = export_focused_report(&mut self.tree, root_id, &metadata);
+        let output_path = default_report_path();
+        std::fs::write(&output_path, content)?;
+        Ok(output_path)
+    }
+
+    fn focused_report_metadata(
+        &mut self,
+        root_id: NodeId,
+    ) -> anyhow::Result<FocusedReportMetadata> {
+        let scan_root_id = self
+            .tree
+            .root
+            .ok_or_else(|| anyhow::anyhow!("scan root is no longer available"))?;
+        let scan_root_path = self
+            .tree
+            .node_real_path(scan_root_id)
+            .ok_or_else(|| anyhow::anyhow!("scan root has no real path"))?;
+        let focused_path = self
+            .tree
+            .node_real_path(root_id)
+            .ok_or_else(|| anyhow::anyhow!("focused node has no real path"))?;
+
+        Ok(FocusedReportMetadata {
+            generated_at_unix_secs: current_unix_secs(),
+            scan_root_path: scan_root_path.display().to_string(),
+            focused_path: focused_path.display().to_string(),
+            size_basis: size_basis_label(),
+            max_depth: self.max_depth,
+            search_query: self.search.query().to_string(),
+            search_filter_enabled: self.search_filter_enabled,
+            color_mode: if self.color_by_extension {
+                "extension"
+            } else {
+                "directory-depth"
+            },
+            include_hidden: self.include_hidden,
+            follow_symlinks: self.follow_symlinks,
+            stay_on_filesystem: self.stay_on_filesystem,
+            sqlite_cache_enabled: self.sqlite_cache_enabled,
+            realtime_watch_enabled: self.realtime_watch_enabled,
+            exclude_patterns: parse_exclude_patterns(&self.exclude_input),
+        })
     }
 
     fn cancel_scan(&mut self) {
@@ -3245,14 +3326,16 @@ fn format_signed_bytes(delta: i128) -> String {
 }
 
 fn default_export_path(format: ExportFormat) -> PathBuf {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+    let timestamp = current_unix_secs();
     PathBuf::from(format!(
         "disk-map-export-{timestamp}.{}",
         format.extension()
     ))
+}
+
+fn default_report_path() -> PathBuf {
+    let timestamp = current_unix_secs();
+    PathBuf::from(format!("disk-map-report-{timestamp}.json"))
 }
 
 fn format_perf_stats(stats: &PerfStats) -> String {
@@ -3931,6 +4014,36 @@ mod tests {
 
         assert!(app.insight_report.is_none());
         assert_eq!(app.status, "Insights unavailable: no focused directory");
+    }
+
+    #[test]
+    fn focused_report_metadata_captures_reproducible_view_state() {
+        let mut app = app_with_search_matches();
+        app.exclude_input = ".git,target".into();
+        app.include_hidden = false;
+        app.follow_symlinks = true;
+        app.stay_on_filesystem = true;
+        app.sqlite_cache_enabled = true;
+        app.realtime_watch_enabled = true;
+        app.search_filter_enabled = true;
+        app.color_by_extension = true;
+        app.max_depth = 4;
+        *app.search.input_mut() = "match".into();
+
+        let metadata = app.focused_report_metadata(1).expect("metadata");
+
+        assert_eq!(metadata.scan_root_path, "/root");
+        assert_eq!(metadata.focused_path, "/root/match-dir");
+        assert_eq!(metadata.max_depth, 4);
+        assert_eq!(metadata.search_query, "match");
+        assert!(metadata.search_filter_enabled);
+        assert_eq!(metadata.color_mode, "extension");
+        assert!(!metadata.include_hidden);
+        assert!(metadata.follow_symlinks);
+        assert!(metadata.stay_on_filesystem);
+        assert!(metadata.sqlite_cache_enabled);
+        assert!(metadata.realtime_watch_enabled);
+        assert_eq!(metadata.exclude_patterns, vec![".git", "target"]);
     }
 
     #[test]

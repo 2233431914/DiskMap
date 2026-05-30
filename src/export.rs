@@ -30,6 +30,24 @@ struct ExportRecord {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedReportMetadata {
+    pub generated_at_unix_secs: u64,
+    pub scan_root_path: String,
+    pub focused_path: String,
+    pub size_basis: &'static str,
+    pub max_depth: usize,
+    pub search_query: String,
+    pub search_filter_enabled: bool,
+    pub color_mode: &'static str,
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+    pub stay_on_filesystem: bool,
+    pub sqlite_cache_enabled: bool,
+    pub realtime_watch_enabled: bool,
+    pub exclude_patterns: Vec<String>,
+}
+
 pub fn export_subtree(tree: &mut TreeStore, root_id: NodeId, format: ExportFormat) -> String {
     let mut records = Vec::new();
     collect_records(tree, root_id, &mut records);
@@ -38,6 +56,16 @@ pub fn export_subtree(tree: &mut TreeStore, root_id: NodeId, format: ExportForma
         ExportFormat::Csv => records_to_csv(&records),
         ExportFormat::Json => records_to_json(&records),
     }
+}
+
+pub fn export_focused_report(
+    tree: &mut TreeStore,
+    root_id: NodeId,
+    metadata: &FocusedReportMetadata,
+) -> String {
+    let mut records = Vec::new();
+    collect_records(tree, root_id, &mut records);
+    report_to_json(metadata, &records)
 }
 
 fn collect_records(tree: &mut TreeStore, node_id: NodeId, records: &mut Vec<ExportRecord>) {
@@ -111,6 +139,59 @@ fn records_to_json(records: &[ExportRecord]) -> String {
     }
     out.push_str("\n]\n");
     out
+}
+
+fn report_to_json(metadata: &FocusedReportMetadata, records: &[ExportRecord]) -> String {
+    let mut out = String::from("{\n  \"metadata\":{");
+    out.push_str("\"generated_at_unix_secs\":");
+    out.push_str(&metadata.generated_at_unix_secs.to_string());
+    out.push_str(",\"scan_root_path\":\"");
+    out.push_str(&json_escape(&metadata.scan_root_path));
+    out.push_str("\",\"focused_path\":\"");
+    out.push_str(&json_escape(&metadata.focused_path));
+    out.push_str("\",\"size_basis\":\"");
+    out.push_str(&json_escape(metadata.size_basis));
+    out.push_str("\",\"max_depth\":");
+    out.push_str(&metadata.max_depth.to_string());
+    out.push_str(",\"search_query\":\"");
+    out.push_str(&json_escape(&metadata.search_query));
+    out.push_str("\",\"search_filter_enabled\":");
+    out.push_str(bool_json(metadata.search_filter_enabled));
+    out.push_str(",\"color_mode\":\"");
+    out.push_str(&json_escape(metadata.color_mode));
+    out.push_str("\",\"scan_options\":{");
+    out.push_str("\"include_hidden\":");
+    out.push_str(bool_json(metadata.include_hidden));
+    out.push_str(",\"follow_symlinks\":");
+    out.push_str(bool_json(metadata.follow_symlinks));
+    out.push_str(",\"stay_on_filesystem\":");
+    out.push_str(bool_json(metadata.stay_on_filesystem));
+    out.push_str(",\"sqlite_cache_enabled\":");
+    out.push_str(bool_json(metadata.sqlite_cache_enabled));
+    out.push_str(",\"realtime_watch_enabled\":");
+    out.push_str(bool_json(metadata.realtime_watch_enabled));
+    out.push_str(",\"exclude_patterns\":[");
+    for (index, pattern) in metadata.exclude_patterns.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(pattern));
+        out.push('"');
+    }
+    out.push_str("]}}");
+    out.push_str(",\n  \"entries\":");
+    out.push_str(&records_to_json(records));
+    out.push_str("}\n");
+    out
+}
+
+fn bool_json(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 fn csv_cell(value: &str) -> String {
@@ -199,5 +280,37 @@ mod tests {
         assert!(csv.contains("/root/dir,18,Directory,"));
         assert!(!csv.contains("/root,bad"));
         assert!(!csv.contains("/root,18,Directory,"));
+    }
+
+    #[test]
+    fn focused_report_includes_metadata_and_entries() {
+        let mut tree = sample_tree();
+        let metadata = FocusedReportMetadata {
+            generated_at_unix_secs: 123,
+            scan_root_path: "/root".into(),
+            focused_path: "/root/dir".into(),
+            size_basis: "Allocated size",
+            max_depth: 3,
+            search_query: "file".into(),
+            search_filter_enabled: true,
+            color_mode: "extension",
+            include_hidden: false,
+            follow_symlinks: true,
+            stay_on_filesystem: true,
+            sqlite_cache_enabled: false,
+            realtime_watch_enabled: true,
+            exclude_patterns: vec![".git".into(), "target".into()],
+        };
+
+        let report = export_focused_report(&mut tree, 1, &metadata);
+
+        assert!(report.contains("\"generated_at_unix_secs\":123"));
+        assert!(report.contains("\"focused_path\":\"/root/dir\""));
+        assert!(report.contains("\"search_filter_enabled\":true"));
+        assert!(report.contains("\"exclude_patterns\":[\".git\",\"target\"]"));
+        assert!(report.contains(
+            "\"path\":\"/root/dir/a,file.txt\",\"size\":10,\"kind\":\"File\",\"error\":null"
+        ));
+        assert!(!report.contains("\"path\":\"/root/bad\""));
     }
 }
