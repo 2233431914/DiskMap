@@ -316,6 +316,9 @@ pub struct DiskMapApp {
     /// a successful import. Avoids spawning a native file dialog (we
     /// don't depend on a GUI toolkit for picking files).
     pub(super) rules_import_path: String,
+    /// Per-root scan option profiles. In-memory only (Phase 15 will
+    /// add persistence). Auto-applied when a scan starts.
+    pub(super) profiles: crate::profiles::ProfileStore,
 }
 
 impl Default for DiskMapApp {
@@ -371,6 +374,7 @@ impl Default for DiskMapApp {
             rules: crate::rules::default_ruleset(),
             last_rule_hits: None,
             rules_import_path: String::new(),
+            profiles: crate::profiles::ProfileStore::new(),
         }
     }
 }
@@ -1093,6 +1097,11 @@ impl DiskMapApp {
                     self.scan.mark_started();
                     self.status = format!("Scanning {}", path.display());
                     self.record_recent_root(&path);
+                    // Auto-apply per-root profile if one exists. The
+                    // profile's option values overwrite the live UI
+                    // fields *before* the scan starts, so the scan
+                    // itself uses the profiled options.
+                    self.apply_profile_to_ui(&path.display().to_string());
                     self.tree.clear();
                     self.tree.push_node(None, root_node);
                     self.tree.set_root_path(path);
@@ -1334,6 +1343,45 @@ impl DiskMapApp {
         self.status = format!("Applied {} rules, found {count} hits", self.rules.enabled_count());
         self.pending_repaint = true;
         count
+    }
+
+    /// Apply a saved profile to the live UI fields. Does not change
+    /// any in-flight scan; just overwrites the user-facing options
+    /// for the next scan. If no profile is stored for `root`, this
+    /// is a no-op (the UI keeps its current values).
+    pub fn apply_profile_to_ui(&mut self, root: &str) {
+        let Some(profile) = self.profiles.get(root).cloned() else {
+            return;
+        };
+        self.exclude_input = profile.exclude_patterns.join(",");
+        self.include_hidden = profile.include_hidden;
+        self.follow_symlinks = profile.follow_symlinks;
+        self.stay_on_filesystem = profile.stay_on_filesystem;
+        self.sqlite_cache_enabled = profile.sqlite_cache_enabled;
+        self.search_filter_enabled = profile.search_filter_enabled;
+        self.color_by_extension = profile.color_by_extension;
+        self.realtime_watch_enabled = profile.realtime_watch_enabled;
+        self.status = format!("Applied profile for {}", root);
+        self.pending_repaint = true;
+    }
+
+    /// Save the current UI option values to the profile for `root`.
+    /// Overwrites any existing profile for that key.
+    pub fn save_current_as_profile(&mut self, root: &str) {
+        use crate::profiles::ScanProfile;
+        let profile = ScanProfile {
+            exclude_patterns: parse_exclude_patterns(&self.exclude_input),
+            include_hidden: self.include_hidden,
+            follow_symlinks: self.follow_symlinks,
+            stay_on_filesystem: self.stay_on_filesystem,
+            sqlite_cache_enabled: self.sqlite_cache_enabled,
+            search_filter_enabled: self.search_filter_enabled,
+            color_by_extension: self.color_by_extension,
+            realtime_watch_enabled: self.realtime_watch_enabled,
+        };
+        self.profiles.set(root, profile);
+        self.status = format!("Saved profile for {} ({} stored)", root, self.profiles.len());
+        self.pending_repaint = true;
     }
 
     /// Build a snapshot bundle from the current app state and write it

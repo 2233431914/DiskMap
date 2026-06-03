@@ -286,6 +286,68 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         app.analyze_file_insights();
     }
 
+    // Per-root scan option profile controls. Only meaningful when
+    // there's a real path (not a virtual aggregate node) and that path
+    // is the focused root (or scan root) — we key profiles by the
+    // path string the user typed.
+    if let Some(profile_root_path) = node_path.as_ref() {
+        let profile_root = profile_root_path.to_string_lossy().to_string();
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("PROFILE")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        let profile_count = app.profiles.len();
+        if profile_count > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{} profile(s) stored (this root: {})",
+                    profile_count,
+                    if app.profiles.get(&profile_root).is_some() {
+                        "saved"
+                    } else {
+                        "not saved"
+                    }
+                ))
+                .small()
+                .color(p.text_muted),
+            );
+        } else {
+            ui.label(
+                RichText::new("No profiles yet — saved options are remembered per root")
+                    .small()
+                    .color(p.text_muted),
+            );
+        }
+        ui.columns(2, |cols| {
+            let w0 = cols[0].available_width();
+            if cols[0]
+                .add(
+                    egui::Button::new("Save for this root")
+                        .min_size(Vec2::new(w0, 24.0)),
+                )
+                .clicked()
+            {
+                app.save_current_as_profile(&profile_root);
+            }
+            let w1 = cols[1].available_width();
+            let has_profile = app.profiles.get(&profile_root).is_some();
+            if cols[1]
+                .add_enabled(
+                    has_profile,
+                    egui::Button::new("Apply profile")
+                        .min_size(Vec2::new(w1, 24.0)),
+                )
+                .clicked()
+            {
+                app.apply_profile_to_ui(&profile_root);
+            }
+        });
+    }
+
     if let Some(parent) = node_parent {
         ui.add_space(10.0);
         ui.label(
