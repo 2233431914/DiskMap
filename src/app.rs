@@ -53,6 +53,7 @@ const STORAGE_STAY_ON_FILESYSTEM: &str = "disk_map.stay_on_filesystem";
 const STORAGE_SQLITE_CACHE: &str = "disk_map.sqlite_cache";
 const STORAGE_SEARCH_FILTER: &str = "disk_map.search_filter";
 const STORAGE_COLOR_BY_EXTENSION: &str = "disk_map.color_by_extension";
+const STORAGE_REALTIME_WATCH: &str = "disk_map.realtime_watch";
 const STORAGE_RECENT_ROOTS: &str = "disk_map.recent_roots";
 const STORAGE_PINNED_ROOTS: &str = "disk_map.pinned_roots";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
@@ -421,6 +422,13 @@ impl DiskMapApp {
             self.color_by_extension = color_by_extension;
         }
 
+        if let Some(realtime_watch_enabled) = storage
+            .get_string(STORAGE_REALTIME_WATCH)
+            .and_then(|value| parse_storage_bool(&value))
+        {
+            self.realtime_watch_enabled = realtime_watch_enabled;
+        }
+
         if let Some(recent_roots) = storage.get_string(STORAGE_RECENT_ROOTS) {
             self.recent_roots = parse_stored_paths(&recent_roots, MAX_RECENT_ROOTS);
         }
@@ -459,6 +467,10 @@ impl DiskMapApp {
         storage.set_string(
             STORAGE_COLOR_BY_EXTENSION,
             self.color_by_extension.to_string(),
+        );
+        storage.set_string(
+            STORAGE_REALTIME_WATCH,
+            self.realtime_watch_enabled.to_string(),
         );
         storage.set_string(STORAGE_RECENT_ROOTS, serialize_paths(&self.recent_roots));
         storage.set_string(STORAGE_PINNED_ROOTS, serialize_paths(&self.pinned_roots));
@@ -3911,6 +3923,9 @@ mod tests {
         storage
             .values
             .insert(STORAGE_COLOR_BY_EXTENSION.into(), "true".into());
+        storage
+            .values
+            .insert(STORAGE_REALTIME_WATCH.into(), "false".into());
         storage.values.insert(
             STORAGE_RECENT_ROOTS.into(),
             "/recent-a\n\n/recent-b\n/recent-a".into(),
@@ -3931,7 +3946,7 @@ mod tests {
         assert!(!app.include_hidden);
         assert!(app.follow_symlinks);
         assert!(app.stay_on_filesystem);
-        assert!(app.realtime_watch_enabled);
+        assert!(!app.realtime_watch_enabled);
         assert!(app.sqlite_cache_enabled);
         assert!(app.search_filter_enabled);
         assert!(app.color_by_extension);
@@ -3954,6 +3969,7 @@ mod tests {
             sqlite_cache_enabled: true,
             search_filter_enabled: true,
             color_by_extension: true,
+            realtime_watch_enabled: false,
             recent_roots: vec!["/recent".into(), "/older".into()],
             pinned_roots: vec!["/pinned".into()],
             max_depth: 4,
@@ -4025,6 +4041,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            storage.values.get(STORAGE_REALTIME_WATCH).map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
             storage.values.get(STORAGE_THEME).map(String::as_str),
             Some("light")
         );
@@ -4035,6 +4055,24 @@ mod tests {
         assert_eq!(
             storage.values.get(STORAGE_PINNED_ROOTS).map(String::as_str),
             Some("/pinned")
+        );
+    }
+
+    #[test]
+    fn realtime_watch_preference_round_trips_through_storage() {
+        let mut storage = TestStorage::default();
+        let app = DiskMapApp {
+            realtime_watch_enabled: false,
+            ..Default::default()
+        };
+
+        app.save_preferences(&mut storage);
+        let mut restored = DiskMapApp::default();
+        restored.restore_preferences(&storage);
+
+        assert!(
+            !restored.realtime_watch_enabled,
+            "disabled Watch must survive save/restore"
         );
     }
 
