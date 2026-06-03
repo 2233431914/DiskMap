@@ -37,6 +37,12 @@ pub struct NodeRecord {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedSubtree {
+    pub parent: Option<NodeId>,
+    pub dirty_nodes: Vec<NodeId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeStore {
     pub nodes: Vec<Node>,
@@ -218,6 +224,46 @@ impl TreeStore {
         self.adjust_ancestor_sizes(target_id, old_size, new_size);
         self.path_cache.clear();
         Some(appended_ids)
+    }
+
+    pub fn detach_subtree(&mut self, node_id: NodeId) -> Option<DetachedSubtree> {
+        if node_id >= self.nodes.len() {
+            return None;
+        }
+
+        if self.root == Some(node_id) {
+            self.clear();
+            return Some(DetachedSubtree {
+                parent: None,
+                dirty_nodes: Vec::new(),
+            });
+        }
+
+        let parent_id = self.nodes[node_id].parent?;
+        let removed_size = self.nodes[node_id].size;
+        if let Some(index) = self.nodes[parent_id]
+            .children
+            .iter()
+            .position(|child_id| *child_id == node_id)
+        {
+            self.nodes[parent_id].children.remove(index);
+        }
+        self.nodes[node_id].parent = None;
+
+        let mut dirty_nodes = Vec::new();
+        let mut current = Some(parent_id);
+        while let Some(id) = current {
+            self.nodes[id].size = self.nodes[id].size.saturating_sub(removed_size);
+            self.nodes[id].sort_dirty = true;
+            dirty_nodes.push(id);
+            current = self.nodes[id].parent;
+        }
+
+        self.path_cache.clear();
+        Some(DetachedSubtree {
+            parent: Some(parent_id),
+            dirty_nodes,
+        })
     }
 
     pub fn repair_sorted_children(&mut self, dirty_nodes: &[NodeId]) {
@@ -431,6 +477,40 @@ mod tests {
         replacement.add_node(None, "file.txt".into(), NodeKind::Dir, 0);
 
         assert!(tree.replace_children_from(file, &replacement).is_none());
+    }
+
+    #[test]
+    fn detach_subtree_removes_child_and_updates_ancestor_sizes() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 30);
+        tree.set_root_path("/root".into());
+        let dir = tree.add_node(Some(root), "dir".into(), NodeKind::Dir, 10);
+        let file = tree.add_node(Some(dir), "file.txt".into(), NodeKind::File, 10);
+        let sibling = tree.add_node(Some(root), "sibling.txt".into(), NodeKind::File, 20);
+
+        let detached = tree.detach_subtree(dir).expect("detached subtree");
+
+        assert_eq!(detached.parent, Some(root));
+        assert_eq!(detached.dirty_nodes, vec![root]);
+        assert_eq!(tree.node(root).size, 20);
+        assert_eq!(tree.node(dir).parent, None);
+        assert!(tree.node(dir).children.contains(&file));
+        assert_eq!(tree.node(file).parent, Some(dir));
+        assert_eq!(tree.node(root).children, vec![sibling]);
+    }
+
+    #[test]
+    fn detach_subtree_clears_tree_when_root_is_removed() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 1);
+        tree.set_root_path("/root".into());
+        tree.add_node(Some(root), "file.txt".into(), NodeKind::File, 1);
+
+        let detached = tree.detach_subtree(root).expect("detached root");
+
+        assert_eq!(detached.parent, None);
+        assert!(tree.is_empty());
+        assert_eq!(tree.root, None);
     }
 
     #[test]

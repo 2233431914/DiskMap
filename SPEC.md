@@ -28,27 +28,26 @@
 - [x] Treemap visualization by area (Squarified Treemap algorithm)
 - [x] Hover tooltip showing path and size
 - [x] Left-click to select, double-click to drill into directory
-- [x] Right-click context menu: Reveal in Finder / Copy Path / Open
+- [x] Right-click context menu: Open / Reveal in Finder / Copy Path / Move to Trash
 - [x] Search result navigation with Previous/Next and Enter/Shift+Enter
 - [x] Search filter mode showing only matches and ancestor folders
 - [x] Small-file aggregation as virtual "Other Files" nodes
 - [x] Manual rescan for scan root and focused subtree
-- [x] Default-off filesystem watch with debounced incremental subtree rescan
+- [x] Default-on filesystem watch with debounced incremental subtree rescan
 - [x] CSV/JSON export for scan root or focused subtree
 - [x] Focused report JSON export with reproduction metadata for the current view
 - [x] Manual read-only file age/type insight report for the focused subtree
 - [x] Active size basis display
 - [x] Optional SQLite scan cache setting, disabled by default
 - [x] Extension-based color mode
-- [x] Runtime-gated Move to Trash with two-step confirmation
+- [x] Direct Move to Trash with protected-path validation and immediate view update
 - [x] Cleanup review queue before platform Trash actions
 
 ### 3.2 Explicitly Out of Current Default Path
 - SQLite storage enabled by default
 - Duplicate file detection as a cleanup signal
-- FSEvents real-time monitoring enabled by default
+- Permanent deletion that bypasses the operating system Trash
 - Animations
-- Immediate one-click file deletion or always-visible Move to Trash
 - Cleanup automation that mutates scan/search state
 
 ### 3.3 Sidebar Features
@@ -164,10 +163,10 @@ struct TreeStore {
 - Copy full path string through egui clipboard integration
 
 ### 7.3 Destructive Actions
-- Move to Trash is disabled by default and hidden until the user enables `Allow Trash`.
-- Trash candidates must first be added to the cleanup review queue.
-- Trash requires a second confirmation click from the queued candidate and shows path, size, and affected item count.
-- Trash uses the platform trash adapter, reports errors, and must not silently trigger a rescan.
+- Move to Trash is available from the selected-node details panel and the right-click menu.
+- Direct Trash validates protected paths and target existence before calling the platform adapter.
+- Successful Trash removes the node from the in-memory view immediately; failed platform actions only report status.
+- Review-queue Trash still supports a second confirmation click with path, size, and affected item count.
 
 ## 8. UI Layout
 
@@ -192,10 +191,10 @@ struct TreeStore {
 
 ## 10. Roadmap
 
-Unchecked items below are accepted product backlog, not current behavior. Analysis features should stay read-only by default. Destructive workflows must remain gated behind review, protected-path checks, explicit confirmation, and audit logging.
+Unchecked items below are accepted product backlog, not current behavior. Analysis features should stay read-only by default. Destructive workflows must keep protected-path checks and clear status reporting before platform actions.
 
 ### Phase 2: Stabilization and Usability
-- [x] Keep destructive actions disabled by default
+- [x] Keep permanent deletion unavailable; Move to Trash uses protected-path validation
 - [x] Keep SQLite cache disabled by default
 - [x] Maintain clippy-clean code with `cargo clippy --all-targets --all-features -- -D warnings`
 - [x] Add scan error summary after completion: permission errors, skipped paths, symlinks, and error entries
@@ -225,8 +224,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 ### Phase 5: Real-time Monitoring
 - [x] Add notify crate (FSEvents/kqueue)
 - [x] Debounce 300-1000ms
-- [x] Add default-off Watch control for debounced scan-root rescans after filesystem changes
-- Watch is disabled by default and only observes the current scan root when enabled.
+- [x] Add default-on Watch control for debounced scan-root rescans after filesystem changes
+- Watch is enabled by default and observes the current scan root. Users can disable it for the current session from the toolbar.
 - [x] Incremental rescan of changed directories
 - Debounced events are mapped to the deepest known directory containing the changed path. The app rescans that directory off the UI thread and replaces its in-memory subtree; unresolved changes fall back to the scan root.
 
@@ -243,7 +242,7 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [x] Extension-based coloring
 - The optional `Ext` color mode keeps directory colors unchanged and assigns files stable colors based on lowercase extension.
 - [x] Move to Trash functionality with confirmation and reliable platform adapter
-- Trash remains runtime-gated by `Allow Trash`, is not persisted as enabled, and is unavailable for virtual aggregate nodes.
+- Move to Trash is available without a separate enable toggle, uses the platform Trash, and is unavailable for virtual aggregate nodes.
 
 ### Phase 8: Analysis Workflows
 - [x] Recent scan roots and pinned favorites for repeat analysis
@@ -259,12 +258,13 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 
 ### Phase 9: Cleanup Workflow Safety
 - [x] Add a review queue for cleanup candidates before any destructive action
-- The selected node can only be queued for Trash; actual platform Trash actions are launched from the cleanup queue after a second confirmation. Queue rows show path, size, kind, and affected item count.
+- Selected nodes can be moved directly to Trash from the details panel or right-click menu. The cleanup queue remains available internally for review-style flows and shows path, size, kind, and affected item count.
 - [x] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
 - Guardrails block filesystem root, the home root, common system locations, mounted volume roots, and user-configured protected roots. User paths are comma, semicolon, or newline separated and apply to the path itself plus descendants.
 - [x] Require explicit confirmation with path, size, and affected item count before Move to Trash
-- The queued Trash action first enters a confirmation state and reports the target path, selected byte size, and affected item count before the second click can call the platform Trash adapter.
-- [ ] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
+- The queued Trash action first enters a confirmation state and reports the target path, selected byte size, and affected item count before the second click can call the platform Trash adapter. Direct Move to Trash keeps protected-path and existence validation before platform calls.
+- [x] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
+- Successful Move to Trash removes the node from the in-memory tree immediately; failed platform actions only report status and leave scan/search state unchanged.
 
 ### Phase 10: Accessibility and Packaging
 - [ ] Keyboard shortcuts for primary navigation, search navigation, rescan, and focused export

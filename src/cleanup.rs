@@ -17,6 +17,14 @@ pub enum QueueAddResult {
     AlreadyQueued,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupTargetStatus {
+    Ready,
+    Missing,
+    Inaccessible(String),
+    Protected(ProtectedPathReason),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CleanupQueue {
     candidates: Vec<CleanupCandidate>,
@@ -156,6 +164,18 @@ pub fn parse_protected_paths(input: &str) -> Vec<PathBuf> {
     paths
 }
 
+pub fn validate_cleanup_target(path: &Path, user_deny_list: &[PathBuf]) -> CleanupTargetStatus {
+    if let Some(reason) = protected_path_reason_with_deny_list(path, user_deny_list) {
+        return CleanupTargetStatus::Protected(reason);
+    }
+
+    match path.try_exists() {
+        Ok(true) => CleanupTargetStatus::Ready,
+        Ok(false) => CleanupTargetStatus::Missing,
+        Err(error) => CleanupTargetStatus::Inaccessible(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +259,52 @@ mod tests {
                 PathBuf::from("/c")
             ]
         );
+    }
+
+    #[test]
+    fn validate_cleanup_target_reports_ready_missing_protected_and_inaccessible() {
+        let unique = format!(
+            "disk-map-cleanup-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_root = std::env::current_dir()
+            .expect("test current dir should be available")
+            .join("target/test-temp");
+        std::fs::create_dir_all(&temp_root).expect("test temp root should be created");
+        let dir = temp_root.join(unique);
+        std::fs::create_dir(&dir).expect("temp cleanup test dir should be created");
+
+        assert_eq!(
+            validate_cleanup_target(&dir, &[]),
+            CleanupTargetStatus::Ready
+        );
+        assert_eq!(
+            validate_cleanup_target(Path::new("/"), &[]),
+            CleanupTargetStatus::Protected(ProtectedPathReason::FilesystemRoot)
+        );
+
+        std::fs::remove_dir(&dir).expect("temp cleanup test dir should be removed");
+        assert_eq!(
+            validate_cleanup_target(&dir, &[]),
+            CleanupTargetStatus::Missing
+        );
+
+        let parent_file = temp_root.join(format!(
+            "disk-map-cleanup-parent-file-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&parent_file, b"file").expect("temp cleanup test file should be written");
+        let child = parent_file.join("child");
+        assert!(matches!(
+            validate_cleanup_target(&child, &[]),
+            CleanupTargetStatus::Inaccessible(_)
+        ));
+        std::fs::remove_file(&parent_file).expect("temp cleanup test file should be removed");
     }
 }

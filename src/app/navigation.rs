@@ -157,7 +157,7 @@ impl NavigationState {
     pub fn prune_invalid(&mut self, tree: &TreeStore) -> bool {
         if self
             .selected_id
-            .is_some_and(|selected_id| selected_id >= tree.len())
+            .is_some_and(|selected_id| !node_is_reachable(tree, selected_id))
         {
             self.selected_id = None;
         }
@@ -165,11 +165,14 @@ impl NavigationState {
         let mut focus_changed = false;
         if self
             .focused_root
-            .is_some_and(|root_id| root_id >= tree.len())
+            .is_some_and(|root_id| !node_is_reachable(tree, root_id))
         {
             self.focused_root = tree.root;
             focus_changed = true;
         }
+        self.back_history.retain(|id| node_is_reachable(tree, *id));
+        self.forward_history
+            .retain(|id| node_is_reachable(tree, *id));
         if focus_changed {
             self.rebuild_breadcrumb_cache(tree);
         }
@@ -194,6 +197,13 @@ impl NavigationState {
     pub fn push_back_for_test(&mut self, node_id: NodeId) {
         self.back_history.push(node_id);
     }
+}
+
+fn node_is_reachable(tree: &TreeStore, node_id: NodeId) -> bool {
+    node_id < tree.len()
+        && tree
+            .root
+            .is_some_and(|root_id| tree.is_descendant_or_same(node_id, root_id))
 }
 
 #[cfg(test)]

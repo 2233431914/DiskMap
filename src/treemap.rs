@@ -28,8 +28,6 @@ pub struct VisualNode {
     pub depth: usize,
     pub is_dir: bool,
     pub size: u64,
-    pub percent_of_parent: f32,
-    pub percent_of_total: f32,
     pub label_mode: LabelMode,
     pub matched: bool,
     pub ancestor_of_match: bool,
@@ -85,7 +83,6 @@ pub struct TreemapLayoutParams<'a, 'b> {
 struct LayoutContext<'a> {
     tree: &'a mut TreeStore,
     root_id: NodeId,
-    total_size: u64,
     max_depth: usize,
     search_state: &'a SearchState,
     filter_to_search: bool,
@@ -246,8 +243,6 @@ impl Camera {
 
 pub fn layout_treemap(tree: &mut TreeStore, params: TreemapLayoutParams<'_, '_>) {
     params.out.clear();
-    let root_node = tree.node(params.root);
-    let total_size = root_node.size.max(1);
     let layout_rect = params
         .camera
         .apply(params.canvas_rect, params.canvas_rect)
@@ -255,7 +250,6 @@ pub fn layout_treemap(tree: &mut TreeStore, params: TreemapLayoutParams<'_, '_>)
     let mut context = LayoutContext {
         tree,
         root_id: params.root,
-        total_size,
         max_depth: params.max_depth,
         search_state: params.search_state,
         filter_to_search: params.filter_to_search && params.search_state.has_query(),
@@ -554,7 +548,6 @@ fn emit_visual_and_recurse(
         draw_rect,
         depth,
         context.root_id,
-        context.total_size,
         context.search_state,
     ));
 
@@ -613,14 +606,9 @@ fn make_visual_node(
     rect: Rect,
     depth: usize,
     root_id: NodeId,
-    total_size: u64,
     search_state: &SearchState,
 ) -> VisualNode {
     let node = tree.node(node_id);
-    let parent_size = node
-        .parent
-        .map(|parent_id| tree.node(parent_id).size.max(1))
-        .unwrap_or(node.size.max(1));
     let matched = search_state.is_match(node_id);
     let ancestor_of_match = search_state.is_ancestor_of_match(node_id);
     let hidden_by_search = search_state.is_hidden(node_id);
@@ -628,21 +616,9 @@ fn make_visual_node(
 
     let label_text = match label_mode {
         LabelMode::Full => Some(if node_id == root_id {
-            format!(
-                "{} (root)\n{}\n{:.1}% of root · {:.1}% of parent",
-                node.name,
-                format_bytes(node.size),
-                (node.size as f32 / total_size.max(1) as f32) * 100.0,
-                (node.size as f32 / parent_size as f32) * 100.0,
-            )
+            format!("{} (root)\n{}", node.name, format_bytes(node.size))
         } else {
-            format!(
-                "{}\n{}\n{:.1}% of root · {:.1}% of parent",
-                node.name,
-                format_bytes(node.size),
-                (node.size as f32 / total_size.max(1) as f32) * 100.0,
-                (node.size as f32 / parent_size as f32) * 100.0,
-            )
+            format!("{}\n{}", node.name, format_bytes(node.size))
         }),
         LabelMode::Compact => Some(if node_id == root_id {
             format!("{} (root)\n{}", node.name, format_bytes(node.size))
@@ -658,8 +634,6 @@ fn make_visual_node(
         depth,
         is_dir: !node.children.is_empty(),
         size: node.size,
-        percent_of_parent: node.size as f32 / parent_size as f32,
-        percent_of_total: node.size as f32 / total_size.max(1) as f32,
         label_mode,
         matched,
         ancestor_of_match,
