@@ -18,6 +18,7 @@ use crate::scanner::{
 use crate::snapshot::{
     capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff,
 };
+use crate::storage::{app_data_dir, Preferences, SafeStorage};
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{Camera, LayoutScratch, VisualKind, VisualNode};
 use crate::watcher::{WatchPoll, WatchSession};
@@ -294,8 +295,9 @@ pub struct DiskMapApp {
     pub(super) layout_scratch: LayoutScratch,
     pub(super) last_canvas_rect: Option<Rect>,
     pub(super) layout_dirty: bool,
-    pub(super) last_layout_refresh: Instant,
+    pub(super)     last_layout_refresh: Instant,
     pending_repaint: bool,
+    safe_storage: SafeStorage,
 }
 
 impl Default for DiskMapApp {
@@ -345,6 +347,7 @@ impl Default for DiskMapApp {
             layout_dirty: true,
             last_layout_refresh: Instant::now(),
             pending_repaint: false,
+            safe_storage: SafeStorage::new(&app_data_dir("disk-map")),
         }
     }
 }
@@ -352,9 +355,8 @@ impl Default for DiskMapApp {
 impl DiskMapApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
-        if let Some(storage) = cc.storage {
-            app.restore_preferences(storage);
-        }
+        let prefs = app.safe_storage.read();
+        app.restore_preferences(&prefs);
         if let Some(theme) = app.theme_preference {
             apply_theme_preference(&cc.egui_ctx, theme);
         } else {
@@ -363,118 +365,127 @@ impl DiskMapApp {
         app
     }
 
-    fn restore_preferences(&mut self, storage: &dyn eframe::Storage) {
-        if let Some(path_input) = storage.get_string(STORAGE_PATH_INPUT) {
+    fn restore_preferences(&mut self, prefs: &Preferences) {
+        if let Some(path_input) = prefs.get(STORAGE_PATH_INPUT) {
             if !path_input.trim().is_empty() {
-                self.path_input = path_input;
+                self.path_input = path_input.to_string();
             }
         }
 
-        if let Some(exclude_input) = storage.get_string(STORAGE_EXCLUDE_INPUT) {
-            self.exclude_input = exclude_input;
+        if let Some(exclude_input) = prefs.get(STORAGE_EXCLUDE_INPUT) {
+            self.exclude_input = exclude_input.to_string();
         }
 
-        if let Some(protected_paths_input) = storage.get_string(STORAGE_PROTECTED_PATHS) {
-            self.protected_paths_input = protected_paths_input;
+        if let Some(protected_paths_input) = prefs.get(STORAGE_PROTECTED_PATHS) {
+            self.protected_paths_input = protected_paths_input.to_string();
         }
 
-        if let Some(include_hidden) = storage
-            .get_string(STORAGE_INCLUDE_HIDDEN)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(include_hidden) = prefs
+            .get(STORAGE_INCLUDE_HIDDEN)
+            .and_then(parse_storage_bool)
         {
             self.include_hidden = include_hidden;
         }
 
-        if let Some(follow_symlinks) = storage
-            .get_string(STORAGE_FOLLOW_SYMLINKS)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(follow_symlinks) = prefs
+            .get(STORAGE_FOLLOW_SYMLINKS)
+            .and_then(parse_storage_bool)
         {
             self.follow_symlinks = follow_symlinks;
         }
 
-        if let Some(stay_on_filesystem) = storage
-            .get_string(STORAGE_STAY_ON_FILESYSTEM)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(stay_on_filesystem) = prefs
+            .get(STORAGE_STAY_ON_FILESYSTEM)
+            .and_then(parse_storage_bool)
         {
             self.stay_on_filesystem = stay_on_filesystem;
         }
 
-        if let Some(sqlite_cache_enabled) = storage
-            .get_string(STORAGE_SQLITE_CACHE)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(sqlite_cache_enabled) = prefs
+            .get(STORAGE_SQLITE_CACHE)
+            .and_then(parse_storage_bool)
         {
             self.sqlite_cache_enabled = sqlite_cache_enabled;
         }
 
-        if let Some(search_filter_enabled) = storage
-            .get_string(STORAGE_SEARCH_FILTER)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(search_filter_enabled) = prefs
+            .get(STORAGE_SEARCH_FILTER)
+            .and_then(parse_storage_bool)
         {
             self.search_filter_enabled = search_filter_enabled;
         }
 
-        if let Some(color_by_extension) = storage
-            .get_string(STORAGE_COLOR_BY_EXTENSION)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(color_by_extension) = prefs
+            .get(STORAGE_COLOR_BY_EXTENSION)
+            .and_then(parse_storage_bool)
         {
             self.color_by_extension = color_by_extension;
         }
 
-        if let Some(realtime_watch_enabled) = storage
-            .get_string(STORAGE_REALTIME_WATCH)
-            .and_then(|value| parse_storage_bool(&value))
+        if let Some(realtime_watch_enabled) = prefs
+            .get(STORAGE_REALTIME_WATCH)
+            .and_then(parse_storage_bool)
         {
             self.realtime_watch_enabled = realtime_watch_enabled;
         }
 
-        if let Some(recent_roots) = storage.get_string(STORAGE_RECENT_ROOTS) {
-            self.recent_roots = parse_stored_paths(&recent_roots, MAX_RECENT_ROOTS);
+        if let Some(recent_roots) = prefs.get(STORAGE_RECENT_ROOTS) {
+            self.recent_roots = parse_stored_paths(recent_roots, MAX_RECENT_ROOTS);
         }
 
-        if let Some(pinned_roots) = storage.get_string(STORAGE_PINNED_ROOTS) {
-            self.pinned_roots = parse_stored_paths(&pinned_roots, MAX_PINNED_ROOTS);
+        if let Some(pinned_roots) = prefs.get(STORAGE_PINNED_ROOTS) {
+            self.pinned_roots = parse_stored_paths(pinned_roots, MAX_PINNED_ROOTS);
         }
 
-        if let Some(depth) = storage
-            .get_string(STORAGE_MAX_DEPTH)
+        if let Some(depth) = prefs
+            .get(STORAGE_MAX_DEPTH)
             .and_then(|value| value.parse::<usize>().ok())
         {
             self.max_depth = depth.clamp(1, 10);
         }
 
-        self.theme_preference = storage
-            .get_string(STORAGE_THEME)
-            .and_then(|value| parse_theme_preference(&value));
+        self.theme_preference = prefs
+            .get(STORAGE_THEME)
+            .and_then(parse_theme_preference);
     }
 
-    fn save_preferences(&self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(STORAGE_PATH_INPUT, self.path_input.clone());
-        storage.set_string(STORAGE_EXCLUDE_INPUT, self.exclude_input.clone());
-        storage.set_string(STORAGE_PROTECTED_PATHS, self.protected_paths_input.clone());
-        storage.set_string(STORAGE_INCLUDE_HIDDEN, self.include_hidden.to_string());
-        storage.set_string(STORAGE_FOLLOW_SYMLINKS, self.follow_symlinks.to_string());
-        storage.set_string(
+    fn collect_preferences(&self) -> Preferences {
+        let mut prefs = Preferences::default();
+        prefs.set(STORAGE_PATH_INPUT, self.path_input.clone());
+        prefs.set(STORAGE_EXCLUDE_INPUT, self.exclude_input.clone());
+        prefs.set(STORAGE_PROTECTED_PATHS, self.protected_paths_input.clone());
+        prefs.set(STORAGE_INCLUDE_HIDDEN, self.include_hidden.to_string());
+        prefs.set(STORAGE_FOLLOW_SYMLINKS, self.follow_symlinks.to_string());
+        prefs.set(
             STORAGE_STAY_ON_FILESYSTEM,
             self.stay_on_filesystem.to_string(),
         );
-        storage.set_string(STORAGE_SQLITE_CACHE, self.sqlite_cache_enabled.to_string());
-        storage.set_string(
+        prefs.set(STORAGE_SQLITE_CACHE, self.sqlite_cache_enabled.to_string());
+        prefs.set(
             STORAGE_SEARCH_FILTER,
             self.search_filter_enabled.to_string(),
         );
-        storage.set_string(
+        prefs.set(
             STORAGE_COLOR_BY_EXTENSION,
             self.color_by_extension.to_string(),
         );
-        storage.set_string(
+        prefs.set(
             STORAGE_REALTIME_WATCH,
             self.realtime_watch_enabled.to_string(),
         );
-        storage.set_string(STORAGE_RECENT_ROOTS, serialize_paths(&self.recent_roots));
-        storage.set_string(STORAGE_PINNED_ROOTS, serialize_paths(&self.pinned_roots));
-        storage.set_string(STORAGE_MAX_DEPTH, self.max_depth.to_string());
+        prefs.set(STORAGE_RECENT_ROOTS, serialize_paths(&self.recent_roots));
+        prefs.set(STORAGE_PINNED_ROOTS, serialize_paths(&self.pinned_roots));
+        prefs.set(STORAGE_MAX_DEPTH, self.max_depth.to_string());
         if let Some(theme) = self.theme_preference {
-            storage.set_string(STORAGE_THEME, theme_preference_name(theme).to_string());
+            prefs.set(STORAGE_THEME, theme_preference_name(theme).to_string());
+        }
+        prefs
+    }
+
+    fn save_preferences(&self) {
+        let prefs = self.collect_preferences();
+        if let Err(error) = self.safe_storage.write(&prefs) {
+            eprintln!("disk-map: failed to write preferences: {error}");
         }
     }
 
@@ -530,8 +541,11 @@ impl eframe::App for DiskMapApp {
         });
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.save_preferences(storage);
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        // eframe passes its own storage here, but we use SafeStorage for
+        // app preferences (crash-safe atomic writes). Window state is
+        // managed by eframe's own persist_window.
+        self.save_preferences();
     }
 }
 
@@ -2564,25 +2578,25 @@ mod tests {
     use super::*;
     use crate::scanner::CacheMode;
     use crate::scanner::{DiscoveredNode, ProgressSnapshot, ScanBatch};
+    use crate::storage::SafeStorage;
     use crate::tree::NodeRecord;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[derive(Default)]
-    struct TestStorage {
-        values: BTreeMap<String, String>,
-    }
-
-    impl eframe::Storage for TestStorage {
-        fn get_string(&self, key: &str) -> Option<String> {
-            self.values.get(key).cloned()
-        }
-
-        fn set_string(&mut self, key: &str, value: String) {
-            self.values.insert(key.to_string(), value);
-        }
-
-        fn flush(&mut self) {}
+    /// Allocate a fresh temp directory for one test. Includes pid + nanos
+    /// + an atomic counter so parallel tests don't collide.
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let p = std::env::temp_dir()
+            .join(format!("disk-map-prefs-test-{pid}-{nanos}-{n}"));
+        std::fs::create_dir_all(&p).expect("temp dir should be creatable");
+        p
     }
 
     fn root_started(scan_id: u64) -> ScanMessage {
@@ -2782,51 +2796,76 @@ mod tests {
     }
 
     #[test]
-    fn preferences_restore_path_depth_and_theme() {
-        let mut storage = TestStorage::default();
-        storage
-            .values
-            .insert(STORAGE_PATH_INPUT.into(), "/restored".into());
-        storage
-            .values
-            .insert(STORAGE_EXCLUDE_INPUT.into(), ".git,target".into());
-        storage
-            .values
-            .insert(STORAGE_PROTECTED_PATHS.into(), "/keep,/safe".into());
-        storage
-            .values
-            .insert(STORAGE_INCLUDE_HIDDEN.into(), "false".into());
-        storage
-            .values
-            .insert(STORAGE_FOLLOW_SYMLINKS.into(), "true".into());
-        storage
-            .values
-            .insert(STORAGE_STAY_ON_FILESYSTEM.into(), "true".into());
-        storage
-            .values
-            .insert(STORAGE_SQLITE_CACHE.into(), "true".into());
-        storage
-            .values
-            .insert(STORAGE_SEARCH_FILTER.into(), "true".into());
-        storage
-            .values
-            .insert(STORAGE_COLOR_BY_EXTENSION.into(), "true".into());
-        storage
-            .values
-            .insert(STORAGE_REALTIME_WATCH.into(), "false".into());
-        storage.values.insert(
-            STORAGE_RECENT_ROOTS.into(),
-            "/recent-a\n\n/recent-b\n/recent-a".into(),
-        );
-        storage.values.insert(
-            STORAGE_PINNED_ROOTS.into(),
-            "/pinned-a\n/pinned-b\n/pinned-a".into(),
-        );
-        storage.values.insert(STORAGE_MAX_DEPTH.into(), "99".into());
-        storage.values.insert(STORAGE_THEME.into(), "dark".into());
-        let mut app = DiskMapApp::default();
+    fn preferences_round_trip_through_safe_storage() {
+        let dir = unique_temp_dir();
+        let store = SafeStorage::new(&dir);
 
-        app.restore_preferences(&storage);
+        let app = DiskMapApp {
+            path_input: "/next".into(),
+            exclude_input: "node_modules;target".into(),
+            protected_paths_input: "/keep\n/safe".into(),
+            include_hidden: false,
+            follow_symlinks: true,
+            stay_on_filesystem: true,
+            sqlite_cache_enabled: true,
+            search_filter_enabled: true,
+            color_by_extension: true,
+            realtime_watch_enabled: false,
+            recent_roots: vec!["/recent".into(), "/older".into()],
+            pinned_roots: vec!["/pinned".into()],
+            max_depth: 4,
+            theme_preference: Some(Theme::Light),
+            safe_storage: SafeStorage::new(&dir),
+            ..Default::default()
+        };
+
+        app.save_preferences();
+        let prefs = store.read();
+        assert_eq!(prefs.get(STORAGE_PATH_INPUT), Some("/next"));
+        assert_eq!(prefs.get(STORAGE_MAX_DEPTH), Some("4"));
+        assert_eq!(prefs.get(STORAGE_EXCLUDE_INPUT), Some("node_modules;target"));
+        assert_eq!(prefs.get(STORAGE_PROTECTED_PATHS), Some("/keep\n/safe"));
+        assert_eq!(prefs.get(STORAGE_INCLUDE_HIDDEN), Some("false"));
+        assert_eq!(prefs.get(STORAGE_FOLLOW_SYMLINKS), Some("true"));
+        assert_eq!(prefs.get(STORAGE_STAY_ON_FILESYSTEM), Some("true"));
+        assert_eq!(prefs.get(STORAGE_SQLITE_CACHE), Some("true"));
+        assert_eq!(prefs.get(STORAGE_SEARCH_FILTER), Some("true"));
+        assert_eq!(prefs.get(STORAGE_COLOR_BY_EXTENSION), Some("true"));
+        assert_eq!(prefs.get(STORAGE_REALTIME_WATCH), Some("false"));
+        assert_eq!(prefs.get(STORAGE_THEME), Some("light"));
+        assert_eq!(prefs.get(STORAGE_RECENT_ROOTS), Some("/recent\n/older"));
+        assert_eq!(prefs.get(STORAGE_PINNED_ROOTS), Some("/pinned"));
+    }
+
+    #[test]
+    fn preferences_restore_from_safe_storage() {
+        let dir = unique_temp_dir();
+        let store = SafeStorage::new(&dir);
+        let mut prefs = crate::storage::Preferences::default();
+        prefs.set(STORAGE_PATH_INPUT, "/restored");
+        prefs.set(STORAGE_EXCLUDE_INPUT, ".git,target");
+        prefs.set(STORAGE_PROTECTED_PATHS, "/keep,/safe");
+        prefs.set(STORAGE_INCLUDE_HIDDEN, "false");
+        prefs.set(STORAGE_FOLLOW_SYMLINKS, "true");
+        prefs.set(STORAGE_STAY_ON_FILESYSTEM, "true");
+        prefs.set(STORAGE_SQLITE_CACHE, "true");
+        prefs.set(STORAGE_SEARCH_FILTER, "true");
+        prefs.set(STORAGE_COLOR_BY_EXTENSION, "true");
+        prefs.set(STORAGE_REALTIME_WATCH, "false");
+        prefs.set(
+            STORAGE_RECENT_ROOTS,
+            "/recent-a\n\n/recent-b\n/recent-a",
+        );
+        prefs.set(STORAGE_PINNED_ROOTS, "/pinned-a\n/pinned-b\n/pinned-a");
+        prefs.set(STORAGE_MAX_DEPTH, "99");
+        prefs.set(STORAGE_THEME, "dark");
+        store.write(&prefs).unwrap();
+
+        let mut app = DiskMapApp {
+            safe_storage: SafeStorage::new(&dir),
+            ..DiskMapApp::default()
+        };
+        app.restore_preferences(&store.read());
 
         assert_eq!(app.path_input, "/restored");
         assert_eq!(app.exclude_input, ".git,target");
@@ -2845,118 +2884,20 @@ mod tests {
     }
 
     #[test]
-    fn preferences_save_path_depth_and_theme() {
-        let mut storage = TestStorage::default();
+    fn realtime_watch_preference_round_trips_through_safe_storage() {
+        let dir = unique_temp_dir();
         let app = DiskMapApp {
-            path_input: "/next".into(),
-            exclude_input: "node_modules;target".into(),
-            protected_paths_input: "/keep\n/safe".into(),
-            include_hidden: false,
-            follow_symlinks: true,
-            stay_on_filesystem: true,
-            sqlite_cache_enabled: true,
-            search_filter_enabled: true,
-            color_by_extension: true,
             realtime_watch_enabled: false,
-            recent_roots: vec!["/recent".into(), "/older".into()],
-            pinned_roots: vec!["/pinned".into()],
-            max_depth: 4,
-            theme_preference: Some(Theme::Light),
+            safe_storage: SafeStorage::new(&dir),
             ..Default::default()
         };
 
-        app.save_preferences(&mut storage);
-
-        assert_eq!(
-            storage.values.get(STORAGE_PATH_INPUT).map(String::as_str),
-            Some("/next")
-        );
-        assert_eq!(
-            storage.values.get(STORAGE_MAX_DEPTH).map(String::as_str),
-            Some("4")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_EXCLUDE_INPUT)
-                .map(String::as_str),
-            Some("node_modules;target")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_PROTECTED_PATHS)
-                .map(String::as_str),
-            Some("/keep\n/safe")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_INCLUDE_HIDDEN)
-                .map(String::as_str),
-            Some("false")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_FOLLOW_SYMLINKS)
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_STAY_ON_FILESYSTEM)
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            storage.values.get(STORAGE_SQLITE_CACHE).map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_SEARCH_FILTER)
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            storage
-                .values
-                .get(STORAGE_COLOR_BY_EXTENSION)
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            storage.values.get(STORAGE_REALTIME_WATCH).map(String::as_str),
-            Some("false")
-        );
-        assert_eq!(
-            storage.values.get(STORAGE_THEME).map(String::as_str),
-            Some("light")
-        );
-        assert_eq!(
-            storage.values.get(STORAGE_RECENT_ROOTS).map(String::as_str),
-            Some("/recent\n/older")
-        );
-        assert_eq!(
-            storage.values.get(STORAGE_PINNED_ROOTS).map(String::as_str),
-            Some("/pinned")
-        );
-    }
-
-    #[test]
-    fn realtime_watch_preference_round_trips_through_storage() {
-        let mut storage = TestStorage::default();
-        let app = DiskMapApp {
-            realtime_watch_enabled: false,
+        app.save_preferences();
+        let mut restored = DiskMapApp {
+            safe_storage: SafeStorage::new(&dir),
             ..Default::default()
         };
-
-        app.save_preferences(&mut storage);
-        let mut restored = DiskMapApp::default();
-        restored.restore_preferences(&storage);
+        restored.restore_preferences(&app.safe_storage.read());
 
         assert!(
             !restored.realtime_watch_enabled,
