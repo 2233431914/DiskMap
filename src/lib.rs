@@ -7,6 +7,7 @@ pub mod export;
 pub mod format;
 pub mod insights;
 pub mod platform;
+pub mod rules;
 pub mod scanner;
 pub mod snapshot;
 pub mod storage;
