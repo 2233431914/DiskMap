@@ -1,5 +1,5 @@
 # Rust build output
-target/
+/target/
 
 # IDE
 .idea/
@@ -11,7 +11,8 @@ target/
 .DS_Store
 Thumbs.db
 
-# Local test files
-10
-10。提高
-=
+# Local test artifacts (see src/scanner.rs::tests::temp_path and similar)
+/target/test-temp/
+
+# Export files written to the current working directory (see SPEC.md §Phase 4)
+/disk-map-export-*
