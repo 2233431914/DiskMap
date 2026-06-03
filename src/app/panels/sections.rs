@@ -319,6 +319,52 @@ pub fn show_insight_report_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMap
     insight_old_files_group(ui, p, &report.old_large_files);
 }
 
+pub fn show_diagnostics_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) {
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new("DIAGNOSTICS")
+            .size(10.0)
+            .strong()
+            .color(p.text_faint),
+    );
+    ui.add_space(4.0);
+    let error_count = app.recent_errors.len();
+    if error_count > 0 {
+        ui.label(
+            RichText::new(format!("{} recent error(s) recorded", error_count))
+                .small()
+                .color(p.danger),
+        );
+    } else {
+        ui.label(
+            RichText::new("No recent errors")
+                .small()
+                .color(p.text_muted),
+        );
+    }
+    let button_width = ui.available_width();
+    if ui
+        .add(
+            egui::Button::new("Export Diagnostics Bundle")
+                .min_size(Vec2::new(button_width, 28.0)),
+        )
+        .on_hover_text("Write a snapshot of app state, scan options, perf stats, and recent errors to disk-map-diagnostics-<ts>/ in the current directory. Paths are redacted (home -> ~).")
+        .clicked()
+    {
+        let dest = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match app.export_diagnostics(&dest) {
+            Ok(path) => {
+                app.status = format!("Wrote diagnostics: {}", path.display());
+            }
+            Err(error) => {
+                app.record_error(format!("diagnostics export failed: {error}"));
+                app.status = format!("Diagnostics export failed: {error}");
+            }
+        }
+        app.pending_repaint = true;
+    }
+}
+
 pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
     let p = palette(ui.ctx());
     let full_rect = ui.max_rect();

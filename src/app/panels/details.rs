@@ -314,5 +314,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     app.show_snapshot_diff_section(ui, p);
     app.show_duplicate_report_section(ui, p);
     app.show_insight_report_section(ui, p);
+    app.show_diagnostics_section(ui, p);
     app.show_search_section(ui, p);
 }

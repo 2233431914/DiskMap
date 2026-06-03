@@ -39,6 +39,7 @@ use egui::{
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
 pub(super) const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
@@ -298,6 +299,12 @@ pub struct DiskMapApp {
     pub(super)     last_layout_refresh: Instant,
     pending_repaint: bool,
     safe_storage: SafeStorage,
+    /// Most recent scan perf stats, captured at ScanMessage::Finished.
+    /// Cleared at ScanMessage::Started. Used by the diagnostics export.
+    last_perf_stats: Option<PerfStats>,
+    /// Bounded ring of recent error/status messages for diagnostics export.
+    /// Capped at 64 entries; oldest dropped on overflow.
+    recent_errors: VecDeque<String>,
 }
 
 impl Default for DiskMapApp {
@@ -348,6 +355,8 @@ impl Default for DiskMapApp {
             last_layout_refresh: Instant::now(),
             pending_repaint: false,
             safe_storage: SafeStorage::new(&app_data_dir("disk-map")),
+            last_perf_stats: None,
+            recent_errors: VecDeque::new(),
         }
     }
 }
@@ -819,6 +828,10 @@ impl DiskMapApp {
         panels::sections::show_insight_report_section(ui, p, self);
     }
 
+    fn show_diagnostics_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        panels::sections::show_diagnostics_section(ui, p, self);
+    }
+
     fn show_status_bar(&self, ui: &mut egui::Ui) {
         panels::sections::show_status_bar(ui, self);
     }
@@ -1069,6 +1082,7 @@ impl DiskMapApp {
                     self.layout_dirty = true;
                     self.mark_search_dirty();
                     self.navigation.rebuild_breadcrumb_cache(&self.tree);
+                    self.last_perf_stats = None;
                 }
                 ScanMessage::Batch { batch, .. } => {
                     self.apply_scan_batch(batch);
@@ -1079,6 +1093,7 @@ impl DiskMapApp {
                     perf_stats,
                     ..
                 } => {
+                    self.last_perf_stats = Some(perf_stats.clone());
                     self.scan.mark_finished(perf_stats);
                     self.prune_invalid_selection();
                     self.refresh_search_matches();
@@ -1090,6 +1105,7 @@ impl DiskMapApp {
                     eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
                 ScanMessage::Cancelled { perf_stats, .. } => {
+                    self.last_perf_stats = Some(perf_stats.clone());
                     self.scan.mark_cancelled(perf_stats);
                     self.status = "Scan cancelled".to_string();
                     self.pending_repaint = true;
@@ -1100,7 +1116,9 @@ impl DiskMapApp {
                     perf_stats,
                     ..
                 } => {
+                    self.last_perf_stats = Some(perf_stats.clone());
                     self.scan.mark_error(perf_stats);
+                    self.record_error(format!("scan error: {message}"));
                     self.status = format!("Error: {message}");
                     self.pending_repaint = true;
                     eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
@@ -1252,9 +1270,67 @@ impl DiskMapApp {
 
     fn apply_platform_result(&mut self, action: &str, result: anyhow::Result<()>) {
         if let Err(error) = result {
+            self.record_error(format!("{action} failed: {error}"));
             self.status = format!("{action} failed: {error}");
             self.pending_repaint = true;
         }
+    }
+
+    /// Record an error or notable status change for the diagnostics
+    /// export. Capped at 64 entries (oldest dropped on overflow).
+    fn record_error(&mut self, message: String) {
+        const MAX_RECENT_ERRORS: usize = 64;
+        if self.recent_errors.len() >= MAX_RECENT_ERRORS {
+            self.recent_errors.pop_front();
+        }
+        self.recent_errors.push_back(message);
+    }
+
+    /// Build a snapshot bundle from the current app state and write it
+    /// to a timestamped directory under `dest_dir`. Returns the path to
+    /// the created bundle directory, or an error if the write failed.
+    pub fn export_diagnostics(&mut self, dest_dir: &Path) -> anyhow::Result<PathBuf> {
+        use crate::diagnostics::DiagnosticsBundle;
+        let scan_root = self.tree.root.and_then(|id| self.tree.node_real_path(id));
+        let scan_root = scan_root.map(|p| p.display().to_string());
+        let scan_options: Vec<(String, String)> = vec![
+            ("include_hidden".into(), self.include_hidden.to_string()),
+            ("follow_symlinks".into(), self.follow_symlinks.to_string()),
+            ("stay_on_filesystem".into(), self.stay_on_filesystem.to_string()),
+            (
+                "sqlite_cache_enabled".into(),
+                self.sqlite_cache_enabled.to_string(),
+            ),
+            (
+                "realtime_watch_enabled".into(),
+                self.realtime_watch_enabled.to_string(),
+            ),
+            (
+                "search_filter_enabled".into(),
+                self.search_filter_enabled.to_string(),
+            ),
+            (
+                "color_by_extension".into(),
+                self.color_by_extension.to_string(),
+            ),
+            ("exclude_patterns".into(), self.exclude_input.clone()),
+            ("protected_paths".into(), self.protected_paths_input.clone()),
+            ("max_depth".into(), self.max_depth.to_string()),
+        ];
+        let bundle = DiagnosticsBundle {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            generated_at_unix_secs: crate::diagnostics::current_unix_secs(),
+            scan_root,
+            status: self.status.clone(),
+            scan_options,
+            perf_stats: self.last_perf_stats.clone(),
+            recent_errors: self.recent_errors.iter().cloned().collect(),
+        };
+        bundle
+            .write_to(dest_dir)
+            .map_err(|e| anyhow::anyhow!("write diagnostics bundle: {e}"))
     }
 
     #[cfg(test)]
