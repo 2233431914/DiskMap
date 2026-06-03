@@ -1,33 +1,31 @@
+#[cfg(test)]
+use crate::cleanup::CleanupCandidate;
 use crate::cleanup::{
-    parse_protected_paths, validate_cleanup_target, CleanupCandidate, CleanupQueue,
-    CleanupTargetStatus, ProtectedPathReason,
+    parse_protected_paths, validate_cleanup_target, CleanupQueue, CleanupTargetStatus,
+    ProtectedPathReason,
 };
 #[cfg(test)]
 use crate::cleanup::{protected_path_reason_with_deny_list, QueueAddResult};
-use crate::duplicates::{find_duplicate_candidates, DuplicateCandidate, DuplicateReport};
+use crate::duplicates::{find_duplicate_candidates, DuplicateReport};
 use crate::export::{export_focused_report, export_subtree, ExportFormat, FocusedReportMetadata};
 use crate::format::format_bytes;
-use crate::insights::{
-    analyze_insights, AgeBucketSummary, FileTypeSummary, InsightReport, OldLargeFile,
-    INSIGHT_REPORT_LIMIT,
-};
-use crate::platform::{move_to_trash, open_path, reveal_in_finder};
+use crate::insights::{analyze_insights, InsightReport};
+use crate::platform::move_to_trash;
 use crate::scanner::{
-    parse_exclude_patterns, scan_path_to_tree, size_basis_detail, size_basis_label, CacheMode,
+    parse_exclude_patterns, scan_path_to_tree, size_basis_label, CacheMode,
     PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
 };
 use crate::snapshot::{
-    capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotChange, SnapshotDiff,
+    capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff,
 };
 use crate::tree::{NodeId, NodeKind, TreeStore};
-use crate::treemap::{
-    layout_treemap, Camera, LayoutScratch, TreemapLayoutParams, VisualKind, VisualNode,
-};
+use crate::treemap::{Camera, LayoutScratch, VisualKind, VisualNode};
 use crate::watcher::{WatchPoll, WatchSession};
 
 mod navigation;
 mod scan_session;
 mod search_nav;
+mod panels;
 
 use navigation::{NavigationOutcome, NavigationState};
 use scan_session::ScanSession;
@@ -41,9 +39,9 @@ use egui::{
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
-const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
-const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
+pub(super) const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
+pub(super) const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
+pub(super) const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
 const STORAGE_PATH_INPUT: &str = "disk_map.path_input";
 const STORAGE_EXCLUDE_INPUT: &str = "disk_map.exclude_input";
 const STORAGE_PROTECTED_PATHS: &str = "disk_map.protected_paths";
@@ -64,7 +62,7 @@ const SNAPSHOT_DIFF_LIMIT: usize = 5;
 const DUPLICATE_REPORT_LIMIT: usize = 8;
 
 #[derive(Clone, Copy)]
-struct Palette {
+pub(super) struct Palette {
     surface: Color32,
     panel: Color32,
     panel_elevated: Color32,
@@ -146,11 +144,11 @@ fn palette_for(theme: Theme) -> &'static Palette {
     }
 }
 
-fn palette(ctx: &egui::Context) -> &'static Palette {
+pub(super) fn palette(ctx: &egui::Context) -> &'static Palette {
     palette_for(ctx.theme())
 }
 
-fn pick_label_color(bg: Color32) -> Color32 {
+pub(super) fn pick_label_color(bg: Color32) -> Color32 {
     let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
     if luma < 140.0 {
         Color32::from_rgb(245, 245, 250)
@@ -258,7 +256,7 @@ fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
 pub struct DiskMapApp {
     path_input: String,
     exclude_input: String,
-    protected_paths_input: String,
+    pub(super) protected_paths_input: String,
     include_hidden: bool,
     follow_symlinks: bool,
     stay_on_filesystem: bool,
@@ -271,32 +269,32 @@ pub struct DiskMapApp {
     incremental_tx: Sender<IncrementalScanResult>,
     incremental_rx: Receiver<IncrementalScanResult>,
     incremental_scan_active: bool,
-    tree: TreeStore,
-    navigation: NavigationState,
-    search: SearchController,
-    search_filter_enabled: bool,
-    color_by_extension: bool,
-    recent_roots: Vec<String>,
-    pinned_roots: Vec<String>,
+    pub(super) tree: TreeStore,
+    pub(super) navigation: NavigationState,
+    pub(super) search: SearchController,
+    pub(super) search_filter_enabled: bool,
+    pub(super) color_by_extension: bool,
+    pub(super) recent_roots: Vec<String>,
+    pub(super) pinned_roots: Vec<String>,
     last_snapshot: Option<ScanSnapshot>,
-    snapshot_diff: Option<SnapshotDiff>,
-    duplicate_report: Option<DuplicateReport>,
-    insight_report: Option<InsightReport>,
-    scan: ScanSession,
-    hovered_id: Option<NodeId>,
-    context_menu_target_id: Option<NodeId>,
-    trash_confirm_target_id: Option<NodeId>,
-    cleanup_queue: CleanupQueue,
-    hovered_visual_kind: Option<VisualKind>,
-    camera: Camera,
-    max_depth: usize,
+    pub(super) snapshot_diff: Option<SnapshotDiff>,
+    pub(super) duplicate_report: Option<DuplicateReport>,
+    pub(super) insight_report: Option<InsightReport>,
+    pub(super) scan: ScanSession,
+    pub(super) hovered_id: Option<NodeId>,
+    pub(super) context_menu_target_id: Option<NodeId>,
+    pub(super) trash_confirm_target_id: Option<NodeId>,
+    pub(super) cleanup_queue: CleanupQueue,
+    pub(super) hovered_visual_kind: Option<VisualKind>,
+    pub(super) camera: Camera,
+    pub(super) max_depth: usize,
     theme_preference: Option<Theme>,
-    status: String,
-    cached_visuals: Vec<VisualNode>,
-    layout_scratch: LayoutScratch,
-    last_canvas_rect: Option<Rect>,
-    layout_dirty: bool,
-    last_layout_refresh: Instant,
+    pub(super) status: String,
+    pub(super) cached_visuals: Vec<VisualNode>,
+    pub(super) layout_scratch: LayoutScratch,
+    pub(super) last_canvas_rect: Option<Rect>,
+    pub(super) layout_dirty: bool,
+    pub(super) last_layout_refresh: Instant,
     pending_repaint: bool,
 }
 
@@ -538,6 +536,13 @@ impl eframe::App for DiskMapApp {
 }
 
 impl DiskMapApp {
+    // The toolbar is intentionally kept in `app.rs` rather than moved to
+    // `app/panels/toolbar.rs`: it composes 25+ fields (path input, exclude
+    // input, all scan-option toggles, search bar, depth controls, nav
+    // buttons, roots menu) and ~30 method calls. Splitting it would either
+    // require exposing a wide slice of `DiskMapApp` internals or threading
+    // a "view" struct through every helper. Cost/benefit is poor for a
+    // single per-frame renderer. Revisit if app.rs grows further.
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if icon_button(ui, self.navigation.can_go_back(), ToolbarIcon::ArrowLeft)
@@ -761,734 +766,47 @@ impl DiskMapApp {
     }
 
     fn show_roots_menu(&mut self, ui: &mut egui::Ui) {
-        let pin_candidate = self.current_root_candidate();
-        let is_pinned = pin_candidate
-            .as_deref()
-            .is_some_and(|path| self.is_root_pinned(path));
-
-        ui.menu_button("Roots", |ui| {
-            ui.set_min_width(280.0);
-            let can_pin = pin_candidate.is_some();
-            let pin_label = if is_pinned {
-                "Unpin Current"
-            } else {
-                "Pin Current"
-            };
-            if ui
-                .add_enabled(can_pin, egui::Button::new(pin_label))
-                .clicked()
-            {
-                if let Some(path) = pin_candidate.as_deref() {
-                    self.toggle_pinned_root(path);
-                }
-                ui.close();
-            }
-
-            ui.separator();
-            self.show_root_menu_group(ui, "Pinned", self.pinned_roots.clone());
-            self.show_root_menu_group(ui, "Recent", self.recent_roots.clone());
-        })
-        .response
-        .on_hover_text("Open recent and pinned scan roots");
-    }
-
-    fn show_root_menu_group(&mut self, ui: &mut egui::Ui, label: &str, roots: Vec<String>) {
-        ui.label(
-            RichText::new(label)
-                .size(10.0)
-                .strong()
-                .color(palette(ui.ctx()).text_faint),
-        );
-        if roots.is_empty() {
-            ui.label(
-                RichText::new("None")
-                    .small()
-                    .color(palette(ui.ctx()).text_faint),
-            );
-            return;
-        }
-
-        for path in roots {
-            if ui
-                .button(truncate_middle(&path, 54))
-                .on_hover_text(&path)
-                .clicked()
-            {
-                self.start_scan_path(PathBuf::from(path));
-                ui.close();
-            }
-        }
+        panels::roots_menu::show_roots_menu(ui, self);
     }
 
     fn show_details_panel(&mut self, ui: &mut egui::Ui) {
-        let p = palette(ui.ctx());
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("DETAILS")
-                .size(11.0)
-                .strong()
-                .color(p.text_muted),
-        );
-        ui.add_space(2.0);
-        section_divider(ui, p);
-        ui.add_space(8.0);
-
-        let subject_id = self
-            .navigation
-            .selected_id()
-            .or(self.navigation.focused_root());
-        let Some(node_id) = subject_id else {
-            self.show_state_message(ui, p, &self.no_root_state_message());
-            self.show_progress_section(ui, p);
-            self.show_scan_issue_section(ui, p);
-            self.show_search_section(ui, p);
-            return;
-        };
-
-        let node_path = self.tree.node_real_path(node_id);
-        let (node_name, node_size, node_kind, child_count, node_scanned, node_error, node_parent) = {
-            let node = self.tree.node(node_id);
-            (
-                node.name.clone(),
-                node.size,
-                node.kind,
-                node.children.len(),
-                node.scanned,
-                node.error.clone(),
-                node.parent,
-            )
-        };
-        let matched = self.search.state().is_match(node_id);
-        let kind_label = describe_node_kind(node_kind, child_count > 0);
-
-        egui::Frame::new()
-            .fill(p.panel_elevated)
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::same(12))
-            .stroke(Stroke::new(1.0, p.stroke_subtle))
-            .show(ui, |ui| {
-                ui.label(RichText::new(&node_name).strong().size(14.0).color(p.text));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format_bytes(node_size))
-                            .monospace()
-                            .color(p.accent),
-                    );
-                });
-                ui.label(
-                    RichText::new(size_basis_label())
-                        .small()
-                        .color(p.text_faint),
-                )
-                .on_hover_text(size_basis_detail());
-                ui.add_space(4.0);
-                let meta = if child_count > 0 {
-                    format!("{kind_label} · {} items", child_count)
-                } else {
-                    kind_label.to_string()
-                };
-                ui.label(RichText::new(meta).small().color(p.text_muted));
-                if !node_scanned {
-                    ui.label(
-                        RichText::new("Scanning in progress…")
-                            .small()
-                            .color(p.accent),
-                    );
-                }
-                if !self.search.query().is_empty() {
-                    let (txt, color) = if matched {
-                        ("Matches search", p.accent)
-                    } else {
-                        ("No search match", p.text_faint)
-                    };
-                    ui.label(RichText::new(txt).small().color(color));
-                }
-                if let Some(path) = &node_path {
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(path.display().to_string())
-                                .monospace()
-                                .small()
-                                .color(p.text_faint),
-                        )
-                        .wrap(),
-                    );
-                }
-            });
-
-        if let Some(err) = &node_error {
-            ui.add_space(6.0);
-            egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(
-                    p.danger.r(),
-                    p.danger.g(),
-                    p.danger.b(),
-                    28,
-                ))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::same(10))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(format!("Error: {err}")).color(p.danger));
-                });
-        }
-
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("PRIMARY")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        let path_available = node_path.is_some();
-        ui.columns(2, |cols| {
-            let w0 = cols[0].available_width();
-            if accent_button(&mut cols[0], "Open", path_available, w0, p).clicked() {
-                if let Some(path) = &node_path {
-                    self.apply_platform_result("Open", open_path(path));
-                }
-            }
-            let w1 = cols[1].available_width();
-            if cols[1]
-                .add_enabled(
-                    path_available,
-                    egui::Button::new("Reveal").min_size(Vec2::new(w1, 32.0)),
-                )
-                .clicked()
-            {
-                if let Some(path) = &node_path {
-                    self.apply_platform_result("Reveal", reveal_in_finder(path));
-                }
-            }
-        });
-
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new("UTILITY")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        let copy_width = ui.available_width();
-        if ui
-            .add_enabled(
-                path_available,
-                egui::Button::new("Copy Path").min_size(Vec2::new(copy_width, 28.0)),
-            )
-            .clicked()
-        {
-            if let Some(path) = &node_path {
-                ui.ctx().copy_text(path.display().to_string());
-            }
-        }
-        ui.add_space(4.0);
-        ui.add_sized(
-            [ui.available_width(), 26.0],
-            egui::TextEdit::singleline(&mut self.protected_paths_input)
-                .hint_text("Protected paths"),
-        )
-        .on_hover_text("Extra protected roots; comma, semicolon, or newline separated");
-
-        let trash_width = ui.available_width();
-        let trash_response = ui.add_enabled(
-            path_available,
-            egui::Button::new("Move to Trash").min_size(Vec2::new(trash_width, 28.0)),
-        );
-        let trash_response = if !path_available {
-            trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
-        } else {
-            trash_response.on_hover_text("Move this item to Trash")
-        };
-        if trash_response.clicked() {
-            self.move_node_to_trash(node_id);
-        }
-        ui.add_space(4.0);
-        let focused_export_id = self.navigation.focused_root();
-        let scan_root_export_id = self.tree.root;
-        let scan_root_is_focused =
-            focused_export_id.is_some() && focused_export_id == scan_root_export_id;
-        ui.columns(2, |cols| {
-            let can_export = focused_export_id.is_some();
-            let w0 = cols[0].available_width();
-            if cols[0]
-                .add_enabled(
-                    can_export,
-                    egui::Button::new("Export View CSV").min_size(Vec2::new(w0, 28.0)),
-                )
-                .clicked()
-            {
-                self.export_focused_subtree(ExportFormat::Csv);
-            }
-            let w1 = cols[1].available_width();
-            if cols[1]
-                .add_enabled(
-                    can_export,
-                    egui::Button::new("Export View JSON").min_size(Vec2::new(w1, 28.0)),
-                )
-                .clicked()
-            {
-                self.export_focused_subtree(ExportFormat::Json);
-            }
-        });
-        if !scan_root_is_focused {
-            ui.add_space(4.0);
-            ui.columns(2, |cols| {
-                let can_export = scan_root_export_id.is_some();
-                let w0 = cols[0].available_width();
-                if cols[0]
-                    .add_enabled(
-                        can_export,
-                        egui::Button::new("Export Root CSV").min_size(Vec2::new(w0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    self.export_scan_root(ExportFormat::Csv);
-                }
-                let w1 = cols[1].available_width();
-                if cols[1]
-                    .add_enabled(
-                        can_export,
-                        egui::Button::new("Export Root JSON").min_size(Vec2::new(w1, 28.0)),
-                    )
-                    .clicked()
-                {
-                    self.export_scan_root(ExportFormat::Json);
-                }
-            });
-        }
-        ui.add_space(4.0);
-        let report_width = ui.available_width();
-        if ui
-            .add_enabled(
-                focused_export_id.is_some(),
-                egui::Button::new("Export Report JSON").min_size(Vec2::new(report_width, 28.0)),
-            )
-            .on_hover_text("Export current view data plus metadata needed to reproduce this view")
-            .clicked()
-        {
-            self.export_focused_report_json();
-        }
-        ui.add_space(4.0);
-        let duplicate_width = ui.available_width();
-        if ui
-            .add_enabled(
-                focused_export_id.is_some() && !self.scan.is_scanning(),
-                egui::Button::new("Analyze Duplicates").min_size(Vec2::new(duplicate_width, 28.0)),
-            )
-            .on_hover_text("Read-only heuristic: same file name and same size in the current view")
-            .clicked()
-        {
-            self.analyze_duplicate_candidates();
-        }
-        ui.add_space(4.0);
-        let insight_width = ui.available_width();
-        if ui
-            .add_enabled(
-                focused_export_id.is_some() && !self.scan.is_scanning(),
-                egui::Button::new("Analyze Insights").min_size(Vec2::new(insight_width, 28.0)),
-            )
-            .on_hover_text("Read-only age buckets and extension category summary for this view")
-            .clicked()
-        {
-            self.analyze_file_insights();
-        }
-
-        if let Some(parent) = node_parent {
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new("PARENT")
-                    .size(10.0)
-                    .strong()
-                    .color(p.text_faint),
-            );
-            ui.add_space(4.0);
-            let parent_name = self.tree.node(parent).name.clone();
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(format!("↑ {parent_name}")).color(p.text))
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::new(1.0, p.stroke_subtle)),
-                )
-                .clicked()
-            {
-                self.navigation.set_selected_id(Some(parent));
-            }
-        }
-
-        self.show_progress_section(ui, p);
-        self.show_scan_issue_section(ui, p);
-        self.show_cleanup_queue_section(ui, p);
-        self.show_snapshot_diff_section(ui, p);
-        self.show_duplicate_report_section(ui, p);
-        self.show_insight_report_section(ui, p);
-        self.show_search_section(ui, p);
+        panels::details::show(ui, self);
     }
 
     fn show_progress_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let Some(progress) = self.scan.progress() else {
-            return;
-        };
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("SCAN")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} files · {} dirs",
-                progress.files_scanned, progress.dirs_scanned
-            ))
-            .small()
-            .color(p.text_muted),
-        );
-        ui.label(
-            RichText::new(format_bytes(progress.bytes_seen))
-                .monospace()
-                .color(p.text),
-        );
-        ui.label(
-            RichText::new(size_basis_label())
-                .small()
-                .color(p.text_faint),
-        )
-        .on_hover_text(size_basis_detail());
-        let current_path = truncate_middle(&progress.current_path.display().to_string(), 42);
-        ui.add(
-            egui::Label::new(
-                RichText::new(current_path)
-                    .small()
-                    .monospace()
-                    .color(p.text_faint),
-            )
-            .truncate(),
-        );
+        panels::sections::show_progress_section(ui, p, self);
     }
 
     fn show_state_message(&self, ui: &mut egui::Ui, p: &Palette, message: &StateMessage) {
-        ui.label(
-            RichText::new(message.title)
-                .strong()
-                .size(14.0)
-                .color(p.text),
-        );
-        ui.add_space(4.0);
-        ui.add(egui::Label::new(RichText::new(&message.detail).color(p.text_muted).small()).wrap());
+        panels::sections::show_state_message(ui, p, message);
     }
 
     fn show_scan_issue_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let summary = self.scan.issue_summary();
-        if !summary.has_findings() {
-            return;
-        }
-
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("SCAN ISSUES")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        for (label, count, color) in [
-            ("Error entries", summary.error_entries, p.danger),
-            ("Skipped paths", summary.skipped_paths, p.text_muted),
-            ("Permission errors", summary.permission_errors, p.danger),
-            ("Symlinks", summary.symlinks, p.text_muted),
-        ] {
-            if count == 0 {
-                continue;
-            }
-            ui.label(
-                RichText::new(format!("{label}: {count}"))
-                    .small()
-                    .color(color),
-            );
-        }
+        panels::sections::show_scan_issue_section(ui, p, self);
     }
 
     fn show_cleanup_queue_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        if self.cleanup_queue.is_empty() {
-            return;
-        }
-
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("CLEANUP QUEUE")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} · {}",
-                pluralize(self.cleanup_queue.len() as u64, "candidate", "candidates"),
-                format_bytes(self.cleanup_queue.total_size())
-            ))
-            .small()
-            .color(p.text_muted),
-        );
-
-        let candidates = self.cleanup_queue.candidates().to_vec();
-        for candidate in candidates {
-            cleanup_candidate_row(ui, p, &candidate);
-            ui.columns(2, |cols| {
-                let w0 = cols[0].available_width();
-                if cols[0]
-                    .add(
-                        egui::Button::new(
-                            if self.trash_confirm_target_id == Some(candidate.node_id) {
-                                "Confirm Trash"
-                            } else {
-                                "Trash"
-                            },
-                        )
-                        .min_size(Vec2::new(w0, 24.0)),
-                    )
-                    .clicked()
-                {
-                    self.arm_or_confirm_queued_trash(candidate.node_id);
-                }
-                let w1 = cols[1].available_width();
-                if cols[1]
-                    .add(egui::Button::new("Remove").min_size(Vec2::new(w1, 24.0)))
-                    .clicked()
-                {
-                    self.remove_cleanup_candidate(candidate.node_id);
-                }
-            });
-            ui.add_space(4.0);
-        }
+        panels::sections::show_cleanup_queue_section(ui, p, self);
     }
 
     fn show_search_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let query = self.search.query();
-        if query.is_empty() {
-            return;
-        }
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("SEARCH")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("Query: {query}"))
-                .small()
-                .color(p.text_muted),
-        );
-        let match_text = if self.search.is_dirty() {
-            format!("{} matches · Updating…", self.search.state().match_count())
-        } else if let Some(index) = self.search.active_match() {
-            format!(
-                "{} / {} matches · Ready",
-                index + 1,
-                self.search.state().match_count()
-            )
-        } else {
-            format!("{} matches · Ready", self.search.state().match_count())
-        };
-        ui.label(
-            RichText::new(match_text)
-                .small()
-                .color(if self.search.is_dirty() {
-                    p.accent
-                } else {
-                    p.text_muted
-                }),
-        );
+        panels::sections::show_search_section(ui, p, self);
     }
 
     fn show_snapshot_diff_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let Some(diff) = &self.snapshot_diff else {
-            return;
-        };
-
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("SNAPSHOT DIFF")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} total change",
-                format_signed_bytes(diff.total_delta())
-            ))
-            .small()
-            .monospace()
-            .color(if diff.total_delta() >= 0 {
-                p.accent
-            } else {
-                p.text_muted
-            }),
-        )
-        .on_hover_text(diff.root_path.display().to_string());
-
-        if !diff.has_changes() {
-            ui.label(
-                RichText::new("No path-level changes since previous scan.")
-                    .small()
-                    .color(p.text_muted),
-            );
-            return;
-        }
-
-        snapshot_change_group(ui, p, "Added", &diff.added);
-        snapshot_change_group(ui, p, "Grown", &diff.grown);
-        snapshot_change_group(ui, p, "Shrunk", &diff.shrunk);
-        snapshot_change_group(ui, p, "Removed", &diff.removed);
+        panels::sections::show_snapshot_diff_section(ui, p, self);
     }
 
     fn show_duplicate_report_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let Some(report) = &self.duplicate_report else {
-            return;
-        };
-
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("DUPLICATE CANDIDATES")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} groups · {} files · up to {} candidates",
-                report.group_count,
-                report.file_count,
-                format_bytes(report.total_reclaimable_bytes)
-            ))
-            .small()
-            .color(p.text_muted),
-        )
-        .on_hover_text(report.root_path.display().to_string());
-
-        if report.candidates.is_empty() {
-            ui.label(
-                RichText::new("No same-name same-size candidates in this view.")
-                    .small()
-                    .color(p.text_muted),
-            );
-            return;
-        }
-
-        for candidate in &report.candidates {
-            duplicate_candidate_row(ui, p, candidate);
-        }
+        panels::sections::show_duplicate_report_section(ui, p, self);
     }
 
     fn show_insight_report_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        let Some(report) = &self.insight_report else {
-            return;
-        };
-
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("INSIGHTS")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} files · {} known mtimes · {}",
-                report.file_count,
-                report.known_mtime_count,
-                format_bytes(report.total_size)
-            ))
-            .small()
-            .color(p.text_muted),
-        )
-        .on_hover_text(report.root_path.display().to_string());
-
-        if report.file_count == 0 {
-            ui.label(
-                RichText::new("No files in this view.")
-                    .small()
-                    .color(p.text_muted),
-            );
-            return;
-        }
-
-        insight_type_group(ui, p, &report.type_summaries);
-        insight_age_group(ui, p, &report.age_buckets);
-        insight_old_files_group(ui, p, &report.old_large_files);
+        panels::sections::show_insight_report_section(ui, p, self);
     }
 
     fn show_status_bar(&self, ui: &mut egui::Ui) {
-        let p = palette(ui.ctx());
-        let full_rect = ui.max_rect();
-        ui.painter().line_segment(
-            [full_rect.left_top(), full_rect.right_top()],
-            Stroke::new(1.0, p.stroke_subtle),
-        );
-
-        ui.horizontal_centered(|ui| {
-            ui.add_space(4.0);
-            let dot_color = if self.status.starts_with("Error") {
-                p.danger
-            } else if self.scan.is_scanning() {
-                p.accent
-            } else if self.status.starts_with("Cancel") {
-                p.text_faint
-            } else {
-                Color32::from_rgb(0x4A, 0xC4, 0x7A)
-            };
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-            ui.label(RichText::new(&self.status).size(11.5).color(p.text_muted));
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(6.0);
-                if !self.navigation.breadcrumb().is_empty() {
-                    let crumb = self.navigation.breadcrumb().replace(" / ", " › ");
-                    let display = truncate_middle(&crumb, 60);
-                    ui.label(
-                        RichText::new(display)
-                            .size(11.5)
-                            .monospace()
-                            .color(p.text_faint),
-                    );
-                }
-
-                if let Some(progress) = self.scan.progress() {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("│").size(11.0).color(p.text_faint));
-                    ui.add_space(10.0);
-                    let text = format!(
-                        "{} files · {} dirs · {}",
-                        progress.files_scanned,
-                        progress.dirs_scanned,
-                        format_bytes(progress.bytes_seen)
-                    );
-                    ui.label(RichText::new(text).size(11.5).color(p.text_muted));
-                    let current_path =
-                        truncate_middle(&progress.current_path.display().to_string(), 44);
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("│").size(11.0).color(p.text_faint));
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(current_path)
-                            .size(11.5)
-                            .monospace()
-                            .color(p.text_faint),
-                    );
-                }
-            });
-        });
+        panels::sections::show_status_bar(ui, self);
     }
 
     fn no_root_state_message(&self) -> StateMessage {
@@ -1560,206 +878,7 @@ impl DiskMapApp {
     }
 
     fn show_treemap(&mut self, ui: &mut egui::Ui) {
-        let p = palette(ui.ctx());
-        let available = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(available, Sense::click_and_drag());
-        let painter = ui.painter_at(available);
-        painter.rect_filled(available, 0.0, p.surface);
-
-        let Some(root_id) = self.navigation.focused_root() else {
-            self.paint_state_message(
-                &painter,
-                available,
-                ui.style(),
-                p,
-                &self.no_root_state_message(),
-            );
-            return;
-        };
-
-        if let Some(message) = self.empty_root_state_message(root_id) {
-            self.paint_state_message(&painter, available, ui.style(), p, &message);
-            return;
-        }
-
-        let canvas_changed = self.last_canvas_rect != Some(available);
-        if canvas_changed {
-            self.last_canvas_rect = Some(available);
-            self.layout_dirty = true;
-            self.last_layout_refresh = Instant::now()
-                .checked_sub(LAYOUT_REFRESH_INTERVAL)
-                .unwrap_or_else(Instant::now);
-        }
-
-        let should_refresh_layout = self.layout_dirty
-            && (!self.scan.is_scanning()
-                || self.last_layout_refresh.elapsed() >= LAYOUT_REFRESH_INTERVAL);
-
-        if should_refresh_layout {
-            let layout_start = Instant::now();
-            layout_treemap(
-                &mut self.tree,
-                TreemapLayoutParams {
-                    root: root_id,
-                    canvas_rect: available,
-                    camera: self.camera,
-                    max_depth: self.max_depth,
-                    search_state: self.search.state(),
-                    filter_to_search: self.search_filter_enabled,
-                    out: &mut self.cached_visuals,
-                    scratch: &mut self.layout_scratch,
-                },
-            );
-            self.layout_dirty = false;
-            self.last_layout_refresh = Instant::now();
-            self.scan.record_layout_recompute(layout_start.elapsed());
-        }
-
-        self.hovered_visual_kind = find_hovered_visual(&self.cached_visuals, response.hover_pos())
-            .map(|visual| visual.kind);
-        self.hovered_id = self.hovered_visual_kind.map(|kind| match kind {
-            VisualKind::Node(node_id) => node_id,
-        });
-
-        if response.secondary_clicked() {
-            self.context_menu_target_id = self.hovered_id;
-        }
-
-        if response.dragged() && self.search.input().is_empty() {
-            let drag_delta = response.drag_delta();
-            if drag_delta != Vec2::ZERO {
-                self.camera.pan += drag_delta;
-                self.layout_dirty = true;
-                self.last_layout_refresh = Instant::now()
-                    .checked_sub(LAYOUT_REFRESH_INTERVAL)
-                    .unwrap_or_else(Instant::now);
-            }
-        }
-
-        let zoom_delta = ui.ctx().input(|input| input.zoom_delta());
-        if (zoom_delta - 1.0).abs() > f32::EPSILON {
-            if let Some(pointer) = response.hover_pos() {
-                self.camera.zoom_around(pointer, zoom_delta);
-                self.layout_dirty = true;
-                self.last_layout_refresh = Instant::now()
-                    .checked_sub(LAYOUT_REFRESH_INTERVAL)
-                    .unwrap_or_else(Instant::now);
-            }
-        }
-
-        for visual in &self.cached_visuals {
-            self.paint_visual(ui, &painter, visual);
-        }
-        if response.double_clicked() {
-            if let Some(node_id) = self.hovered_id {
-                if !self.tree.node(node_id).children.is_empty() {
-                    self.enter_root(node_id, true);
-                } else {
-                    self.navigation.set_selected_id(Some(node_id));
-                }
-            } else {
-                self.reset_camera();
-            }
-        } else if response.clicked() {
-            if let Some(node_id) = self.hovered_id {
-                self.navigation.set_selected_id(Some(node_id));
-            } else {
-                self.navigation.set_selected_id(None);
-            }
-        }
-
-        response.context_menu(|ui| {
-            if let Some(node_id) = self.context_menu_target_id {
-                let p = palette(ui.ctx());
-                let node_path = self.tree.node_real_path(node_id);
-                let node = self.tree.node(node_id);
-                let node_name = node.name.clone();
-                let node_size = node.size;
-                ui.set_min_width(CONTEXT_MENU_MIN_WIDTH);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(truncate_middle(&node_name, CONTEXT_MENU_MAX_TITLE_CHARS))
-                            .strong()
-                            .color(p.text),
-                    );
-                    ui.label(
-                        RichText::new(format_bytes(node_size))
-                            .small()
-                            .monospace()
-                            .color(p.text_muted),
-                    );
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            node_path.is_some(),
-                            egui::Button::new("Open")
-                                .min_size(Vec2::new(ui.available_width(), 24.0)),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = &node_path {
-                            self.apply_platform_result("Open", open_path(path));
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            node_path.is_some(),
-                            egui::Button::new("Reveal in Finder")
-                                .min_size(Vec2::new(ui.available_width(), 24.0)),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = &node_path {
-                            self.apply_platform_result("Reveal", reveal_in_finder(path));
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            node_path.is_some(),
-                            egui::Button::new("Copy Path")
-                                .min_size(Vec2::new(ui.available_width(), 24.0)),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = &node_path {
-                            ui.ctx().copy_text(path.display().to_string());
-                        }
-                        ui.close();
-                    }
-                    ui.separator();
-                    let trash_response = ui.add_enabled(
-                        node_path.is_some(),
-                        egui::Button::new("Move to Trash")
-                            .min_size(Vec2::new(ui.available_width(), 24.0)),
-                    );
-                    let trash_response = if node_path.is_none() {
-                        trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
-                    } else {
-                        trash_response.on_hover_text("Move this item to Trash")
-                    };
-                    if trash_response.clicked() {
-                        self.move_node_to_trash(node_id);
-                        ui.close();
-                    }
-                });
-            }
-        });
-
-        let context_menu_open = response.context_menu_opened();
-
-        if !context_menu_open {
-            self.context_menu_target_id = None;
-        }
-
-        if !context_menu_open {
-            if let Some(node_id) = self.hovered_id {
-                if let Some(pos) = response.hover_pos() {
-                    self.show_hover_tooltip(ui, node_id, pos);
-                }
-            }
-        }
+        panels::treemap_view::show(ui, self);
     }
 
     fn show_hover_tooltip(&mut self, ui: &egui::Ui, node_id: NodeId, pos: Pos2) {
@@ -2692,7 +1811,7 @@ impl DiskMapApp {
             &mut self.tree,
             root_id,
             current_unix_secs(),
-            INSIGHT_REPORT_LIMIT,
+            crate::insights::INSIGHT_REPORT_LIMIT,
         ) {
             Some(report) => {
                 self.status = format!(
@@ -2955,7 +2074,7 @@ impl DiskMapApp {
     }
 }
 
-fn find_hovered_visual(visuals: &[VisualNode], pos: Option<Pos2>) -> Option<&VisualNode> {
+pub(super) fn find_hovered_visual(visuals: &[VisualNode], pos: Option<Pos2>) -> Option<&VisualNode> {
     let pos = pos?;
     visuals.iter().rev().find(|visual| {
         visual.rect.contains(pos) && visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0
@@ -3041,7 +2160,7 @@ fn stroke_for_visual(
     }
 }
 
-fn describe_node_kind(kind: NodeKind, has_children: bool) -> &'static str {
+pub(super) fn describe_node_kind(kind: NodeKind, has_children: bool) -> &'static str {
     match kind {
         NodeKind::Dir if has_children => "Directory",
         NodeKind::Dir => "Empty directory",
@@ -3300,7 +2419,7 @@ fn theme_cycle_button(ui: &mut egui::Ui) -> Option<Theme> {
     }
 }
 
-fn section_divider(ui: &mut egui::Ui, palette: &Palette) {
+pub(super) fn section_divider(ui: &mut egui::Ui, palette: &Palette) {
     let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), 1.0));
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
@@ -3308,7 +2427,7 @@ fn section_divider(ui: &mut egui::Ui, palette: &Palette) {
     );
 }
 
-fn accent_button(
+pub(super) fn accent_button(
     ui: &mut egui::Ui,
     label: &str,
     enabled: bool,
@@ -3334,113 +2453,6 @@ fn accent_button(
     )
 }
 
-fn snapshot_change_group(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    label: &str,
-    changes: &[SnapshotChange],
-) {
-    if changes.is_empty() {
-        return;
-    }
-
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(format!("{label}: {}", changes.len()))
-            .small()
-            .strong()
-            .color(palette.text_muted),
-    );
-    for change in changes {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format_signed_bytes(change.delta))
-                    .small()
-                    .monospace()
-                    .color(if change.delta >= 0 {
-                        palette.accent
-                    } else {
-                        palette.text_muted
-                    }),
-            );
-            ui.add(
-                egui::Label::new(
-                    RichText::new(truncate_middle(&change.path, 34))
-                        .small()
-                        .color(palette.text_faint),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&change.path);
-        });
-    }
-}
-
-fn duplicate_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &DuplicateCandidate) {
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(format!(
-            "{} · {} files · {} each",
-            truncate_middle(&candidate.name, 28),
-            candidate.paths.len(),
-            format_bytes(candidate.size)
-        ))
-        .small()
-        .strong()
-        .color(palette.text_muted),
-    );
-    ui.label(
-        RichText::new(format!(
-            "Potential reclaim: {}",
-            format_bytes(candidate.reclaimable_bytes)
-        ))
-        .small()
-        .monospace()
-        .color(palette.accent),
-    );
-    for path in candidate.paths.iter().take(3) {
-        ui.add(
-            egui::Label::new(
-                RichText::new(truncate_middle(path, 38))
-                    .small()
-                    .color(palette.text_faint),
-            )
-            .truncate(),
-        )
-        .on_hover_text(path);
-    }
-}
-
-fn cleanup_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &CleanupCandidate) {
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new(format!(
-            "{} · {} · {}",
-            truncate_middle(&candidate.name, 28),
-            describe_node_kind(candidate.kind, candidate.item_count > 1),
-            pluralize(candidate.item_count as u64, "item", "items")
-        ))
-        .small()
-        .strong()
-        .color(palette.text_muted),
-    );
-    ui.label(
-        RichText::new(format_bytes(candidate.size))
-            .small()
-            .monospace()
-            .color(palette.accent),
-    );
-    ui.add(
-        egui::Label::new(
-            RichText::new(truncate_middle(&candidate.path.display().to_string(), 38))
-                .small()
-                .color(palette.text_faint),
-        )
-        .truncate(),
-    )
-    .on_hover_text(candidate.path.display().to_string());
-}
-
 fn protected_path_status(reason: ProtectedPathReason, path: &Path) -> String {
     format!(
         "Protected path blocked: {} ({})",
@@ -3464,122 +2476,6 @@ fn cleanup_target_inaccessible_status(path: &Path, error: &str) -> String {
     )
 }
 
-fn insight_type_group(ui: &mut egui::Ui, palette: &Palette, summaries: &[FileTypeSummary]) {
-    if summaries.is_empty() {
-        return;
-    }
-
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("By type")
-            .small()
-            .strong()
-            .color(palette.text_muted),
-    );
-    for summary in summaries.iter().take(INSIGHT_REPORT_LIMIT) {
-        let ext = if summary.extension == "(none)" {
-            "no ext".to_string()
-        } else {
-            format!(".{}", summary.extension)
-        };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format_bytes(summary.total_size))
-                    .small()
-                    .monospace()
-                    .color(palette.accent),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "{} {ext} · {}",
-                    summary.category,
-                    pluralize(summary.file_count as u64, "file", "files")
-                ))
-                .small()
-                .color(palette.text_faint),
-            );
-        });
-    }
-}
-
-fn insight_age_group(ui: &mut egui::Ui, palette: &Palette, summaries: &[AgeBucketSummary]) {
-    if summaries.iter().all(|summary| summary.file_count == 0) {
-        return;
-    }
-
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("By modified age")
-            .small()
-            .strong()
-            .color(palette.text_muted),
-    );
-    for summary in summaries {
-        if summary.file_count == 0 {
-            continue;
-        }
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format_bytes(summary.total_size))
-                    .small()
-                    .monospace()
-                    .color(if summary.bucket.label() == "unknown" {
-                        palette.text_faint
-                    } else {
-                        palette.accent
-                    }),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "{} · {}",
-                    summary.bucket.label(),
-                    pluralize(summary.file_count as u64, "file", "files")
-                ))
-                .small()
-                .color(palette.text_faint),
-            );
-        });
-    }
-}
-
-fn insight_old_files_group(ui: &mut egui::Ui, palette: &Palette, files: &[OldLargeFile]) {
-    if files.is_empty() {
-        return;
-    }
-
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("Old large files")
-            .small()
-            .strong()
-            .color(palette.text_muted),
-    );
-    for file in files.iter().take(INSIGHT_REPORT_LIMIT) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format_bytes(file.size))
-                    .small()
-                    .monospace()
-                    .color(palette.accent),
-            );
-            ui.label(
-                RichText::new(format!("{}d · {}", file.age_days, file.category))
-                    .small()
-                    .color(palette.text_muted),
-            );
-        });
-        ui.add(
-            egui::Label::new(
-                RichText::new(truncate_middle(&file.path, 38))
-                    .small()
-                    .color(palette.text_faint),
-            )
-            .truncate(),
-        )
-        .on_hover_text(&file.path);
-    }
-}
-
 fn current_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3591,7 +2487,7 @@ fn dirs_home_fallback() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
 
-fn truncate_middle(input: &str, max_chars: usize) -> String {
+pub(super) fn truncate_middle(input: &str, max_chars: usize) -> String {
     let char_count = input.chars().count();
     if char_count <= max_chars {
         return input.to_string();
@@ -3611,19 +2507,11 @@ fn truncate_middle(input: &str, max_chars: usize) -> String {
     format!("{left}…{right}")
 }
 
-fn pluralize(count: u64, singular: &str, plural: &str) -> String {
+pub(super) fn pluralize(count: u64, singular: &str, plural: &str) -> String {
     if count == 1 {
         format!("{count} {singular}")
     } else {
         format!("{count} {plural}")
-    }
-}
-
-fn format_signed_bytes(delta: i128) -> String {
-    if delta >= 0 {
-        format!("+{}", format_bytes(delta as u64))
-    } else {
-        format!("-{}", format_bytes(delta.unsigned_abs() as u64))
     }
 }
 
