@@ -22,13 +22,15 @@
 //! new `RulePredicate` variant later without breaking the data model.
 
 use crate::tree::{Node, NodeId, NodeKind, TreeStore};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Cap on how many hits `evaluate_rules` will collect and return.
 /// Matches the convention in `insights::INSIGHT_REPORT_LIMIT` so the
 /// sidebar section doesn't grow unbounded for very large trees.
 pub const INSIGHT_REPORT_LIMIT_FROM_RULES: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleCategory {
     /// A read-only observation about a node (e.g. "this file is
     /// unusually large for a hidden file").
@@ -51,7 +53,7 @@ impl RuleCategory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RulePredicate {
     /// Match a file whose size is at least `min_size` bytes.
     LargeFile { min_size: u64 },
@@ -70,7 +72,7 @@ pub enum RulePredicate {
     AlwaysProtected { path_pattern: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub id: String,
     pub name: String,
@@ -80,7 +82,7 @@ pub struct Rule {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
@@ -363,6 +365,90 @@ pub fn default_ruleset() -> RuleSet {
     set
 }
 
+/// Wire format version. Bump when the JSON shape changes.
+pub const RULES_FORMAT_VERSION: u32 = 1;
+
+/// Wrapper struct for JSON serialization. Adds a `version` field at
+/// the top level so future readers can detect incompatible files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedRuleSet {
+    pub version: u32,
+    pub rules: Vec<Rule>,
+}
+
+impl From<&RuleSet> for ExportedRuleSet {
+    fn from(set: &RuleSet) -> Self {
+        Self {
+            version: RULES_FORMAT_VERSION,
+            rules: set.rules.clone(),
+        }
+    }
+}
+
+impl From<ExportedRuleSet> for RuleSet {
+    fn from(exp: ExportedRuleSet) -> Self {
+        Self { rules: exp.rules }
+    }
+}
+
+/// Serialize a `RuleSet` to pretty JSON. Always writes the current
+/// `RULES_FORMAT_VERSION` so future readers can sanity-check.
+pub fn export_ruleset_json(set: &RuleSet) -> String {
+    let exp = ExportedRuleSet::from(set);
+    serde_json::to_string_pretty(&exp)
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialize failed: {e}\"}}"))
+}
+
+/// Parse and validate JSON into a `RuleSet`. Returns a human-readable
+/// error on any failure (invalid JSON, wrong version, missing fields,
+/// empty id, etc.). Path-safety: doesn't actually load files; the
+/// caller reads the file and passes the contents in.
+pub fn import_ruleset_json(text: &str) -> Result<RuleSet, String> {
+    let exp: ExportedRuleSet = serde_json::from_str(text)
+        .map_err(|e| format!("invalid JSON: {e}"))?;
+    if exp.version != RULES_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported version: expected {}, got {}",
+            RULES_FORMAT_VERSION, exp.version
+        ));
+    }
+    for (i, rule) in exp.rules.iter().enumerate() {
+        if rule.id.trim().is_empty() {
+            return Err(format!("rule at index {i} has empty id"));
+        }
+        if rule.name.trim().is_empty() {
+            return Err(format!("rule '{}' has empty name", rule.id));
+        }
+    }
+    Ok(RuleSet { rules: exp.rules })
+}
+
+/// Write the ruleset to `<dest_dir>/disk-map-rules-<ts>.json` and
+/// return the resulting path. Creates `dest_dir` if it doesn't exist.
+pub fn export_ruleset_to_dir(set: &RuleSet, dest_dir: &Path) -> std::io::Result<PathBuf> {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    fs::create_dir_all(dest_dir)?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dest_dir.join(format!("disk-map-rules-{ts}.json"));
+    let json = export_ruleset_json(set);
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
+/// Read JSON from `path` and parse it as a `RuleSet`. The path must
+/// already be a file; we don't recurse, follow symlinks, or do any
+/// other filesystem exploration. Returns a human-readable error on
+/// any I/O or parse failure.
+pub fn import_ruleset_from_path(path: &Path) -> Result<RuleSet, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    import_ruleset_json(&text)
+}
+
 fn score_for_size(actual: u64, threshold: u64) -> u32 {
     if threshold == 0 {
         return 50;
@@ -617,5 +703,48 @@ mod tests {
         rules.add(mk());
         rules.add(mk());
         assert_eq!(rules.rules.len(), 1);
+    }
+
+    #[test]
+    fn export_then_import_round_trips() {
+        let set = default_ruleset();
+        let json = export_ruleset_json(&set);
+        let restored = import_ruleset_json(&json).expect("import should succeed");
+        assert_eq!(restored, set);
+    }
+
+    #[test]
+    fn empty_ruleset_round_trips() {
+        let set = RuleSet::new();
+        let json = export_ruleset_json(&set);
+        let restored = import_ruleset_json(&json).unwrap();
+        assert_eq!(restored.rules.len(), 0);
+    }
+
+    #[test]
+    fn import_rejects_invalid_json() {
+        let err = import_ruleset_json("not json at all").unwrap_err();
+        assert!(err.contains("invalid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn import_rejects_wrong_version() {
+        let bad = r#"{"version": 999, "rules": []}"#;
+        let err = import_ruleset_json(bad).unwrap_err();
+        assert!(err.contains("version"), "got: {err}");
+    }
+
+    #[test]
+    fn import_rejects_empty_id() {
+        let bad = r#"{"version": 1, "rules": [{"id": "", "name": "x", "description": "", "category": "AnomalyHint", "predicate": "Hidden", "enabled": true}]}"#;
+        let err = import_ruleset_json(bad).unwrap_err();
+        assert!(err.contains("empty id"), "got: {err}");
+    }
+
+    #[test]
+    fn import_rejects_unknown_category_variant() {
+        let bad = r#"{"version": 1, "rules": [{"id": "x", "name": "x", "description": "", "category": "NoSuchCategory", "predicate": "Hidden", "enabled": true}]}"#;
+        let err = import_ruleset_json(bad).unwrap_err();
+        assert!(err.contains("invalid JSON") || err.contains("category"), "got: {err}");
     }
 }

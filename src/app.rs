@@ -312,6 +312,10 @@ pub struct DiskMapApp {
     /// Most recent result from `evaluate_current_rules`, if any.
     /// Surfaced in the rules section as a small summary.
     pub(super) last_rule_hits: Option<Vec<crate::rules::RuleHit>>,
+    /// Sticky text field for the rules import path. Self-clears after
+    /// a successful import. Avoids spawning a native file dialog (we
+    /// don't depend on a GUI toolkit for picking files).
+    pub(super) rules_import_path: String,
 }
 
 impl Default for DiskMapApp {
@@ -366,6 +370,7 @@ impl Default for DiskMapApp {
             recent_errors: VecDeque::new(),
             rules: crate::rules::default_ruleset(),
             last_rule_hits: None,
+            rules_import_path: String::new(),
         }
     }
 }

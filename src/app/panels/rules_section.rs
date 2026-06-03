@@ -5,6 +5,7 @@
 use super::super::DiskMapApp;
 use super::super::Palette;
 use crate::app::palette;
+use crate::rules::{export_ruleset_to_dir, import_ruleset_from_path};
 use eframe::egui::{self, RichText, Vec2};
 
 const RULES_HIT_PREVIEW: usize = 8;
@@ -62,6 +63,58 @@ pub fn show_rules_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) 
     {
         app.evaluate_current_rules();
     }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let w = ui.available_width() * 0.5 - 4.0;
+        if ui
+            .add(egui::Button::new("Export").min_size(Vec2::new(w, 24.0)))
+            .on_hover_text("Write the current ruleset to disk-map-rules-<ts>.json in the current working directory")
+            .clicked()
+        {
+            let dest = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match export_ruleset_to_dir(&app.rules, &dest) {
+                Ok(path) => {
+                    app.status = format!("Wrote rules: {}", path.display());
+                }
+                Err(error) => {
+                    app.record_error(format!("rules export failed: {error}"));
+                    app.status = format!("Rules export failed: {error}");
+                }
+            }
+            app.pending_repaint = true;
+        }
+        if ui
+            .add(egui::Button::new("Import").min_size(Vec2::new(w, 24.0)))
+            .on_hover_text("Load a ruleset JSON from the path below (replaces the current ruleset)")
+            .clicked()
+        {
+            let raw = app.rules_import_path.trim().to_string();
+            if raw.is_empty() {
+                app.status = "Type a path to import from".to_string();
+                app.pending_repaint = true;
+            } else {
+                match import_ruleset_from_path(std::path::Path::new(&raw)) {
+                    Ok(ruleset) => {
+                        app.rules = ruleset;
+                        app.last_rule_hits = None;
+                        app.rules_import_path.clear();
+                        app.status = format!("Imported rules from {}", raw);
+                    }
+                    Err(error) => {
+                        app.record_error(format!("rules import failed: {error}"));
+                        app.status = format!("Rules import failed: {error}");
+                    }
+                }
+                app.pending_repaint = true;
+            }
+        }
+    });
+    ui.add_sized(
+        [ui.available_width(), 22.0],
+        egui::TextEdit::singleline(&mut app.rules_import_path).hint_text("Path to rules JSON"),
+    )
+    .on_hover_text("Absolute or relative path to a rules JSON file. Cleared after a successful import.");
 
     if let Some(hits) = &app.last_rule_hits {
         ui.add_space(4.0);
