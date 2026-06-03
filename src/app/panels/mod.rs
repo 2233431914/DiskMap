@@ -4,5 +4,6 @@
 
 pub mod details;
 pub mod roots_menu;
+pub mod rules_section;
 pub mod sections;
 pub mod treemap_view;

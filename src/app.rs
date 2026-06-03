@@ -305,6 +305,13 @@ pub struct DiskMapApp {
     /// Bounded ring of recent error/status messages for diagnostics export.
     /// Capped at 64 entries; oldest dropped on overflow.
     recent_errors: VecDeque<String>,
+    /// Read-only rule engine state. Initialized from `default_ruleset`
+    /// on first launch; mutations happen only through the rules section
+    /// UI (toggle enabled flag).
+    pub(super) rules: crate::rules::RuleSet,
+    /// Most recent result from `evaluate_current_rules`, if any.
+    /// Surfaced in the rules section as a small summary.
+    pub(super) last_rule_hits: Option<Vec<crate::rules::RuleHit>>,
 }
 
 impl Default for DiskMapApp {
@@ -357,6 +364,8 @@ impl Default for DiskMapApp {
             safe_storage: SafeStorage::new(&app_data_dir("disk-map")),
             last_perf_stats: None,
             recent_errors: VecDeque::new(),
+            rules: crate::rules::default_ruleset(),
+            last_rule_hits: None,
         }
     }
 }
@@ -832,6 +841,10 @@ impl DiskMapApp {
         panels::sections::show_diagnostics_section(ui, p, self);
     }
 
+    fn show_rules_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        panels::rules_section::show_rules_section(ui, p, self);
+    }
+
     fn show_status_bar(&self, ui: &mut egui::Ui) {
         panels::sections::show_status_bar(ui, self);
     }
@@ -1284,6 +1297,38 @@ impl DiskMapApp {
             self.recent_errors.pop_front();
         }
         self.recent_errors.push_back(message);
+    }
+
+    /// Evaluate the current `rules` against the focused subtree and
+    /// cache the result in `last_rule_hits`. Returns the number of
+    /// hits found (capped at the same limit the engine uses).
+    pub fn evaluate_current_rules(&mut self) -> usize {
+        use crate::rules::{evaluate_rules, RuleContext, INSIGHT_REPORT_LIMIT_FROM_RULES};
+        let root_id = match self
+            .navigation
+            .focused_root()
+            .or(self.tree.root)
+        {
+            Some(id) => id,
+            None => {
+                self.last_rule_hits = Some(Vec::new());
+                self.status = "No scan loaded — apply rules to current view".to_string();
+                self.pending_repaint = true;
+                return 0;
+            }
+        };
+        let ctx = RuleContext {
+            now_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let hits = evaluate_rules(&self.rules, &mut self.tree, root_id, &ctx, INSIGHT_REPORT_LIMIT_FROM_RULES);
+        let count = hits.len();
+        self.last_rule_hits = Some(hits);
+        self.status = format!("Applied {} rules, found {count} hits", self.rules.enabled_count());
+        self.pending_repaint = true;
+        count
     }
 
     /// Build a snapshot bundle from the current app state and write it

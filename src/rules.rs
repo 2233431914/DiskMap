@@ -23,6 +23,11 @@
 
 use crate::tree::{Node, NodeId, NodeKind, TreeStore};
 
+/// Cap on how many hits `evaluate_rules` will collect and return.
+/// Matches the convention in `insights::INSIGHT_REPORT_LIMIT` so the
+/// sidebar section doesn't grow unbounded for very large trees.
+pub const INSIGHT_REPORT_LIMIT_FROM_RULES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleCategory {
     /// A read-only observation about a node (e.g. "this file is
