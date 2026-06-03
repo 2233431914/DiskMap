@@ -41,10 +41,11 @@ notarized `.app` bundle yet.
 ### Dev commands
 
 ```bash
-cargo test --lib                      # 129 unit tests, <1s on M-series
+cargo test --lib                      # 136 unit tests, <1s on M-series
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release                 # optimized binary
-cargo bench                           # criterion perf suite (perfnp paths)
+cargo bench --bench perf              # micro-benchmarks (synthetic 1k nodes)
+cargo bench --bench large_tree        # large-tree suite with 1k/10k/100k fixtures
 ```
 
 ## Usage (60 seconds)

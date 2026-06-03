@@ -91,6 +91,15 @@ struct LayoutContext<'a> {
 }
 
 impl SearchState {
+    /// Construct an empty `SearchState` sized to the given tree length.
+    /// Use `clear` to reset when the tree size changes mid-session.
+    pub fn new(tree_len: usize) -> Self {
+        let mut state = Self::default();
+        state.matched_bits.grow(tree_len);
+        state.matched_descendant_counts.resize(tree_len, 0);
+        state
+    }
+
     pub fn clear(&mut self, tree_len: usize) {
         self.query_lower.clear();
         self.matched_bits.clear();

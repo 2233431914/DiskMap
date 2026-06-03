@@ -16,3 +16,6 @@ Thumbs.db
 
 # Export files written to the current working directory (see SPEC.md §Phase 4)
 /disk-map-export-*
+
+# Benchmark fixtures (regenerate via `cargo bench --bench large_tree`)
+/target/bench-fixtures/
