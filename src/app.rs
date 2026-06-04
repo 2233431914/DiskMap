@@ -262,7 +262,7 @@ pub struct DiskMapApp {
     include_hidden: bool,
     follow_symlinks: bool,
     stay_on_filesystem: bool,
-    realtime_watch_enabled: bool,
+    pub(super) realtime_watch_enabled: bool,
     sqlite_cache_enabled: bool,
     watcher: Option<WatchSession>,
     initial_scan_pending: bool,
@@ -297,7 +297,7 @@ pub struct DiskMapApp {
     pub(super) last_canvas_rect: Option<Rect>,
     pub(super) layout_dirty: bool,
     pub(super)     last_layout_refresh: Instant,
-    pending_repaint: bool,
+    pub(super) pending_repaint: bool,
     safe_storage: SafeStorage,
     /// Most recent scan perf stats, captured at ScanMessage::Finished.
     /// Cleared at ScanMessage::Started. Used by the diagnostics export.
@@ -319,6 +319,14 @@ pub struct DiskMapApp {
     /// Per-root scan option profiles. In-memory only (Phase 15 will
     /// add persistence). Auto-applied when a scan starts.
     pub(super) profiles: crate::profiles::ProfileStore,
+    /// Command palette (Cmd+K) open state. The palette renders as a
+    /// top-anchored overlay only when this is true.
+    pub(super) palette_open: bool,
+    /// Live filter text for the palette.
+    pub(super) palette_query: String,
+    /// Index of the currently highlighted palette result. Reset to 0
+    /// on each query change.
+    pub(super) palette_selected: usize,
 }
 
 impl Default for DiskMapApp {
@@ -375,6 +383,9 @@ impl Default for DiskMapApp {
             last_rule_hits: None,
             rules_import_path: String::new(),
             profiles: crate::profiles::ProfileStore::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
         }
     }
 }
@@ -545,6 +556,11 @@ impl eframe::App for DiskMapApp {
         self.maybe_refresh_search(ctx);
         self.maybe_request_deferred_repaint(ctx);
         self.drive_background_updates(ctx);
+
+        // Command palette overlay (Cmd+K). Drawn last so it sits on
+        // top of everything else. Needs the egui::Context, which is
+        // only available in update() (not ui()).
+        panels::command_palette::show_command_palette(ctx, self);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1074,10 +1090,29 @@ impl DiskMapApp {
         }
 
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            if self.navigation.selected_id().is_some() {
+            if self.palette_open {
+                self.palette_open = false;
+                self.palette_query.clear();
+            } else if self.navigation.selected_id().is_some() {
                 self.navigation.set_selected_id(None);
             } else if !self.search.input().is_empty() {
                 self.clear_search();
+            }
+        }
+
+        // Command palette: Cmd+K (mac) or Ctrl+K (other). Open on
+        // press; if already open, just keep it open (the panel handles
+        // its own focus).
+        let cmd_or_ctrl = ctx.input(|input| {
+            input.modifiers.command || input.modifiers.ctrl
+        });
+        if cmd_or_ctrl
+            && ctx.input(|input| input.key_pressed(egui::Key::K))
+        {
+            self.palette_open = !self.palette_open;
+            if self.palette_open {
+                self.palette_query.clear();
+                self.palette_selected = 0;
             }
         }
     }
@@ -1259,7 +1294,7 @@ impl DiskMapApp {
         );
     }
 
-    fn update_snapshot_comparison(&mut self) {
+    pub(super) fn update_snapshot_comparison(&mut self) {
         let Some(root_id) = self.tree.root else {
             self.snapshot_diff = None;
             return;
@@ -1290,7 +1325,7 @@ impl DiskMapApp {
         )
     }
 
-    fn clear_search(&mut self) {
+    pub(super) fn clear_search(&mut self) {
         self.search.clear(self.tree.len());
         self.layout_dirty = true;
     }
@@ -1867,7 +1902,7 @@ impl DiskMapApp {
         !self.scan.is_scanning() && self.focused_subtree_rescan_path().is_some()
     }
 
-    fn rescan_scan_root(&mut self) {
+    pub(super) fn rescan_scan_root(&mut self) {
         let Some(path) = self.scan_root_rescan_path() else {
             self.status = "Rescan unavailable: no scan root".to_string();
             self.pending_repaint = true;
@@ -1876,7 +1911,7 @@ impl DiskMapApp {
         self.start_scan_path(path);
     }
 
-    fn rescan_focused_subtree(&mut self) {
+    pub(super) fn rescan_focused_subtree(&mut self) {
         let Some(path) = self.focused_subtree_rescan_path() else {
             self.status = "Rescan unavailable: no focused directory".to_string();
             self.pending_repaint = true;
@@ -1954,7 +1989,7 @@ impl DiskMapApp {
         self.pending_repaint = true;
     }
 
-    fn analyze_duplicate_candidates(&mut self) {
+    pub(super) fn analyze_duplicate_candidates(&mut self) {
         let Some(root_id) = self.navigation.focused_root() else {
             self.duplicate_report = None;
             self.status = "Duplicate analysis unavailable: no focused directory".to_string();
@@ -1987,7 +2022,7 @@ impl DiskMapApp {
         self.pending_repaint = true;
     }
 
-    fn analyze_file_insights(&mut self) {
+    pub(super) fn analyze_file_insights(&mut self) {
         let Some(root_id) = self.navigation.focused_root() else {
             self.insight_report = None;
             self.status = "Insights unavailable: no focused directory".to_string();
@@ -2094,12 +2129,12 @@ impl DiskMapApp {
         self.apply_navigation_outcome(outcome);
     }
 
-    fn return_to_scan_root(&mut self) {
+    pub(super) fn return_to_scan_root(&mut self) {
         let outcome = self.navigation.return_to_scan_root(&self.tree);
         self.apply_navigation_outcome(outcome);
     }
 
-    fn navigate_back(&mut self) {
+    pub(super) fn navigate_back(&mut self) {
         let outcome = self.navigation.navigate_back();
         self.apply_navigation_outcome(outcome);
     }
@@ -2109,7 +2144,7 @@ impl DiskMapApp {
         self.apply_navigation_outcome(outcome);
     }
 
-    fn reset_camera(&mut self) {
+    pub(super) fn reset_camera(&mut self) {
         self.camera = Camera::default();
         self.mark_layout_dirty_now();
     }
@@ -2173,7 +2208,7 @@ impl DiskMapApp {
         }
     }
 
-    fn enter_selected_directory(&mut self) -> bool {
+    pub(super) fn enter_selected_directory(&mut self) -> bool {
         let Some(selected_id) = self.navigation.selected_id() else {
             return false;
         };
@@ -2184,7 +2219,7 @@ impl DiskMapApp {
         true
     }
 
-    fn increase_depth(&mut self) -> bool {
+    pub(super) fn increase_depth(&mut self) -> bool {
         if self.max_depth >= 10 {
             return false;
         }
@@ -2193,7 +2228,7 @@ impl DiskMapApp {
         true
     }
 
-    fn decrease_depth(&mut self) -> bool {
+    pub(super) fn decrease_depth(&mut self) -> bool {
         if self.max_depth <= 1 {
             return false;
         }
@@ -3684,7 +3719,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_selected_directory_focuses_selected_dir() {
+    pub(super) fn enter_selected_directory_focuses_selected_dir() {
         let mut app = app_with_search_matches();
         app.navigation.set_selected_id(Some(1));
 
@@ -3694,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_selected_directory_ignores_files() {
+    pub(super) fn enter_selected_directory_ignores_files() {
         let mut app = app_with_search_matches();
         app.navigation.set_selected_id(Some(2));
 
@@ -3809,7 +3844,7 @@ mod tests {
     }
 
     #[test]
-    fn return_to_scan_root_pushes_previous_focus_to_back_history() {
+    pub(super) fn return_to_scan_root_pushes_previous_focus_to_back_history() {
         let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started(1));
         app.apply_scan_message_for_test(ScanMessage::Batch {
@@ -3845,7 +3880,7 @@ mod tests {
     }
 
     #[test]
-    fn return_to_scan_root_is_noop_when_already_at_scan_root() {
+    pub(super) fn return_to_scan_root_is_noop_when_already_at_scan_root() {
         let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started(1));
         app.navigation.push_back_for_test(42);
@@ -3939,7 +3974,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_search_clears_active_match_cursor() {
+    pub(super) fn clear_search_clears_active_match_cursor() {
         let mut app = app_with_search_matches();
         app.navigate_search_match(SearchDirection::Next);
 

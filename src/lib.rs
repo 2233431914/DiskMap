@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cleanup;
+pub mod commands;
 pub mod db;
 pub mod diagnostics;
 pub mod duplicates;
