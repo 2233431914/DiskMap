@@ -114,6 +114,11 @@ impl NavigationState {
         }
     }
 
+    pub fn set_focused_root(&mut self, node_id: Option<NodeId>) {
+        self.focused_root = node_id;
+        self.breadcrumb_cache.clear();
+    }
+
     pub fn return_to_scan_root(&mut self, tree: &TreeStore) -> NavigationOutcome {
         let Some(scan_root) = tree.root else {
             return NavigationOutcome::Noop;

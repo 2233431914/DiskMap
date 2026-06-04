@@ -290,6 +290,63 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     // there's a real path (not a virtual aggregate node) and that path
     // is the focused root (or scan root) — we key profiles by the
     // path string the user typed.
+    if let Some(view_root_path) = node_path.as_ref() {
+        let view_root = view_root_path.to_string_lossy().to_string();
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("VIEW")
+                .size(10.0)
+                .strong()
+                .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        let saved_view = app.views.get(&view_root);
+        if let Some(view) = saved_view {
+            ui.label(
+                RichText::new(format!(
+                    "Saved: depth {}, filter={}, last={}{}",
+                    view.depth,
+                    if view.search_filter_enabled { "on" } else { "off" },
+                    view.last_report_mode,
+                    if view.search_query.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", q=\"{}\"", view.search_query)
+                    },
+                ))
+                .small()
+                .color(p.text_muted),
+            );
+        } else {
+            ui.label(
+                RichText::new("No saved view for this root")
+                    .small()
+                    .color(p.text_muted),
+            );
+        }
+        ui.columns(2, |cols| {
+            let w0 = cols[0].available_width();
+            if cols[0]
+                .add(egui::Button::new("Save current view").min_size(Vec2::new(w0, 24.0)))
+                .on_hover_text("Capture depth, search query, focused/selected node, color mode, and last opened report panel under this root")
+                .clicked()
+            {
+                app.save_current_view(&view_root);
+            }
+            let w1 = cols[1].available_width();
+            let has_view = app.views.get(&view_root).is_some();
+            if cols[1]
+                .add_enabled(
+                    has_view,
+                    egui::Button::new("Apply saved view").min_size(Vec2::new(w1, 24.0)),
+                )
+                .clicked()
+            {
+                app.apply_saved_view(&view_root);
+            }
+        });
+    }
+
     if let Some(profile_root_path) = node_path.as_ref() {
         let profile_root = profile_root_path.to_string_lossy().to_string();
         ui.add_space(10.0);

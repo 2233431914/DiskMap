@@ -15,6 +15,7 @@ pub mod snapshot;
 pub mod storage;
 pub mod tree;
 pub mod treemap;
+pub mod views;
 pub mod watcher;
 
 pub use app::{configure_theme, DiskMapApp};

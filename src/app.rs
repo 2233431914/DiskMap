@@ -327,6 +327,15 @@ pub struct DiskMapApp {
     /// Index of the currently highlighted palette result. Reset to 0
     /// on each query change.
     pub(super) palette_selected: usize,
+    /// Per-root saved view state (in-memory). One entry per scan
+    /// root. Captured via the "Save current view" sidebar button.
+    pub(super) views: crate::views::ViewStore,
+    /// Discriminator for the last-opened report panel. Used by
+    /// "Apply saved view" to re-open the same panel the user had
+    /// when they saved. One of: "none" | "duplicates" | "insights"
+    /// | "snapshot" | "rules". String rather than enum so future
+    /// panels don't require a code change.
+    pub(super) last_report_mode: String,
 }
 
 impl Default for DiskMapApp {
@@ -386,6 +395,8 @@ impl Default for DiskMapApp {
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            views: crate::views::ViewStore::new(),
+            last_report_mode: "none".to_string(),
         }
     }
 }
@@ -1295,6 +1306,7 @@ impl DiskMapApp {
     }
 
     pub(super) fn update_snapshot_comparison(&mut self) {
+        self.last_report_mode = "snapshot".to_string();
         let Some(root_id) = self.tree.root else {
             self.snapshot_diff = None;
             return;
@@ -1352,6 +1364,7 @@ impl DiskMapApp {
     /// cache the result in `last_rule_hits`. Returns the number of
     /// hits found (capped at the same limit the engine uses).
     pub fn evaluate_current_rules(&mut self) -> usize {
+        self.last_report_mode = "rules".to_string();
         use crate::rules::{evaluate_rules, RuleContext, INSIGHT_REPORT_LIMIT_FROM_RULES};
         let root_id = match self
             .navigation
@@ -1416,6 +1429,54 @@ impl DiskMapApp {
         };
         self.profiles.set(root, profile);
         self.status = format!("Saved profile for {} ({} stored)", root, self.profiles.len());
+        self.pending_repaint = true;
+    }
+
+    /// Capture the current view state under `root`. Existing entry
+    /// for the same root is overwritten (last-write-wins, same
+    /// convention as `ProfileStore::set`).
+    pub fn save_current_view(&mut self, root: &str) {
+        use crate::views::ViewState;
+        let state = ViewState {
+            depth: self.max_depth,
+            search_query: self.search.input().to_string(),
+            search_filter_enabled: self.search_filter_enabled,
+            color_by_extension: self.color_by_extension,
+            last_report_mode: self.last_report_mode.clone(),
+            focused_id: self.navigation.focused_root(),
+            selected_id: self.navigation.selected_id(),
+        };
+        self.views.set(root, state);
+        self.status = format!("Saved view for {} ({} stored)", root, self.views.len());
+        self.pending_repaint = true;
+    }
+
+    /// Apply a previously-saved view's state to the live UI fields.
+    /// No-op if no view is stored for `root`. Does not change the
+    /// loaded scan — the user re-runs the scan if they want to
+    /// re-evaluate search results against new data.
+    pub fn apply_saved_view(&mut self, root: &str) {
+        let Some(view) = self.views.get(root).cloned() else {
+            return;
+        };
+        self.max_depth = view.depth.clamp(1, 10);
+        *self.search.input_mut() = view.search_query;
+        self.search_filter_enabled = view.search_filter_enabled;
+        self.color_by_extension = view.color_by_extension;
+        self.last_report_mode = view.last_report_mode;
+        if let Some(focused) = view.focused_id {
+            if focused < self.tree.len() {
+                self.navigation.set_focused_root(Some(focused));
+            }
+        }
+        if let Some(selected) = view.selected_id {
+            if selected < self.tree.len() {
+                self.navigation.set_selected_id(Some(selected));
+            }
+        }
+        self.layout_dirty = true;
+        self.mark_search_dirty();
+        self.status = format!("Applied saved view for {}", root);
         self.pending_repaint = true;
     }
 
@@ -1990,6 +2051,7 @@ impl DiskMapApp {
     }
 
     pub(super) fn analyze_duplicate_candidates(&mut self) {
+        self.last_report_mode = "duplicates".to_string();
         let Some(root_id) = self.navigation.focused_root() else {
             self.duplicate_report = None;
             self.status = "Duplicate analysis unavailable: no focused directory".to_string();
@@ -2023,6 +2085,7 @@ impl DiskMapApp {
     }
 
     pub(super) fn analyze_file_insights(&mut self) {
+        self.last_report_mode = "insights".to_string();
         let Some(root_id) = self.navigation.focused_root() else {
             self.insight_report = None;
             self.status = "Insights unavailable: no focused directory".to_string();
