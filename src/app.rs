@@ -336,6 +336,12 @@ pub struct DiskMapApp {
     /// | "snapshot" | "rules". String rather than enum so future
     /// panels don't require a code change.
     pub(super) last_report_mode: String,
+    /// Saved filter presets (named bundles of search query +
+    /// filter_enabled toggle). In-memory only.
+    pub(super) filter_presets: crate::views::FilterStore,
+    /// Sticky text field for the new-preset name input. Self-clears
+    /// after a successful add.
+    pub(super) filter_preset_name: String,
 }
 
 impl Default for DiskMapApp {
@@ -397,6 +403,8 @@ impl Default for DiskMapApp {
             palette_selected: 0,
             views: crate::views::ViewStore::new(),
             last_report_mode: "none".to_string(),
+            filter_presets: crate::views::FilterStore::new(),
+            filter_preset_name: String::new(),
         }
     }
 }
@@ -879,6 +887,10 @@ impl DiskMapApp {
 
     fn show_rules_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
         panels::rules_section::show_rules_section(ui, p, self);
+    }
+
+    fn show_filter_presets_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        panels::filter_presets::show_filter_presets_section(ui, p, self);
     }
 
     fn show_status_bar(&self, ui: &mut egui::Ui) {
@@ -1478,6 +1490,65 @@ impl DiskMapApp {
         self.mark_search_dirty();
         self.status = format!("Applied saved view for {}", root);
         self.pending_repaint = true;
+    }
+
+    /// Add a new filter preset with the given name. Uses the current
+    /// search query and filter toggle as the preset body. Returns
+    /// false (and does nothing) if the name is empty or already
+    /// taken, so the UI can show a clear status.
+    pub fn add_filter_preset(&mut self, name: &str) -> bool {
+        use crate::views::FilterPreset;
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.status = "Filter preset name cannot be empty".to_string();
+            self.pending_repaint = true;
+            return false;
+        }
+        let preset = FilterPreset {
+            name: trimmed.to_string(),
+            query: self.search.input().to_string(),
+            filter_enabled: self.search_filter_enabled,
+        };
+        if self.filter_presets.add(preset) {
+            self.status = format!(
+                "Saved filter preset '{}' ({} total)",
+                trimmed,
+                self.filter_presets.len()
+            );
+            self.filter_preset_name.clear();
+            self.pending_repaint = true;
+            true
+        } else {
+            self.status = format!("Filter preset '{}' already exists", trimmed);
+            self.pending_repaint = true;
+            false
+        }
+    }
+
+    /// Apply a saved filter preset to the live search state. No-op
+    /// if no preset by that name exists. Marks the search dirty so
+    /// the next frame re-runs the matcher.
+    pub fn apply_filter_preset(&mut self, name: &str) {
+        let Some(preset) = self.filter_presets.get(name).cloned() else {
+            return;
+        };
+        *self.search.input_mut() = preset.query.clone();
+        self.search_filter_enabled = preset.filter_enabled;
+        self.mark_search_dirty();
+        self.layout_dirty = true;
+        self.status = format!("Applied filter preset '{}'", name);
+        self.pending_repaint = true;
+    }
+
+    /// Remove a saved filter preset by name.
+    pub fn remove_filter_preset(&mut self, name: &str) -> bool {
+        if self.filter_presets.remove(name).is_some() {
+            self.status = format!("Removed filter preset '{}'", name);
+            self.pending_repaint = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Build a snapshot bundle from the current app state and write it

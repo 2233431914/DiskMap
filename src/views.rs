@@ -175,3 +175,132 @@ mod tests {
         assert!(err.is_err());
     }
 }
+
+// --- Saved filter presets --------------------------------------------------
+//
+// A filter preset is a named bundle of (search query, filter enabled).
+// We keep it separate from `ViewState` (which captures depth, color mode,
+// report panel) because filter presets are small enough to surface as
+// one-click rows in the sidebar, and they're a common daily workflow:
+// "I always want to look for *.log files" or "stuff > 100MB".
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterPreset {
+    pub name: String,
+    pub query: String,
+    pub filter_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterStore {
+    /// BTreeMap keyed by preset name (case-sensitive). Duplicate names
+    /// are rejected on insert; the caller should disambiguate before
+    /// saving.
+    presets: BTreeMap<String, FilterPreset>,
+}
+
+impl FilterStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, preset: FilterPreset) -> bool {
+        if preset.name.trim().is_empty() {
+            return false;
+        }
+        if self.presets.contains_key(&preset.name) {
+            return false;
+        }
+        self.presets.insert(preset.name.clone(), preset);
+        true
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<FilterPreset> {
+        self.presets.remove(name)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&FilterPreset> {
+        self.presets.get(name)
+    }
+
+    pub fn list(&self) -> Vec<FilterPreset> {
+        self.presets.values().cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.presets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.presets.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &FilterPreset)> {
+        self.presets.iter()
+    }
+}
+
+#[cfg(test)]
+mod filter_preset_tests {
+    use super::*;
+
+    #[test]
+    fn empty_name_is_rejected() {
+        let mut store = FilterStore::new();
+        assert!(!store.add(FilterPreset {
+            name: "".into(),
+            query: "x".into(),
+            filter_enabled: false,
+        }));
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn duplicate_name_is_rejected() {
+        let mut store = FilterStore::new();
+        assert!(store.add(FilterPreset {
+            name: "logs".into(),
+            query: ".log".into(),
+            filter_enabled: true,
+        }));
+        assert!(!store.add(FilterPreset {
+            name: "logs".into(),
+            query: "other".into(),
+            filter_enabled: false,
+        }));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn add_remove_get_round_trip() {
+        let mut store = FilterStore::new();
+        store.add(FilterPreset {
+            name: "big-files".into(),
+            query: "size>100MB".into(),
+            filter_enabled: true,
+        });
+        let got = store.get("big-files").unwrap();
+        assert_eq!(got.query, "size>100MB");
+        assert!(got.filter_enabled);
+        assert!(store.remove("big-files").is_some());
+        assert!(store.get("big-files").is_none());
+    }
+
+    #[test]
+    fn json_round_trip() {
+        let mut store = FilterStore::new();
+        store.add(FilterPreset {
+            name: "a".into(),
+            query: "alpha".into(),
+            filter_enabled: true,
+        });
+        store.add(FilterPreset {
+            name: "b".into(),
+            query: "beta".into(),
+            filter_enabled: false,
+        });
+        let json = serde_json::to_string(&store).unwrap();
+        let restored: FilterStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(store.list(), restored.list());
+    }
+}

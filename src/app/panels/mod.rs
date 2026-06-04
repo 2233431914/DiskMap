@@ -4,6 +4,7 @@
 
 pub mod command_palette;
 pub mod details;
+pub mod filter_presets;
 pub mod roots_menu;
 pub mod rules_section;
 pub mod sections;
