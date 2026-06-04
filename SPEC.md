@@ -307,15 +307,15 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [ ] Undo guidance that explains platform Trash recovery options when supported, without promising guaranteed restoration
 
 ### Phase 14: Power User Workflow
-- [ ] Command palette for navigation, scan, export, filter, and view-mode actions
-- [ ] Keyboard-first triage flow for moving between search matches, report rows, and selected treemap nodes
+- [x] Command palette for navigation, scan, export, filter, and view-mode actions (Implemented in: 62c1d7a; 17 builtin commands; Cmd+K / Ctrl+K to open; case-insensitive substring filter; Enter / Esc / Up / Down keyboard handling)
+- [x] Keyboard-first triage flow for moving between search matches, report rows, and selected treemap nodes (Implemented in: existing handle_keyboard + new Esc/Cmd+K bindings; Enter=enter selected, Backspace=back, Alt+←/→=back/forward, [/]=depth, Esc=clear/close)
 - [ ] Saved filter presets for extension, category, size threshold, modified age, hidden files, symlink policy, and exclude patterns
 - [ ] Multi-root comparison workspace for comparing several scan roots side by side
 - [ ] Bookmark selected nodes inside a scan for later review
 - [ ] Saved views that remember focused node, depth, search/filter state, color mode, and selected report mode
 - [ ] Deep-link style local references to reopen a saved root, snapshot, focused node, and view mode
 - [ ] Configurable color palettes for directory depth, extension mode, and category mode
-- [x] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI (Implemented in: pending commit; `diskmap-cli scan <path> [-f text|json|csv] [-e <pattern>] [--max-depth N] [--include-hidden] [--follow-symlinks] [--sort-by path|size] [-o FILE]`; hand-rolled arg parser, no new deps; 14 unit tests for parser + format + sort)
+- [x] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI (Implemented in: a6d9cb0; `diskmap-cli scan <path> [-f text|json|csv] [-e <pattern>] [--max-depth N] [--include-hidden] [--follow-symlinks] [--sort-by path|size] [-o FILE]`; hand-rolled arg parser, no new deps; 14 unit tests for parser + format + sort)
 
 ### Phase 15: Reliability and Distribution
 - [x] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs (Implemented in: 25e8b18, c9fcab5; only preferences currently use the crash-safe write — history/snapshots/audit are still TODO)

@@ -81,6 +81,17 @@ preferences, no profiles, no destructive actions — read-only.
 5. Right-click a node for **Open / Reveal / Copy Path / Move to Trash**. Trash
    shows a confirmation with path, size, and affected item count.
 
+## Keyboard shortcuts
+
+| Key            | Action                                  |
+|----------------|-----------------------------------------|
+| `Enter`        | Enter selected directory                |
+| `Backspace`    | Navigate back                           |
+| `Alt+←/→`     | Navigate back / forward                  |
+| `[` / `]`      | Decrease / increase treemap depth       |
+| `Esc`          | Clear selection / search / close palette |
+| `Cmd+K` / `Ctrl+K` | Open command palette                |
+
 ## Privacy
 
 Everything is local. No network calls, no analytics, no remote cache. The
