@@ -315,7 +315,7 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [ ] Saved views that remember focused node, depth, search/filter state, color mode, and selected report mode
 - [ ] Deep-link style local references to reopen a saved root, snapshot, focused node, and view mode
 - [ ] Configurable color palettes for directory depth, extension mode, and category mode
-- [ ] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI
+- [x] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI (Implemented in: pending commit; `diskmap-cli scan <path> [-f text|json|csv] [-e <pattern>] [--max-depth N] [--include-hidden] [--follow-symlinks] [--sort-by path|size] [-o FILE]`; hand-rolled arg parser, no new deps; 14 unit tests for parser + format + sort)
 
 ### Phase 15: Reliability and Distribution
 - [x] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs (Implemented in: 25e8b18, c9fcab5; only preferences currently use the crash-safe write — history/snapshots/audit are still TODO)

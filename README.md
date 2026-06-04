@@ -41,12 +41,32 @@ notarized `.app` bundle yet.
 ### Dev commands
 
 ```bash
-cargo test --lib                      # 136 unit tests, <1s on M-series
+cargo test --lib                      # 166 unit tests, <1s on M-series
 cargo clippy --all-targets --all-features -- -D warnings
-cargo build --release                 # optimized binary
+cargo build --release                 # optimized GUI binary (target/release/disk-map)
+cargo build --release --bin diskmap-cli  # optimized CLI binary
 cargo bench --bench perf              # micro-benchmarks (synthetic 1k nodes)
 cargo bench --bench large_tree        # large-tree suite with 1k/10k/100k fixtures
 ```
+
+### Headless CLI
+
+For scripting and piping into other tools, there's a separate
+`diskmap-cli` binary that reuses the same scanner:
+
+```bash
+diskmap-cli scan /path/to/dir                    # text to stdout
+diskmap-cli scan /path/to/dir -f json            # JSON to stdout
+diskmap-cli scan /path/to/dir -f csv -o out.csv  # CSV to file
+diskmap-cli scan /path/to/dir -e .git -e target  # exclude patterns
+diskmap-cli scan /path/to/dir --max-depth 3      # cap depth
+diskmap-cli scan /path/to/dir --include-hidden   # dotfiles
+diskmap-cli scan /path/to/dir --follow-symlinks  # symlinks
+diskmap-cli scan /path/to/dir --sort-by size     # largest first
+```
+
+`2>/dev/null` to silence the scanner's perf log. The CLI has no
+preferences, no profiles, no destructive actions — read-only.
 
 ## Usage (60 seconds)
 
