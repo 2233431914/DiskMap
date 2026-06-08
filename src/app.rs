@@ -629,9 +629,11 @@ impl eframe::App for DiskMapApp {
             .exact_size(28.0)
             .show_inside(ui, |ui| self.show_status_bar(ui));
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.show_treemap(ui);
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(0))
+            .show_inside(ui, |ui| {
+                self.show_treemap(ui);
+            });
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {

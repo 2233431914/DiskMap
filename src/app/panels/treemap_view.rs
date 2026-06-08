@@ -20,7 +20,14 @@ use std::time::Instant;
 
 pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     let p = palette(ui.ctx());
-    let (available, response) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+    let available = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    if available.width() <= 0.0 || available.height() <= 0.0 {
+        app.cached_visuals.clear();
+        app.last_canvas_rect = None;
+        app.layout_dirty = true;
+        return;
+    }
+    let response = ui.allocate_rect(available, Sense::click());
     let painter = ui.painter_at(available);
     painter.rect_filled(available, 0.0, p.surface);
 
