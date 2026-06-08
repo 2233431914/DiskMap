@@ -3,7 +3,7 @@ use crate::tree::{NodeId, TreeStore};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavigationOutcome {
     Noop,
-    ResetCameraOnly,
+    RefreshLayoutOnly,
     FocusChanged { refresh_search: bool },
 }
 
@@ -69,7 +69,7 @@ impl NavigationState {
 
     pub fn enter_root(&mut self, node_id: NodeId, push_history: bool) -> NavigationOutcome {
         if self.focused_root == Some(node_id) {
-            return NavigationOutcome::ResetCameraOnly;
+            return NavigationOutcome::RefreshLayoutOnly;
         }
 
         if push_history {
@@ -245,13 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn enter_same_root_requests_camera_reset_without_history_mutation() {
+    fn enter_same_root_requests_layout_refresh_without_history_mutation() {
         let mut state = NavigationState::default();
         state.set_scan_root(Some(0));
 
         let outcome = state.enter_root(0, true);
 
-        assert_eq!(outcome, NavigationOutcome::ResetCameraOnly);
+        assert_eq!(outcome, NavigationOutcome::RefreshLayoutOnly);
         assert!(!state.can_go_back());
         assert_eq!(state.focused_root(), Some(0));
     }

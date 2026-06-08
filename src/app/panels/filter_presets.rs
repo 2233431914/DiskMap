@@ -52,12 +52,23 @@ pub fn show_filter_presets_section(ui: &mut egui::Ui, p: &Palette, app: &mut Dis
         let name = preset.name.clone();
         ui.horizontal(|ui| {
             let label = if preset.query.is_empty() {
-                format!("(empty query){}", if preset.filter_enabled { " + filter" } else { "" })
+                format!(
+                    "(empty query){}",
+                    if preset.filter_enabled {
+                        " + filter"
+                    } else {
+                        ""
+                    }
+                )
             } else {
                 format!(
                     "{}{}",
                     preset.query,
-                    if preset.filter_enabled { " + filter" } else { "" }
+                    if preset.filter_enabled {
+                        " + filter"
+                    } else {
+                        ""
+                    }
                 )
             };
             if ui

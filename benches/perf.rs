@@ -3,7 +3,7 @@ use disk_map::scanner::{
     CacheMode, DiscoveredNode, PerfStats, ProgressSnapshot, ScanBatch, ScanOptions,
 };
 use disk_map::tree::{NodeKind, NodeRecord, TreeStore};
-use disk_map::treemap::{layout_treemap, Camera, LayoutScratch, SearchState, TreemapLayoutParams};
+use disk_map::treemap::{layout_treemap, LayoutScratch, SearchState, TreemapLayoutParams};
 use egui::Rect;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
@@ -90,6 +90,7 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                     max_pending_nodes: 2048,
                     max_pending_size_deltas: 4096,
                     cache_mode: CacheMode::Disabled,
+                    cache_path: None,
                     exclude_patterns: Vec::new(),
                     include_hidden: true,
                     follow_symlinks: false,
@@ -151,7 +152,6 @@ fn treemap_layout_bench(c: &mut Criterion) {
                     TreemapLayoutParams {
                         root,
                         canvas_rect: canvas,
-                        camera: Camera::default(),
                         max_depth: 2,
                         search_state: &search_state,
                         filter_to_search: false,

@@ -23,6 +23,7 @@
 
 use crate::tree::{Node, NodeId, NodeKind, TreeStore};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Cap on how many hits `evaluate_rules` will collect and return.
@@ -60,10 +61,7 @@ pub enum RulePredicate {
     /// Match a file whose modified-time is at least `min_age_days`
     /// old AND size is at least `min_size` bytes. Unknown mtime never
     /// matches.
-    OldFile {
-        min_age_days: u64,
-        min_size: u64,
-    },
+    OldFile { min_age_days: u64, min_size: u64 },
     /// Match hidden files or directories (name starts with `.`).
     Hidden,
     /// Match symlink nodes.
@@ -151,6 +149,18 @@ pub struct RuleHit {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleImportPreview {
+    pub source_path: PathBuf,
+    pub ruleset: RuleSet,
+    pub incoming_rule_count: usize,
+    pub incoming_enabled_count: usize,
+    pub added_count: usize,
+    pub removed_count: usize,
+    pub changed_count: usize,
+    pub unchanged_count: usize,
+}
+
 /// Returns `Some(())` if `node` matches the rule, with the reason
 /// written to `reason_out` and a heuristic `score` (0-100) for
 /// ranking. Read-only: never mutates anything.
@@ -192,10 +202,7 @@ pub fn matches(rule: &Rule, node: &Node, ctx: &RuleContext) -> Option<(u32, Stri
             if age_days >= *min_age_days {
                 Some((
                     score_for_age(age_days, *min_age_days),
-                    format!(
-                        "modified {} days ago, size {}",
-                        age_days, node.size
-                    ),
+                    format!("modified {} days ago, size {}", age_days, node.size),
                 ))
             } else {
                 None
@@ -223,7 +230,10 @@ pub fn matches(rule: &Rule, node: &Node, ctx: &RuleContext) -> Option<(u32, Stri
             // UI or future scan-aware version) to refine.
             let name_match = node.name == path_pattern.trim_start_matches('/');
             if name_match {
-                Some((100, format!("name matches protected pattern {path_pattern}")))
+                Some((
+                    100,
+                    format!("name matches protected pattern {path_pattern}"),
+                ))
             } else {
                 None
             }
@@ -308,7 +318,9 @@ pub fn default_ruleset() -> RuleSet {
     set.add(Rule {
         id: "old-large-file".into(),
         name: "Old + large files".into(),
-        description: "Files >100 MB that have not been modified in over a year. Common cleanup target.".into(),
+        description:
+            "Files >100 MB that have not been modified in over a year. Common cleanup target."
+                .into(),
         category: RuleCategory::CleanupCandidate,
         predicate: RulePredicate::OldFile {
             min_age_days: 365,
@@ -319,7 +331,8 @@ pub fn default_ruleset() -> RuleSet {
     set.add(Rule {
         id: "hidden-files".into(),
         name: "Hidden entries".into(),
-        description: "Files or directories whose name starts with a dot. Review before exposing.".into(),
+        description: "Files or directories whose name starts with a dot. Review before exposing."
+            .into(),
         category: RuleCategory::AnomalyHint,
         predicate: RulePredicate::Hidden,
         enabled: true,
@@ -335,7 +348,8 @@ pub fn default_ruleset() -> RuleSet {
     set.add(Rule {
         id: "protected-system".into(),
         name: "System location".into(),
-        description: "Top-level /System entry. Destructive actions against this are blocked.".into(),
+        description: "Top-level /System entry. Destructive actions against this are blocked."
+            .into(),
         category: RuleCategory::ProtectedPath,
         predicate: RulePredicate::AlwaysProtected {
             path_pattern: "System".into(),
@@ -345,7 +359,8 @@ pub fn default_ruleset() -> RuleSet {
     set.add(Rule {
         id: "protected-library".into(),
         name: "Library location".into(),
-        description: "Top-level /Library entry. Destructive actions against this are blocked.".into(),
+        description: "Top-level /Library entry. Destructive actions against this are blocked."
+            .into(),
         category: RuleCategory::ProtectedPath,
         predicate: RulePredicate::AlwaysProtected {
             path_pattern: "Library".into(),
@@ -355,7 +370,8 @@ pub fn default_ruleset() -> RuleSet {
     set.add(Rule {
         id: "protected-applications".into(),
         name: "Applications location".into(),
-        description: "Top-level /Applications entry. Destructive actions against this are blocked.".into(),
+        description: "Top-level /Applications entry. Destructive actions against this are blocked."
+            .into(),
         category: RuleCategory::ProtectedPath,
         predicate: RulePredicate::AlwaysProtected {
             path_pattern: "Applications".into(),
@@ -404,8 +420,8 @@ pub fn export_ruleset_json(set: &RuleSet) -> String {
 /// empty id, etc.). Path-safety: doesn't actually load files; the
 /// caller reads the file and passes the contents in.
 pub fn import_ruleset_json(text: &str) -> Result<RuleSet, String> {
-    let exp: ExportedRuleSet = serde_json::from_str(text)
-        .map_err(|e| format!("invalid JSON: {e}"))?;
+    let exp: ExportedRuleSet =
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
     if exp.version != RULES_FORMAT_VERSION {
         return Err(format!(
             "unsupported version: expected {}, got {}",
@@ -419,8 +435,55 @@ pub fn import_ruleset_json(text: &str) -> Result<RuleSet, String> {
         if rule.name.trim().is_empty() {
             return Err(format!("rule '{}' has empty name", rule.id));
         }
+        if exp.rules[..i].iter().any(|existing| existing.id == rule.id) {
+            return Err(format!("duplicate rule id '{}'", rule.id));
+        }
     }
     Ok(RuleSet { rules: exp.rules })
+}
+
+pub fn preview_ruleset_import(
+    current: &RuleSet,
+    incoming: RuleSet,
+    source_path: PathBuf,
+) -> RuleImportPreview {
+    let current_by_id = current
+        .rules
+        .iter()
+        .map(|rule| (rule.id.as_str(), rule))
+        .collect::<BTreeMap<_, _>>();
+    let incoming_by_id = incoming
+        .rules
+        .iter()
+        .map(|rule| (rule.id.as_str(), rule))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut added_count = 0;
+    let mut changed_count = 0;
+    let mut unchanged_count = 0;
+    for (id, incoming_rule) in &incoming_by_id {
+        match current_by_id.get(id) {
+            Some(current_rule) if *current_rule == *incoming_rule => unchanged_count += 1,
+            Some(_) => changed_count += 1,
+            None => added_count += 1,
+        }
+    }
+
+    let removed_count = current_by_id
+        .keys()
+        .filter(|id| !incoming_by_id.contains_key(**id))
+        .count();
+
+    RuleImportPreview {
+        source_path,
+        incoming_rule_count: incoming.rules.len(),
+        incoming_enabled_count: incoming.enabled_count(),
+        added_count,
+        removed_count,
+        changed_count,
+        unchanged_count,
+        ruleset: incoming,
+    }
 }
 
 /// Write the ruleset to `<dest_dir>/disk-map-rules-<ts>.json` and
@@ -444,8 +507,8 @@ pub fn export_ruleset_to_dir(set: &RuleSet, dest_dir: &Path) -> std::io::Result<
 /// other filesystem exploration. Returns a human-readable error on
 /// any I/O or parse failure.
 pub fn import_ruleset_from_path(path: &Path) -> Result<RuleSet, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     import_ruleset_json(&text)
 }
 
@@ -486,13 +549,7 @@ mod tests {
         size: u64,
         mtime: Option<u64>,
     ) -> NodeId {
-        tree.add_node_with_modified(
-            Some(parent),
-            name.into(),
-            NodeKind::File,
-            size,
-            mtime,
-        )
+        tree.add_node_with_modified(Some(parent), name.into(), NodeKind::File, size, mtime)
     }
 
     #[test]
@@ -554,7 +611,13 @@ mod tests {
         // Old enough but too small
         add_file(&mut tree, root, "old-small.txt", 100, Some(now - 400 * DAY));
         // Big enough but too recent
-        add_file(&mut tree, root, "fresh-big.bin", 200 * 1_048_576, Some(now - 10 * DAY));
+        add_file(
+            &mut tree,
+            root,
+            "fresh-big.bin",
+            200 * 1_048_576,
+            Some(now - 10 * DAY),
+        );
         // Both
         let both = add_file(
             &mut tree,
@@ -666,7 +729,10 @@ mod tests {
     fn default_ruleset_has_seven_rules() {
         let rules = default_ruleset();
         assert_eq!(rules.rules.len(), 7);
-        assert!(rules.enabled_count() >= 5, "most defaults should be enabled");
+        assert!(
+            rules.enabled_count() >= 5,
+            "most defaults should be enabled"
+        );
         assert!(rules.get("large-file-1gb").is_some());
         assert!(rules.get("protected-system").is_some());
     }
@@ -745,6 +811,77 @@ mod tests {
     fn import_rejects_unknown_category_variant() {
         let bad = r#"{"version": 1, "rules": [{"id": "x", "name": "x", "description": "", "category": "NoSuchCategory", "predicate": "Hidden", "enabled": true}]}"#;
         let err = import_ruleset_json(bad).unwrap_err();
-        assert!(err.contains("invalid JSON") || err.contains("category"), "got: {err}");
+        assert!(
+            err.contains("invalid JSON") || err.contains("category"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_duplicate_ids() {
+        let bad = r#"{"version": 1, "rules": [
+            {"id": "x", "name": "x", "description": "", "category": "AnomalyHint", "predicate": "Hidden", "enabled": true},
+            {"id": "x", "name": "x2", "description": "", "category": "AnomalyHint", "predicate": "Symlink", "enabled": true}
+        ]}"#;
+        let err = import_ruleset_json(bad).unwrap_err();
+        assert!(err.contains("duplicate rule id"), "got: {err}");
+    }
+
+    #[test]
+    fn preview_ruleset_import_summarizes_delta_without_applying() {
+        let mut current = RuleSet::new();
+        current.add(Rule {
+            id: "same".into(),
+            name: "Same".into(),
+            description: "".into(),
+            category: RuleCategory::AnomalyHint,
+            predicate: RulePredicate::Hidden,
+            enabled: true,
+        });
+        current.add(Rule {
+            id: "changed".into(),
+            name: "Changed".into(),
+            description: "before".into(),
+            category: RuleCategory::AnomalyHint,
+            predicate: RulePredicate::Hidden,
+            enabled: true,
+        });
+        current.add(Rule {
+            id: "removed".into(),
+            name: "Removed".into(),
+            description: "".into(),
+            category: RuleCategory::AnomalyHint,
+            predicate: RulePredicate::Hidden,
+            enabled: true,
+        });
+
+        let mut incoming = RuleSet::new();
+        incoming.add(current.get("same").unwrap().clone());
+        incoming.add(Rule {
+            id: "changed".into(),
+            name: "Changed".into(),
+            description: "after".into(),
+            category: RuleCategory::AnomalyHint,
+            predicate: RulePredicate::Hidden,
+            enabled: false,
+        });
+        incoming.add(Rule {
+            id: "added".into(),
+            name: "Added".into(),
+            description: "".into(),
+            category: RuleCategory::AnomalyHint,
+            predicate: RulePredicate::Symlink,
+            enabled: true,
+        });
+
+        let preview = preview_ruleset_import(&current, incoming, PathBuf::from("/rules.json"));
+
+        assert_eq!(preview.incoming_rule_count, 3);
+        assert_eq!(preview.incoming_enabled_count, 2);
+        assert_eq!(preview.added_count, 1);
+        assert_eq!(preview.removed_count, 1);
+        assert_eq!(preview.changed_count, 1);
+        assert_eq!(preview.unchanged_count, 1);
+        assert_eq!(current.rules.len(), 3);
     }
 }

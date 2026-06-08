@@ -22,8 +22,9 @@ Inspired by SpaceSniffer, written in Rust with `eframe`/`egui`.
 - Optional experimental SQLite scan cache (off by default)
 - Recent + pinned scan roots, persisted user-facing options
 
-Packaging, signing/notarization, accessibility, and CLI are **not** done — see
-[SPEC.md](SPEC.md) for the full roadmap.
+The headless CLI and local macOS `.app` packaging path are available.
+Accessibility hardening and a full signed/notarized public release checklist
+remain roadmap work — see [SPEC.md](SPEC.md) for details.
 
 ## Build & Run
 
@@ -35,8 +36,18 @@ integration.
 cargo run --release
 ```
 
-`target/release/disk-map` is a standalone binary. There is no installer, no
-notarized `.app` bundle yet.
+`target/release/disk-map` is a standalone binary.
+
+### macOS App Bundle
+
+```bash
+scripts/package-macos.sh
+```
+
+This builds `target/dist/DiskMap.app` and
+`target/dist/DiskMap-<version>-macos-<arch>.zip`. The default signature is
+ad-hoc for local testing. Developer ID signing, notarization, and a simple DMG
+are documented in [packaging/macos/README.md](packaging/macos/README.md).
 
 ### Dev commands
 
@@ -44,6 +55,7 @@ notarized `.app` bundle yet.
 cargo test --lib                      # 166 unit tests, <1s on M-series
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release                 # optimized GUI binary (target/release/disk-map)
+scripts/package-macos.sh              # build target/dist/DiskMap.app + zip
 cargo build --release --bin diskmap-cli  # optimized CLI binary
 cargo bench --bench perf              # micro-benchmarks (synthetic 1k nodes)
 cargo bench --bench large_tree        # large-tree suite with 1k/10k/100k fixtures

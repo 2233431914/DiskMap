@@ -5,7 +5,6 @@
 use super::super::DiskMapApp;
 use super::super::Palette;
 use crate::app::palette;
-use crate::rules::{export_ruleset_to_dir, import_ruleset_from_path};
 use eframe::egui::{self, RichText, Vec2};
 
 const RULES_HIT_PREVIEW: usize = 8;
@@ -33,20 +32,11 @@ pub fn show_rules_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) 
         ui.horizontal(|ui| {
             let mut enabled_flag = app.rules.rules[i].enabled;
             if ui.checkbox(&mut enabled_flag, "").changed() {
-                if enabled_flag {
-                    app.rules.enable(&id);
-                } else {
-                    app.rules.disable(&id);
-                }
-                app.pending_repaint = true;
+                app.set_rule_enabled(&id, enabled_flag);
             }
             ui.label(RichText::new(&name).color(p.text));
         });
-        ui.label(
-            RichText::new(&description)
-                .small()
-                .color(p.text_muted),
-        );
+        ui.label(RichText::new(&description).small().color(p.text_muted));
         ui.add_space(2.0);
         i += 1;
     }
@@ -54,11 +44,10 @@ pub fn show_rules_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) 
     ui.add_space(6.0);
     let button_width = ui.available_width();
     if ui
-        .add(
-            egui::Button::new("Apply Rules")
-                .min_size(Vec2::new(button_width, 28.0)),
+        .add(egui::Button::new("Apply Rules").min_size(Vec2::new(button_width, 28.0)))
+        .on_hover_text(
+            "Run all enabled rules against the current focused subtree and cache the hits",
         )
-        .on_hover_text("Run all enabled rules against the current focused subtree and cache the hits")
         .clicked()
     {
         app.evaluate_current_rules();
@@ -72,49 +61,69 @@ pub fn show_rules_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) 
             .on_hover_text("Write the current ruleset to disk-map-rules-<ts>.json in the current working directory")
             .clicked()
         {
-            let dest = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            match export_ruleset_to_dir(&app.rules, &dest) {
-                Ok(path) => {
-                    app.status = format!("Wrote rules: {}", path.display());
-                }
-                Err(error) => {
-                    app.record_error(format!("rules export failed: {error}"));
-                    app.status = format!("Rules export failed: {error}");
-                }
-            }
-            app.pending_repaint = true;
+            app.export_rules_to_current_dir();
         }
         if ui
             .add(egui::Button::new("Import").min_size(Vec2::new(w, 24.0)))
-            .on_hover_text("Load a ruleset JSON from the path below (replaces the current ruleset)")
+            .on_hover_text("Load a ruleset JSON from the path below and preview changes before applying")
             .clicked()
         {
-            let raw = app.rules_import_path.trim().to_string();
-            if raw.is_empty() {
-                app.status = "Type a path to import from".to_string();
-                app.pending_repaint = true;
-            } else {
-                match import_ruleset_from_path(std::path::Path::new(&raw)) {
-                    Ok(ruleset) => {
-                        app.rules = ruleset;
-                        app.last_rule_hits = None;
-                        app.rules_import_path.clear();
-                        app.status = format!("Imported rules from {}", raw);
-                    }
-                    Err(error) => {
-                        app.record_error(format!("rules import failed: {error}"));
-                        app.status = format!("Rules import failed: {error}");
-                    }
-                }
-                app.pending_repaint = true;
-            }
+            app.preview_rules_import_from_input();
         }
     });
     ui.add_sized(
         [ui.available_width(), 22.0],
         egui::TextEdit::singleline(&mut app.rules_import_path).hint_text("Path to rules JSON"),
     )
-    .on_hover_text("Absolute or relative path to a rules JSON file. Cleared after a successful import.");
+    .on_hover_text(
+        "Absolute or relative path to a rules JSON file. Cleared after a confirmed import.",
+    );
+
+    if let Some(preview) = app.pending_rules_import.clone() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "Preview: {} rules ({} enabled)",
+                preview.incoming_rule_count, preview.incoming_enabled_count
+            ))
+            .small()
+            .color(p.accent),
+        );
+        ui.label(
+            RichText::new(format!(
+                "+{} / -{} / {} changed / {} unchanged",
+                preview.added_count,
+                preview.removed_count,
+                preview.changed_count,
+                preview.unchanged_count
+            ))
+            .small()
+            .color(p.text_muted),
+        );
+        ui.label(
+            RichText::new(preview.source_path.display().to_string())
+                .small()
+                .monospace()
+                .color(p.text_faint),
+        );
+        ui.horizontal(|ui| {
+            let w = ui.available_width() * 0.5 - 4.0;
+            if ui
+                .add(egui::Button::new("Apply Import").min_size(Vec2::new(w, 24.0)))
+                .on_hover_text("Replace the current ruleset with this preview")
+                .clicked()
+            {
+                app.confirm_rules_import();
+            }
+            if ui
+                .add(egui::Button::new("Cancel").min_size(Vec2::new(w, 24.0)))
+                .on_hover_text("Discard this import preview")
+                .clicked()
+            {
+                app.cancel_rules_import();
+            }
+        });
+    }
 
     if let Some(hits) = &app.last_rule_hits {
         ui.add_space(4.0);
@@ -139,12 +148,7 @@ pub fn show_rules_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) 
                     Some(rule) => format!("[{}] {}", rule.name, hit.reason),
                     None => format!("[{}] {}", hit.rule_id, hit.reason),
                 };
-                ui.label(
-                    RichText::new(label)
-                        .small()
-                        .monospace()
-                        .color(p.text_muted),
-                );
+                ui.label(RichText::new(label).small().monospace().color(p.text_muted));
             }
             if hits.len() > RULES_HIT_PREVIEW {
                 ui.label(

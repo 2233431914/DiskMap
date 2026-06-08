@@ -49,22 +49,18 @@ impl DiagnosticsBundle {
         let bundle_dir = dest_dir.join(format!("{BUNDLE_DIR_PREFIX}{ts}"));
         fs::create_dir_all(&bundle_dir)?;
 
-        write_file(&bundle_dir.join("manifest.txt",), |f| {
+        write_file(&bundle_dir.join("manifest.txt"), |f| {
             writeln!(f, "disk-map diagnostics bundle")?;
             writeln!(f, "========================")?;
             writeln!(f, "app_version: {}", self.app_version)?;
             writeln!(f, "platform: {}-{}", self.os, self.arch)?;
-            writeln!(
-                f,
-                "generated_at_unix_secs: {}",
-                self.generated_at_unix_secs
-            )?;
+            writeln!(f, "generated_at_unix_secs: {}", self.generated_at_unix_secs)?;
             writeln!(f, "scan_root: {}", redact_home_opt(&self.scan_root))?;
             writeln!(f, "status: {}", self.status)?;
             Ok(())
         })?;
 
-        write_file(&bundle_dir.join("scan_options.txt",), |f| {
+        write_file(&bundle_dir.join("scan_options.txt"), |f| {
             writeln!(f, "scan options")?;
             writeln!(f, "============")?;
             for (k, v) in &self.scan_options {
@@ -73,7 +69,7 @@ impl DiagnosticsBundle {
             Ok(())
         })?;
 
-        write_file(&bundle_dir.join("perf.txt",), |f| {
+        write_file(&bundle_dir.join("perf.txt"), |f| {
             writeln!(f, "scan perf stats")?;
             writeln!(f, "===============")?;
             match &self.perf_stats {
@@ -84,29 +80,21 @@ impl DiagnosticsBundle {
                     writeln!(f, "nodes_discovered: {}", s.nodes_discovered)?;
                     writeln!(f, "files_scanned: {}", s.files_scanned)?;
                     writeln!(f, "dirs_scanned: {}", s.dirs_scanned)?;
-                    writeln!(
-                        f,
-                        "size_delta_merges: {}",
-                        s.size_delta_merges
-                    )?;
+                    writeln!(f, "size_delta_merges: {}", s.size_delta_merges)?;
                     writeln!(
                         f,
                         "ancestor_size_delta_total_ms: {:.3}",
                         s.ancestor_size_delta_total_ms
                     )?;
                     writeln!(f, "parent_stack_hits: {}", s.parent_stack_hits)?;
-                    writeln!(
-                        f,
-                        "parent_lookup_fallbacks: {}",
-                        s.parent_lookup_fallbacks
-                    )?;
+                    writeln!(f, "parent_lookup_fallbacks: {}", s.parent_lookup_fallbacks)?;
                 }
                 None => writeln!(f, "(no completed scan yet)")?,
             }
             Ok(())
         })?;
 
-        write_file(&bundle_dir.join("recent_errors.txt",), |f| {
+        write_file(&bundle_dir.join("recent_errors.txt"), |f| {
             if self.recent_errors.is_empty() {
                 writeln!(f, "(no recent errors recorded)")?;
             } else {
@@ -172,8 +160,7 @@ mod tests {
             .as_nanos();
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let p = std::env::temp_dir()
-            .join(format!("disk-map-diagnostics-test-{pid}-{nanos}-{n}"));
+        let p = std::env::temp_dir().join(format!("disk-map-diagnostics-test-{pid}-{nanos}-{n}"));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -194,7 +181,12 @@ mod tests {
         };
         let bundle_dir = bundle.write_to(&dest).unwrap();
         assert!(bundle_dir.is_dir());
-        for name in ["manifest.txt", "scan_options.txt", "perf.txt", "recent_errors.txt"] {
+        for name in [
+            "manifest.txt",
+            "scan_options.txt",
+            "perf.txt",
+            "recent_errors.txt",
+        ] {
             let p = bundle_dir.join(name);
             assert!(p.is_file(), "expected {name} to exist");
             let text = fs::read_to_string(&p).unwrap();

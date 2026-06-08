@@ -271,6 +271,7 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [ ] Accessible labels and focus order for toolbar, treemap selection, and context menu actions
 - [ ] Performance regression benchmarks for large trees, search rebuilds, and layout generation
 - [ ] macOS packaging, signing/notarization, and release checklist
+  - Partial: `scripts/package-macos.sh` builds `target/dist/DiskMap.app` plus zip, supports ad-hoc or Developer ID signing, optional `notarytool` submission/stapling, and optional simple DMG. Public release still needs a real Developer ID notarization run and upgrade/rollback checklist.
 
 ### Phase 11: Practical Analysis Additions
 - [ ] Size anomaly hints: highlight unexpectedly large caches, build artifacts, and log folders using configurable read-only rules
@@ -309,7 +310,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 ### Phase 14: Power User Workflow
 - [x] Command palette for navigation, scan, export, filter, and view-mode actions (Implemented in: 62c1d7a; 17 builtin commands; Cmd+K / Ctrl+K to open; case-insensitive substring filter; Enter / Esc / Up / Down keyboard handling)
 - [x] Keyboard-first triage flow for moving between search matches, report rows, and selected treemap nodes (Implemented in: existing handle_keyboard + new Esc/Cmd+K bindings; Enter=enter selected, Backspace=back, Alt+←/→=back/forward, [/]=depth, Esc=clear/close)
-- [x] Saved filter presets for extension, category, size threshold, modified age, hidden files, symlink policy, and exclude patterns (Implemented in: pending commit; `FilterPreset` + `FilterStore` in src/views.rs; 4 unit tests; sidebar "FILTER PRESETS" section with name input + save / apply / remove buttons; search query + filter_enabled only for now)
+- [ ] Saved filter presets for extension, category, size threshold, modified age, hidden files, symlink policy, and exclude patterns
+  - Partial: `FilterPreset` + `FilterStore` in `src/views.rs` support persisted named search-query/filter-mode presets in the sidebar. Typed presets for extension/category/size/age/hidden/symlink/exclude controls remain deferred.
 - [ ] Multi-root comparison workspace for comparing several scan roots side by side
 - [ ] Bookmark selected nodes inside a scan for later review
 - [x] Saved views that remember focused node, depth, search/filter state, color mode, and selected report mode (Implemented in: 7ac572a; per-root `ViewState` with depth/search_query/search_filter_enabled/color_by_extension/last_report_mode/focused_id/selected_id; "Save current view" + "Apply saved view" buttons in a "VIEW" section of the details panel; 6 unit tests; serde round-trip)
@@ -318,11 +320,14 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [x] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI (Implemented in: a6d9cb0; `diskmap-cli scan <path> [-f text|json|csv] [-e <pattern>] [--max-depth N] [--include-hidden] [--follow-symlinks] [--sort-by path|size] [-o FILE]`; hand-rolled arg parser, no new deps; 14 unit tests for parser + format + sort)
 
 ### Phase 15: Reliability and Distribution
-- [x] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs (Implemented in: 25e8b18, c9fcab5; only preferences currently use the crash-safe write — history/snapshots/audit are still TODO)
+- [ ] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs
+  - Partial: preferences plus compact user state (profiles, saved views, filter presets, and rulesets) use `SafeStorage` with write-to-temp + fsync + rename. Full history, snapshots, and cleanup audit logs are not persisted through this path yet.
 - [x] Large-tree benchmark suite with fixed fixtures and regression thresholds (Implemented in: e47c6ac; baselines file at benches/baselines/large_tree.txt — 10k/100k numbers are TBD pending a full bench run)
 - [ ] UI smoke tests for scan, navigation, search, export, watch, cache, and trash confirmation flows
+  - Partial: app-driver smoke coverage exercises scan, navigation, search, JSON export action, watch startup, SQLite cache path, and trash confirmation. Rendered UI smoke coverage remains deferred.
 - [x] Diagnostics bundle export with app version, platform, scan options, perf counters, recent errors, and redacted local paths where requested (Implemented in: 0091b27)
 - [ ] macOS app bundle release profile with signing and notarization documentation
+  - Partial: app bundle script and signing/notarization documentation live in `scripts/package-macos.sh` and `packaging/macos/README.md`; release-profile automation remains incomplete until a real Developer ID/notarization credential path is exercised.
 - [ ] Release checklist for upgrades, preference migration, cache compatibility, and rollback testing
 - [ ] Import/export settings bundle for migrating preferences between machines
 - [ ] Privacy statement documenting that scans, histories, caches, and reports are local-only unless the user exports files manually
@@ -342,6 +347,7 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 
 ### Phase 18: Extensibility and Rule Management
 - [x] User-editable rule sets for categories, anomaly hints, cleanup candidates, and protected paths (Implemented in: e5f4799, ecde3e8; default ruleset + UI sidebar; adding new rules from the UI is deferred — for now, edit via JSON import)
-- [x] Import/export rule bundles with validation and preview before applying changes (Implemented in: 1741288; import replaces the current ruleset; "preview before applying" not yet implemented)
-- [x] Per-root option profiles for exclude rules, safe scan options, watch/cache settings, and report defaults (Implemented in: 25e8b18; in-memory only, persistence is a future task)
+- [x] Import/export rule bundles with validation and preview before applying changes (Implemented in: `src/rules.rs` + `src/app/rule_actions.rs`; JSON import validates version/fields/duplicate ids, sidebar preview shows added/removed/changed/unchanged counts, and apply/cancel is required before replacing the live ruleset)
+- [ ] Per-root option profiles for exclude rules, safe scan options, watch/cache settings, and report defaults
+  - Partial: per-root profiles are persisted through `SafeStorage` and applied before scan startup. Report defaults remain deferred.
 - [x] Rule test fixtures that let users validate matching behavior against example paths before enabling a rule set (Implemented in: 2c12a36; integration tests in tests/rules_fixtures.rs)

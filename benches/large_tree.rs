@@ -15,9 +15,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use disk_map::scanner::{scan_path_to_tree, ScanOptions};
 use disk_map::tree::TreeStore;
-use disk_map::treemap::{
-    layout_treemap, Camera, LayoutScratch, SearchState, TreemapLayoutParams,
-};
+use disk_map::treemap::{layout_treemap, LayoutScratch, SearchState, TreemapLayoutParams};
 use egui::Rect;
 use std::fs;
 use std::hint::black_box;
@@ -42,7 +40,7 @@ fn generate_tree_if_missing(target_count: usize, dest: &Path) {
     }
     fs::create_dir_all(dest).expect("create fixture root");
     let mut count = 1; // the root itself
-    // BFS frontier with depth tracking so we can stop recursing deep
+                       // BFS frontier with depth tracking so we can stop recursing deep
     let mut frontier: Vec<(PathBuf, usize)> = vec![(dest.to_path_buf(), 0)];
     let max_depth = 8usize;
     while count < target_count && !frontier.is_empty() {
@@ -115,7 +113,6 @@ fn layout_bench(c: &mut Criterion) {
             .expect("pre-scan should succeed");
         let root_id = tree.root.expect("scanned tree has a root");
         let canvas = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
-        let camera = Camera::default();
         let search_state = SearchState::new(tree.len());
         let mut out = Vec::new();
         let mut scratch = LayoutScratch::default();
@@ -126,7 +123,6 @@ fn layout_bench(c: &mut Criterion) {
                     TreemapLayoutParams {
                         root: root_id,
                         canvas_rect: canvas,
-                        camera,
                         max_depth: 4,
                         search_state: &search_state,
                         filter_to_search: false,

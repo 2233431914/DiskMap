@@ -8,8 +8,8 @@
 //! one-line forwarder.
 
 use super::super::DiskMapApp;
-use super::super::StateMessage;
 use super::super::Palette;
+use super::super::StateMessage;
 use crate::app::{describe_node_kind, palette, pluralize, truncate_middle};
 use crate::cleanup::CleanupCandidate;
 use crate::duplicates::DuplicateCandidate;
@@ -133,13 +133,11 @@ pub fn show_cleanup_queue_section(ui: &mut egui::Ui, p: &Palette, app: &mut Disk
             let w0 = cols[0].available_width();
             if cols[0]
                 .add(
-                    egui::Button::new(
-                        if app.trash_confirm_target_id == Some(candidate.node_id) {
-                            "Confirm Trash"
-                        } else {
-                            "Trash"
-                        },
-                    )
+                    egui::Button::new(if app.trash_confirm_target_id == Some(candidate.node_id) {
+                        "Confirm Trash"
+                    } else {
+                        "Trash"
+                    })
                     .min_size(Vec2::new(w0, 24.0)),
                 )
                 .clicked()

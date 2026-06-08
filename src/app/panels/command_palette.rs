@@ -64,29 +64,19 @@ pub fn show_command_palette(ctx: &egui::Context, app: &mut DiskMapApp) {
                 if matches.is_empty() {
                     ui.add_space(12.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("No matches")
-                                .color(p.text_muted)
-                                .italics(),
-                        );
+                        ui.label(RichText::new("No matches").color(p.text_muted).italics());
                     });
                 } else {
                     egui::ScrollArea::vertical()
                         .max_height(palette_height - 80.0)
                         .show(ui, |ui| {
-                            for (i, cmd) in matches
-                                .iter()
-                                .take(PALETTE_MAX_FILTERED)
-                                .enumerate()
-                            {
+                            for (i, cmd) in matches.iter().take(PALETTE_MAX_FILTERED).enumerate() {
                                 let is_selected = i == selected_index;
                                 let label = format!("{} — {}", cmd.label, cmd.hint);
-                                let row_response = ui.add(
-                                    egui::Button::selectable(
-                                        is_selected,
-                                        egui::RichText::new(label),
-                                    ),
-                                );
+                                let row_response = ui.add(egui::Button::selectable(
+                                    is_selected,
+                                    egui::RichText::new(label),
+                                ));
                                 if row_response.clicked() {
                                     selected_index = i;
                                     run_command(app, cmd);
@@ -109,9 +99,7 @@ pub fn show_command_palette(ctx: &egui::Context, app: &mut DiskMapApp) {
     // Keyboard handling: Enter runs the highlighted match, Escape
     // closes. (Cmd+K is handled in app.rs::handle_keyboard.)
     if ctx.input(|i| i.key_pressed(Key::Enter)) && !matches.is_empty() {
-        if let Some(cmd) = matches
-            .get(app.palette_selected.min(matches.len().saturating_sub(1)))
-        {
+        if let Some(cmd) = matches.get(app.palette_selected.min(matches.len().saturating_sub(1))) {
             run_command(app, cmd);
             app.palette_open = false;
             app.palette_query.clear();

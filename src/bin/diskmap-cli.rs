@@ -56,9 +56,7 @@ impl Format {
             "text" | "txt" => Ok(Format::Text),
             "json" => Ok(Format::Json),
             "csv" => Ok(Format::Csv),
-            other => Err(format!(
-                "unknown format '{other}' (expected text|json|csv)"
-            )),
+            other => Err(format!("unknown format '{other}' (expected text|json|csv)")),
         }
     }
 }
@@ -119,9 +117,7 @@ fn parse_args(argv: &[String]) -> Result<CliOptions, String> {
         "help" | "-h" | "--help" => Ok(CliOptions {
             command: Command::Help,
         }),
-        other => Err(format!(
-            "unknown subcommand '{other}' (expected: scan)"
-        )),
+        other => Err(format!("unknown subcommand '{other}' (expected: scan)")),
     }
 }
 
@@ -172,9 +168,9 @@ fn parse_scan(argv: &[String]) -> Result<CliOptions, String> {
                 let value = argv
                     .get(i + 1)
                     .ok_or_else(|| format!("{arg} requires a value"))?;
-                let n: usize = value
-                    .parse()
-                    .map_err(|_| format!("--max-depth must be a positive integer, got '{value}'"))?;
+                let n: usize = value.parse().map_err(|_| {
+                    format!("--max-depth must be a positive integer, got '{value}'")
+                })?;
                 if n == 0 {
                     return Err("--max-depth must be >= 1".to_string());
                 }
@@ -620,9 +616,21 @@ mod tests {
     #[test]
     fn row_sorting_by_path_is_stable_alphabetical() {
         let mut rows = vec![
-            Row { path: "/c".into(), size: 1, kind: NodeKind::File },
-            Row { path: "/a".into(), size: 3, kind: NodeKind::File },
-            Row { path: "/b".into(), size: 2, kind: NodeKind::File },
+            Row {
+                path: "/c".into(),
+                size: 1,
+                kind: NodeKind::File,
+            },
+            Row {
+                path: "/a".into(),
+                size: 3,
+                kind: NodeKind::File,
+            },
+            Row {
+                path: "/b".into(),
+                size: 2,
+                kind: NodeKind::File,
+            },
         ];
         sort_rows(&mut rows, SortBy::Path);
         assert_eq!(rows[0].path, "/a");
@@ -633,9 +641,21 @@ mod tests {
     #[test]
     fn row_sorting_by_size_descending_breaks_ties_by_path() {
         let mut rows = vec![
-            Row { path: "/b".into(), size: 100, kind: NodeKind::File },
-            Row { path: "/a".into(), size: 100, kind: NodeKind::File },
-            Row { path: "/c".into(), size: 50, kind: NodeKind::File },
+            Row {
+                path: "/b".into(),
+                size: 100,
+                kind: NodeKind::File,
+            },
+            Row {
+                path: "/a".into(),
+                size: 100,
+                kind: NodeKind::File,
+            },
+            Row {
+                path: "/c".into(),
+                size: 50,
+                kind: NodeKind::File,
+            },
         ];
         sort_rows(&mut rows, SortBy::Size);
         // /a and /b tied at 100; tiebreak by path

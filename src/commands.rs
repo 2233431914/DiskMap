@@ -32,8 +32,7 @@ impl Command {
             return true;
         }
         let q = query.to_ascii_lowercase();
-        self.id.to_ascii_lowercase().contains(&q)
-            || self.label.to_ascii_lowercase().contains(&q)
+        self.id.to_ascii_lowercase().contains(&q) || self.label.to_ascii_lowercase().contains(&q)
     }
 }
 
@@ -104,8 +103,8 @@ pub fn builtin_commands() -> Vec<Command> {
             label: "Export diagnostics bundle",
             hint: "Write a snapshot of app state to disk-map-diagnostics-<ts>/",
             run: |app| {
-                let dest = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let dest =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 match app.export_diagnostics(&dest) {
                     Ok(path) => app.status = format!("Wrote diagnostics: {}", path.display()),
                     Err(e) => app.status = format!("Diagnostics export failed: {e}"),
@@ -118,8 +117,8 @@ pub fn builtin_commands() -> Vec<Command> {
             label: "Export rules to file",
             hint: "Write the current ruleset to disk-map-rules-<ts>.json",
             run: |app| {
-                let dest = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let dest =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 match crate::rules::export_ruleset_to_dir(&app.rules, &dest) {
                     Ok(path) => app.status = format!("Wrote rules: {}", path.display()),
                     Err(e) => app.status = format!("Rules export failed: {e}"),
@@ -135,7 +134,11 @@ pub fn builtin_commands() -> Vec<Command> {
                 app.realtime_watch_enabled = !app.realtime_watch_enabled;
                 app.status = format!(
                     "Watch {}",
-                    if app.realtime_watch_enabled { "on" } else { "off" }
+                    if app.realtime_watch_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 );
                 app.pending_repaint = true;
             },
@@ -148,7 +151,11 @@ pub fn builtin_commands() -> Vec<Command> {
                 app.color_by_extension = !app.color_by_extension;
                 app.status = format!(
                     "Color mode: {}",
-                    if app.color_by_extension { "extension" } else { "depth" }
+                    if app.color_by_extension {
+                        "extension"
+                    } else {
+                        "depth"
+                    }
                 );
                 app.layout_dirty = true;
                 app.pending_repaint = true;
@@ -162,7 +169,11 @@ pub fn builtin_commands() -> Vec<Command> {
                 app.search_filter_enabled = !app.search_filter_enabled;
                 app.status = format!(
                     "Search filter: {}",
-                    if app.search_filter_enabled { "on" } else { "off" }
+                    if app.search_filter_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 );
                 app.layout_dirty = true;
                 app.pending_repaint = true;
@@ -191,10 +202,10 @@ pub fn builtin_commands() -> Vec<Command> {
             },
         },
         Command {
-            id: "reset-camera",
-            label: "Reset treemap camera",
-            hint: "Pan/zoom back to the default view",
-            run: |app| app.reset_camera(),
+            id: "refresh-treemap-layout",
+            label: "Refresh treemap layout",
+            hint: "Recompute the fixed treemap layout for the current view",
+            run: |app| app.refresh_treemap_layout(),
         },
     ]
 }

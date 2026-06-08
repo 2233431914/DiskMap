@@ -22,8 +22,7 @@ fn unique_temp_dir() -> std::path::PathBuf {
         .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
-    let p = std::env::temp_dir()
-        .join(format!("disk-map-rules-fixture-{pid}-{nanos}-{n}"));
+    let p = std::env::temp_dir().join(format!("disk-map-rules-fixture-{pid}-{nanos}-{n}"));
     fs::create_dir_all(&p).expect("temp dir should be creatable");
     p
 }
@@ -157,13 +156,7 @@ fn scan_dir_into_tree(root_path: &std::path::Path) -> (TreeStore, usize) {
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
-            let child = tree.add_node_with_modified(
-                Some(parent_id),
-                name,
-                kind,
-                size,
-                mtime,
-            );
+            let child = tree.add_node_with_modified(Some(parent_id), name, kind, size, mtime);
             // Track the node so we can verify by name.
             let _ = child;
             if kind == NodeKind::File {
@@ -272,7 +265,11 @@ fn limit_caps_results() {
     let ctx = RuleContext { now_unix_secs: now };
     // Our fixture has roughly 4 hits. A limit of 2 should return 2.
     let hits = evaluate_rules(&rules, &mut tree, root, &ctx, 2);
-    assert!(hits.len() <= 2, "limit should be respected, got: {}", hits.len());
+    assert!(
+        hits.len() <= 2,
+        "limit should be respected, got: {}",
+        hits.len()
+    );
 }
 
 #[test]

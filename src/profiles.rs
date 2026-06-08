@@ -1,18 +1,15 @@
 //! Per-root scan option profiles.
 //!
 //! `ScanProfile` captures the user-facing scan options for a single
-//! scan root. `ProfileStore` maps root paths to profiles, in-memory
-//! only (no persistence yet — that's deferred to a future task).
+//! scan root. `ProfileStore` maps root paths to profiles and is
+//! persisted as part of the app's crash-safe local state.
 //!
 //! Design notes:
-//!  - In-memory only. JSON serialization helpers are provided so a
-//!    future persistence layer (e.g. Phase 15) can be added without
-//!    a breaking change.
-//!  - The "key" is the canonical (or user-typed) root path string.
-//!    No special normalization — what the user typed is what we key
-//!    on. If you scan `/Users/me/Downloads` and later
-//!    `/Users/me/Downloads/`, they're different keys. (Documented in
-//!    the UI.)
+//!  - JSON serialization helpers are provided for diagnostics and
+//!    manual inspection; app persistence uses `storage::LocalState`.
+//!  - The "key" is the user-facing root path string with trailing
+//!    slashes trimmed. We do not call `canonicalize`, because profile
+//!    lookup should not require the path to exist before a scan starts.
 //!  - Last-write-wins on conflict. No merge, no diff.
 
 use serde::{Deserialize, Serialize};
@@ -73,8 +70,9 @@ pub struct ProfileStoreFile {
     pub profiles: BTreeMap<String, ScanProfile>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileStore {
+    #[serde(default)]
     profiles: BTreeMap<String, ScanProfile>,
 }
 
@@ -113,7 +111,10 @@ impl ProfileStore {
     }
 
     pub fn list(&self) -> Vec<(String, ScanProfile)> {
-        self.profiles.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.profiles
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -128,13 +129,12 @@ impl ProfileStore {
         let file = ProfileStoreFile {
             profiles: self.profiles.clone(),
         };
-        serde_json::to_string_pretty(&file)
-            .unwrap_or_else(|_| "{\"profiles\":{}}".to_string())
+        serde_json::to_string_pretty(&file).unwrap_or_else(|_| "{\"profiles\":{}}".to_string())
     }
 
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let file: ProfileStoreFile = serde_json::from_str(json)
-            .map_err(|e| format!("invalid ProfileStore JSON: {e}"))?;
+        let file: ProfileStoreFile =
+            serde_json::from_str(json).map_err(|e| format!("invalid ProfileStore JSON: {e}"))?;
         Ok(Self {
             profiles: file.profiles,
         })

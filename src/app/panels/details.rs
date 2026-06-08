@@ -177,8 +177,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     ui.add_space(4.0);
     ui.add_sized(
         [ui.available_width(), 26.0],
-        egui::TextEdit::singleline(&mut app.protected_paths_input)
-            .hint_text("Protected paths"),
+        egui::TextEdit::singleline(&mut app.protected_paths_input).hint_text("Protected paths"),
     )
     .on_hover_text("Extra protected roots; comma, semicolon, or newline separated");
 
@@ -306,7 +305,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                 RichText::new(format!(
                     "Saved: depth {}, filter={}, last={}{}",
                     view.depth,
-                    if view.search_filter_enabled { "on" } else { "off" },
+                    if view.search_filter_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    },
                     view.last_report_mode,
                     if view.search_query.is_empty() {
                         String::new()
@@ -382,10 +385,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         ui.columns(2, |cols| {
             let w0 = cols[0].available_width();
             if cols[0]
-                .add(
-                    egui::Button::new("Save for this root")
-                        .min_size(Vec2::new(w0, 24.0)),
-                )
+                .add(egui::Button::new("Save for this root").min_size(Vec2::new(w0, 24.0)))
                 .clicked()
             {
                 app.save_current_as_profile(&profile_root);
@@ -395,8 +395,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             if cols[1]
                 .add_enabled(
                     has_profile,
-                    egui::Button::new("Apply profile")
-                        .min_size(Vec2::new(w1, 24.0)),
+                    egui::Button::new("Apply profile").min_size(Vec2::new(w1, 24.0)),
                 )
                 .clicked()
             {

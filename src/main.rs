@@ -6,6 +6,7 @@ fn main() -> eframe::Result<()> {
             .with_app_id("disk-map")
             .with_title("DiskMap")
             .with_inner_size([1280.0, 800.0]),
+        renderer: eframe::Renderer::Glow,
         persist_window: true,
         ..Default::default()
     };

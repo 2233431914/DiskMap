@@ -20,6 +20,9 @@ pub struct ScanDb {
 
 impl ScanDb {
     pub fn new(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -140,6 +143,18 @@ mod tests {
         assert_eq!(db.get_cached(Path::new("/tmp/b"), 2), Some(22));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_creates_missing_parent_directory() {
+        let root = temp_db_path("nested-parent");
+        let path = root.join("nested").join("scan-cache.db");
+
+        let _db = ScanDb::new(&path).unwrap();
+
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

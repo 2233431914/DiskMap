@@ -1,7 +1,7 @@
 //! Saved views: per-root capture of UI view state (depth, search
 //! query, focused node, selected node, color mode, last report
-//! panel). In-memory only — a future persistence layer can hook in
-//! the same way `SafeStorage` did for preferences.
+//! panel). `ViewStore` and `FilterStore` are persisted as part of the
+//! app's crash-safe local state.
 //!
 //! Design notes:
 //!  - One entry per scan root. No "list all views in the sidebar"

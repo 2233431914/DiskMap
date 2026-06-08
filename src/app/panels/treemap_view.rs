@@ -1,6 +1,6 @@
-//! Treemap canvas rendering: layout caching, click/drag/zoom interaction,
-//! context menu, and hover tooltip. Extracted from `app.rs` so the per-frame
-//! render path reads top-to-bottom in one file.
+//! Treemap rendering: fixed-area layout caching, selection, context menu, and
+//! hover tooltip. Extracted from `app.rs` so the per-frame render path reads
+//! top-to-bottom in one file.
 //!
 //! Helper paint routines (`paint_visual`, `extension_color_for_visual`,
 //! `show_hover_tooltip`) stay as methods on `DiskMapApp` in `app.rs` because
@@ -20,8 +20,7 @@ use std::time::Instant;
 
 pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     let p = palette(ui.ctx());
-    let available = ui.available_rect_before_wrap();
-    let response = ui.allocate_rect(available, Sense::click_and_drag());
+    let (available, response) = ui.allocate_exact_size(ui.available_size(), Sense::click());
     let painter = ui.painter_at(available);
     painter.rect_filled(available, 0.0, p.surface);
 
@@ -61,7 +60,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             TreemapLayoutParams {
                 root: root_id,
                 canvas_rect: available,
-                camera: app.camera,
                 max_depth: app.max_depth,
                 search_state: app.search.state(),
                 filter_to_search: app.search_filter_enabled,
@@ -74,36 +72,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         app.scan.record_layout_recompute(layout_start.elapsed());
     }
 
-    app.hovered_visual_kind = find_hovered_visual(&app.cached_visuals, response.hover_pos())
-        .map(|visual| visual.kind);
+    app.hovered_visual_kind =
+        find_hovered_visual(&app.cached_visuals, response.hover_pos()).map(|visual| visual.kind);
     app.hovered_id = app.hovered_visual_kind.map(|kind| match kind {
         VisualKind::Node(node_id) => node_id,
     });
 
     if response.secondary_clicked() {
         app.context_menu_target_id = app.hovered_id;
-    }
-
-    if response.dragged() && app.search.input().is_empty() {
-        let drag_delta = response.drag_delta();
-        if drag_delta != Vec2::ZERO {
-            app.camera.pan += drag_delta;
-            app.layout_dirty = true;
-            app.last_layout_refresh = Instant::now()
-                .checked_sub(LAYOUT_REFRESH_INTERVAL)
-                .unwrap_or_else(Instant::now);
-        }
-    }
-
-    let zoom_delta = ui.ctx().input(|input| input.zoom_delta());
-    if (zoom_delta - 1.0).abs() > f32::EPSILON {
-        if let Some(pointer) = response.hover_pos() {
-            app.camera.zoom_around(pointer, zoom_delta);
-            app.layout_dirty = true;
-            app.last_layout_refresh = Instant::now()
-                .checked_sub(LAYOUT_REFRESH_INTERVAL)
-                .unwrap_or_else(Instant::now);
-        }
     }
 
     for visual in &app.cached_visuals {
@@ -117,7 +93,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                 app.navigation.set_selected_id(Some(node_id));
             }
         } else {
-            app.reset_camera();
+            app.navigation.set_selected_id(None);
         }
     } else if response.clicked() {
         if let Some(node_id) = app.hovered_id {
@@ -151,8 +127,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                 if ui
                     .add_enabled(
                         node_path.is_some(),
-                        egui::Button::new("Open")
-                            .min_size(Vec2::new(ui.available_width(), 24.0)),
+                        egui::Button::new("Open").min_size(Vec2::new(ui.available_width(), 24.0)),
                     )
                     .clicked()
                 {

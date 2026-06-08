@@ -1,32 +1,28 @@
+use crate::cleanup::{CleanupQueue, ProtectedPathReason};
+use crate::duplicates::DuplicateReport;
 #[cfg(test)]
-use crate::cleanup::CleanupCandidate;
-use crate::cleanup::{
-    parse_protected_paths, validate_cleanup_target, CleanupQueue, CleanupTargetStatus,
-    ProtectedPathReason,
-};
-#[cfg(test)]
-use crate::cleanup::{protected_path_reason_with_deny_list, QueueAddResult};
-use crate::duplicates::{find_duplicate_candidates, DuplicateReport};
-use crate::export::{export_focused_report, export_subtree, ExportFormat, FocusedReportMetadata};
+use crate::export::ExportFormat;
 use crate::format::format_bytes;
-use crate::insights::{analyze_insights, InsightReport};
-use crate::platform::move_to_trash;
+use crate::insights::InsightReport;
 use crate::scanner::{
-    parse_exclude_patterns, scan_path_to_tree, size_basis_label, CacheMode,
-    PerfStats, ProgressSnapshot, ScanBatch, ScanMessage, ScanOptions,
+    parse_exclude_patterns, scan_path_to_tree, CacheMode, PerfStats, ProgressSnapshot, ScanBatch,
+    ScanMessage, ScanOptions,
 };
-use crate::snapshot::{
-    capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff,
-};
-use crate::storage::{app_data_dir, Preferences, SafeStorage};
+use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff};
+use crate::storage::{app_data_dir, LocalState, Preferences, SafeStorage};
 use crate::tree::{NodeId, NodeKind, TreeStore};
-use crate::treemap::{Camera, LayoutScratch, VisualKind, VisualNode};
+use crate::treemap::{LayoutScratch, VisualKind, VisualNode};
 use crate::watcher::{WatchPoll, WatchSession};
 
+mod analysis_actions;
+mod cleanup_actions;
+mod export_actions;
 mod navigation;
+mod panels;
+mod profile_actions;
+mod rule_actions;
 mod scan_session;
 mod search_nav;
-mod panels;
 
 use navigation::{NavigationOutcome, NavigationState};
 use scan_session::ScanSession;
@@ -37,9 +33,9 @@ use eframe::egui;
 use egui::{
     Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme, Vec2,
 };
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::collections::VecDeque;
 
 pub(super) const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
@@ -61,7 +57,6 @@ const STORAGE_THEME: &str = "disk_map.theme";
 const MAX_RECENT_ROOTS: usize = 10;
 const MAX_PINNED_ROOTS: usize = 12;
 const SNAPSHOT_DIFF_LIMIT: usize = 5;
-const DUPLICATE_REPORT_LIMIT: usize = 8;
 
 #[derive(Clone, Copy)]
 pub(super) struct Palette {
@@ -288,7 +283,6 @@ pub struct DiskMapApp {
     pub(super) trash_confirm_target_id: Option<NodeId>,
     pub(super) cleanup_queue: CleanupQueue,
     pub(super) hovered_visual_kind: Option<VisualKind>,
-    pub(super) camera: Camera,
     pub(super) max_depth: usize,
     theme_preference: Option<Theme>,
     pub(super) status: String,
@@ -296,7 +290,7 @@ pub struct DiskMapApp {
     pub(super) layout_scratch: LayoutScratch,
     pub(super) last_canvas_rect: Option<Rect>,
     pub(super) layout_dirty: bool,
-    pub(super)     last_layout_refresh: Instant,
+    pub(super) last_layout_refresh: Instant,
     pub(super) pending_repaint: bool,
     safe_storage: SafeStorage,
     /// Most recent scan perf stats, captured at ScanMessage::Finished.
@@ -316,8 +310,11 @@ pub struct DiskMapApp {
     /// a successful import. Avoids spawning a native file dialog (we
     /// don't depend on a GUI toolkit for picking files).
     pub(super) rules_import_path: String,
-    /// Per-root scan option profiles. In-memory only (Phase 15 will
-    /// add persistence). Auto-applied when a scan starts.
+    /// Pending rules import preview. Import only replaces the live
+    /// ruleset after the user confirms this preview.
+    pub(super) pending_rules_import: Option<crate::rules::RuleImportPreview>,
+    /// Per-root scan option profiles. Persisted in `SafeStorage` and
+    /// auto-applied when a scan starts.
     pub(super) profiles: crate::profiles::ProfileStore,
     /// Command palette (Cmd+K) open state. The palette renders as a
     /// top-anchored overlay only when this is true.
@@ -327,8 +324,8 @@ pub struct DiskMapApp {
     /// Index of the currently highlighted palette result. Reset to 0
     /// on each query change.
     pub(super) palette_selected: usize,
-    /// Per-root saved view state (in-memory). One entry per scan
-    /// root. Captured via the "Save current view" sidebar button.
+    /// Per-root saved view state. One entry per scan root. Captured
+    /// via the "Save current view" sidebar button.
     pub(super) views: crate::views::ViewStore,
     /// Discriminator for the last-opened report panel. Used by
     /// "Apply saved view" to re-open the same panel the user had
@@ -337,7 +334,7 @@ pub struct DiskMapApp {
     /// panels don't require a code change.
     pub(super) last_report_mode: String,
     /// Saved filter presets (named bundles of search query +
-    /// filter_enabled toggle). In-memory only.
+    /// filter_enabled toggle).
     pub(super) filter_presets: crate::views::FilterStore,
     /// Sticky text field for the new-preset name input. Self-clears
     /// after a successful add.
@@ -381,7 +378,6 @@ impl Default for DiskMapApp {
             trash_confirm_target_id: None,
             cleanup_queue: CleanupQueue::default(),
             hovered_visual_kind: None,
-            camera: Camera::default(),
             max_depth: 1,
             theme_preference: None,
             status: "Ready".to_string(),
@@ -397,6 +393,7 @@ impl Default for DiskMapApp {
             rules: crate::rules::default_ruleset(),
             last_rule_hits: None,
             rules_import_path: String::new(),
+            pending_rules_import: None,
             profiles: crate::profiles::ProfileStore::new(),
             palette_open: false,
             palette_query: String::new(),
@@ -412,14 +409,24 @@ impl Default for DiskMapApp {
 impl DiskMapApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
-        let prefs = app.safe_storage.read();
-        app.restore_preferences(&prefs);
+        let state = app.safe_storage.read_state();
+        app.restore_local_state(&state);
         if let Some(theme) = app.theme_preference {
             apply_theme_preference(&cc.egui_ctx, theme);
         } else {
             app.theme_preference = Some(cc.egui_ctx.theme());
         }
         app
+    }
+
+    fn restore_local_state(&mut self, state: &LocalState) {
+        self.restore_preferences(&state.preferences);
+        self.profiles = state.profiles.clone();
+        self.views = state.views.clone();
+        self.filter_presets = state.filter_presets.clone();
+        self.rules = state.rules.clone();
+        self.pending_rules_import = None;
+        self.last_rule_hits = None;
     }
 
     fn restore_preferences(&mut self, prefs: &Preferences) {
@@ -458,9 +465,8 @@ impl DiskMapApp {
             self.stay_on_filesystem = stay_on_filesystem;
         }
 
-        if let Some(sqlite_cache_enabled) = prefs
-            .get(STORAGE_SQLITE_CACHE)
-            .and_then(parse_storage_bool)
+        if let Some(sqlite_cache_enabled) =
+            prefs.get(STORAGE_SQLITE_CACHE).and_then(parse_storage_bool)
         {
             self.sqlite_cache_enabled = sqlite_cache_enabled;
         }
@@ -501,9 +507,7 @@ impl DiskMapApp {
             self.max_depth = depth.clamp(1, 10);
         }
 
-        self.theme_preference = prefs
-            .get(STORAGE_THEME)
-            .and_then(parse_theme_preference);
+        self.theme_preference = prefs.get(STORAGE_THEME).and_then(parse_theme_preference);
     }
 
     fn collect_preferences(&self) -> Preferences {
@@ -540,10 +544,28 @@ impl DiskMapApp {
     }
 
     fn save_preferences(&self) {
-        let prefs = self.collect_preferences();
-        if let Err(error) = self.safe_storage.write(&prefs) {
-            eprintln!("disk-map: failed to write preferences: {error}");
+        if let Err(error) = self.safe_storage.write_state(&self.collect_local_state()) {
+            eprintln!("disk-map: failed to write local state: {error}");
         }
+    }
+
+    fn collect_local_state(&self) -> LocalState {
+        LocalState {
+            preferences: self.collect_preferences(),
+            profiles: self.profiles.clone(),
+            views: self.views.clone(),
+            filter_presets: self.filter_presets.clone(),
+            rules: self.rules.clone(),
+            ..LocalState::default()
+        }
+    }
+
+    pub(super) fn persist_local_state(&mut self) {
+        if let Err(error) = self.safe_storage.write_state(&self.collect_local_state()) {
+            self.record_error(format!("local state save failed: {error}"));
+            self.status = format!("Local state save failed: {error}");
+        }
+        self.pending_repaint = true;
     }
 
     fn scan_options(&self) -> ScanOptions {
@@ -554,11 +576,20 @@ impl DiskMapApp {
             } else {
                 CacheMode::Disabled
             },
+            cache_path: self.sqlite_cache_enabled.then(|| self.sqlite_cache_path()),
             include_hidden: self.include_hidden,
             follow_symlinks: self.follow_symlinks,
             stay_on_filesystem: self.stay_on_filesystem,
             ..ScanOptions::default()
         }
+    }
+
+    fn sqlite_cache_path(&self) -> PathBuf {
+        self.safe_storage
+            .path()
+            .parent()
+            .map(|dir| dir.join("disk-map-cache.db"))
+            .unwrap_or_else(|| app_data_dir("disk-map").join("disk-map-cache.db"))
     }
 }
 
@@ -660,10 +691,10 @@ impl DiskMapApp {
             }
 
             if icon_button(ui, true, ToolbarIcon::Refresh)
-                .on_hover_text("Reset view")
+                .on_hover_text("Refresh treemap layout")
                 .clicked()
             {
-                self.reset_camera();
+                self.refresh_treemap_layout();
             }
 
             ui.add_space(4.0);
@@ -1126,12 +1157,8 @@ impl DiskMapApp {
         // Command palette: Cmd+K (mac) or Ctrl+K (other). Open on
         // press; if already open, just keep it open (the panel handles
         // its own focus).
-        let cmd_or_ctrl = ctx.input(|input| {
-            input.modifiers.command || input.modifiers.ctrl
-        });
-        if cmd_or_ctrl
-            && ctx.input(|input| input.key_pressed(egui::Key::K))
-        {
+        let cmd_or_ctrl = ctx.input(|input| input.modifiers.command || input.modifiers.ctrl);
+        if cmd_or_ctrl && ctx.input(|input| input.key_pressed(egui::Key::K)) {
             self.palette_open = !self.palette_open;
             if self.palette_open {
                 self.palette_query.clear();
@@ -1155,11 +1182,6 @@ impl DiskMapApp {
                     self.scan.mark_started();
                     self.status = format!("Scanning {}", path.display());
                     self.record_recent_root(&path);
-                    // Auto-apply per-root profile if one exists. The
-                    // profile's option values overwrite the live UI
-                    // fields *before* the scan starts, so the scan
-                    // itself uses the profiled options.
-                    self.apply_profile_to_ui(&path.display().to_string());
                     self.tree.clear();
                     self.tree.push_node(None, root_node);
                     self.tree.set_root_path(path);
@@ -1364,7 +1386,7 @@ impl DiskMapApp {
 
     /// Record an error or notable status change for the diagnostics
     /// export. Capped at 64 entries (oldest dropped on overflow).
-    fn record_error(&mut self, message: String) {
+    pub(super) fn record_error(&mut self, message: String) {
         const MAX_RECENT_ERRORS: usize = 64;
         if self.recent_errors.len() >= MAX_RECENT_ERRORS {
             self.recent_errors.pop_front();
@@ -1378,11 +1400,7 @@ impl DiskMapApp {
     pub fn evaluate_current_rules(&mut self) -> usize {
         self.last_report_mode = "rules".to_string();
         use crate::rules::{evaluate_rules, RuleContext, INSIGHT_REPORT_LIMIT_FROM_RULES};
-        let root_id = match self
-            .navigation
-            .focused_root()
-            .or(self.tree.root)
-        {
+        let root_id = match self.navigation.focused_root().or(self.tree.root) {
             Some(id) => id,
             None => {
                 self.last_rule_hits = Some(Vec::new());
@@ -1397,51 +1415,21 @@ impl DiskMapApp {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         };
-        let hits = evaluate_rules(&self.rules, &mut self.tree, root_id, &ctx, INSIGHT_REPORT_LIMIT_FROM_RULES);
+        let hits = evaluate_rules(
+            &self.rules,
+            &mut self.tree,
+            root_id,
+            &ctx,
+            INSIGHT_REPORT_LIMIT_FROM_RULES,
+        );
         let count = hits.len();
         self.last_rule_hits = Some(hits);
-        self.status = format!("Applied {} rules, found {count} hits", self.rules.enabled_count());
+        self.status = format!(
+            "Applied {} rules, found {count} hits",
+            self.rules.enabled_count()
+        );
         self.pending_repaint = true;
         count
-    }
-
-    /// Apply a saved profile to the live UI fields. Does not change
-    /// any in-flight scan; just overwrites the user-facing options
-    /// for the next scan. If no profile is stored for `root`, this
-    /// is a no-op (the UI keeps its current values).
-    pub fn apply_profile_to_ui(&mut self, root: &str) {
-        let Some(profile) = self.profiles.get(root).cloned() else {
-            return;
-        };
-        self.exclude_input = profile.exclude_patterns.join(",");
-        self.include_hidden = profile.include_hidden;
-        self.follow_symlinks = profile.follow_symlinks;
-        self.stay_on_filesystem = profile.stay_on_filesystem;
-        self.sqlite_cache_enabled = profile.sqlite_cache_enabled;
-        self.search_filter_enabled = profile.search_filter_enabled;
-        self.color_by_extension = profile.color_by_extension;
-        self.realtime_watch_enabled = profile.realtime_watch_enabled;
-        self.status = format!("Applied profile for {}", root);
-        self.pending_repaint = true;
-    }
-
-    /// Save the current UI option values to the profile for `root`.
-    /// Overwrites any existing profile for that key.
-    pub fn save_current_as_profile(&mut self, root: &str) {
-        use crate::profiles::ScanProfile;
-        let profile = ScanProfile {
-            exclude_patterns: parse_exclude_patterns(&self.exclude_input),
-            include_hidden: self.include_hidden,
-            follow_symlinks: self.follow_symlinks,
-            stay_on_filesystem: self.stay_on_filesystem,
-            sqlite_cache_enabled: self.sqlite_cache_enabled,
-            search_filter_enabled: self.search_filter_enabled,
-            color_by_extension: self.color_by_extension,
-            realtime_watch_enabled: self.realtime_watch_enabled,
-        };
-        self.profiles.set(root, profile);
-        self.status = format!("Saved profile for {} ({} stored)", root, self.profiles.len());
-        self.pending_repaint = true;
     }
 
     /// Capture the current view state under `root`. Existing entry
@@ -1460,7 +1448,7 @@ impl DiskMapApp {
         };
         self.views.set(root, state);
         self.status = format!("Saved view for {} ({} stored)", root, self.views.len());
-        self.pending_repaint = true;
+        self.persist_local_state();
     }
 
     /// Apply a previously-saved view's state to the live UI fields.
@@ -1516,7 +1504,7 @@ impl DiskMapApp {
                 self.filter_presets.len()
             );
             self.filter_preset_name.clear();
-            self.pending_repaint = true;
+            self.persist_local_state();
             true
         } else {
             self.status = format!("Filter preset '{}' already exists", trimmed);
@@ -1544,7 +1532,7 @@ impl DiskMapApp {
     pub fn remove_filter_preset(&mut self, name: &str) -> bool {
         if self.filter_presets.remove(name).is_some() {
             self.status = format!("Removed filter preset '{}'", name);
-            self.pending_repaint = true;
+            self.persist_local_state();
             true
         } else {
             false
@@ -1561,7 +1549,10 @@ impl DiskMapApp {
         let scan_options: Vec<(String, String)> = vec![
             ("include_hidden".into(), self.include_hidden.to_string()),
             ("follow_symlinks".into(), self.follow_symlinks.to_string()),
-            ("stay_on_filesystem".into(), self.stay_on_filesystem.to_string()),
+            (
+                "stay_on_filesystem".into(),
+                self.stay_on_filesystem.to_string(),
+            ),
             (
                 "sqlite_cache_enabled".into(),
                 self.sqlite_cache_enabled.to_string(),
@@ -1596,221 +1587,6 @@ impl DiskMapApp {
         bundle
             .write_to(dest_dir)
             .map_err(|e| anyhow::anyhow!("write diagnostics bundle: {e}"))
-    }
-
-    #[cfg(test)]
-    fn queue_cleanup_candidate(&mut self, node_id: NodeId) {
-        let Some(path) = self.tree.node_real_path(node_id) else {
-            self.status = "Cleanup queue unavailable for virtual nodes".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        if let Some(reason) = self.protected_path_reason(&path) {
-            self.status = protected_path_status(reason, &path);
-            self.pending_repaint = true;
-            return;
-        }
-
-        let node = self.tree.node(node_id);
-        let candidate = CleanupCandidate {
-            node_id,
-            name: node.name.clone(),
-            path: path.clone(),
-            size: node.size,
-            item_count: self.cleanup_item_count(node_id),
-            kind: node.kind,
-        };
-        self.status = match self.cleanup_queue.add(candidate) {
-            QueueAddResult::Added => format!("Queued cleanup candidate: {}", path.display()),
-            QueueAddResult::AlreadyQueued => {
-                format!("Cleanup candidate already queued: {}", path.display())
-            }
-        };
-        self.pending_repaint = true;
-    }
-
-    fn move_node_to_trash(&mut self, node_id: NodeId) {
-        let Some(path) = self.tree.node_real_path(node_id) else {
-            self.status = "Move to Trash unavailable for virtual nodes".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        self.move_path_to_trash(node_id, path);
-    }
-
-    fn arm_or_confirm_queued_trash(&mut self, node_id: NodeId) {
-        let Some(candidate) = self.cleanup_queue.get(node_id).cloned() else {
-            self.status = "Move to Trash unavailable: candidate is not queued".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match self.cleanup_target_status(&candidate.path) {
-            CleanupTargetStatus::Ready => {}
-            CleanupTargetStatus::Protected(reason) => {
-                self.trash_confirm_target_id = None;
-                self.status = protected_path_status(reason, &candidate.path);
-                self.pending_repaint = true;
-                return;
-            }
-            CleanupTargetStatus::Missing => {
-                self.trash_confirm_target_id = None;
-                self.cleanup_queue.remove(node_id);
-                self.status = cleanup_target_missing_status(&candidate.path);
-                self.pending_repaint = true;
-                return;
-            }
-            CleanupTargetStatus::Inaccessible(error) => {
-                self.trash_confirm_target_id = None;
-                self.status = cleanup_target_inaccessible_status(&candidate.path, &error);
-                self.pending_repaint = true;
-                return;
-            }
-        }
-
-        if self.trash_confirm_target_id != Some(node_id) {
-            self.trash_confirm_target_id = Some(node_id);
-            self.status = format!(
-                "Confirm Trash: {} · {} · {}",
-                candidate.path.display(),
-                format_bytes(candidate.size),
-                pluralize(candidate.item_count as u64, "item", "items")
-            );
-            self.pending_repaint = true;
-            return;
-        }
-
-        self.move_path_to_trash(node_id, candidate.path);
-    }
-
-    fn move_path_to_trash(&mut self, node_id: NodeId, path: PathBuf) {
-        match self.cleanup_target_status(&path) {
-            CleanupTargetStatus::Ready => {}
-            CleanupTargetStatus::Protected(reason) => {
-                self.trash_confirm_target_id = None;
-                self.status = protected_path_status(reason, &path);
-                self.pending_repaint = true;
-                return;
-            }
-            CleanupTargetStatus::Missing => {
-                self.trash_confirm_target_id = None;
-                self.cleanup_queue.remove(node_id);
-                self.status = cleanup_target_missing_status(&path);
-                self.pending_repaint = true;
-                return;
-            }
-            CleanupTargetStatus::Inaccessible(error) => {
-                self.trash_confirm_target_id = None;
-                self.status = cleanup_target_inaccessible_status(&path, &error);
-                self.pending_repaint = true;
-                return;
-            }
-        }
-
-        if self.trash_confirm_target_id == Some(node_id) {
-            self.trash_confirm_target_id = None;
-        }
-
-        match move_to_trash(&path) {
-            Ok(()) => {
-                self.cleanup_queue.remove(node_id);
-                let view_updated = self.remove_deleted_node_from_view(node_id);
-                self.status = if view_updated {
-                    format!("Moved to Trash: {}", path.display())
-                } else {
-                    format!("Moved to Trash: {}. Rescan to refresh.", path.display())
-                };
-            }
-            Err(error) => {
-                self.status = format!("Move to Trash failed: {error}");
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    fn remove_deleted_node_from_view(&mut self, node_id: NodeId) -> bool {
-        if node_id >= self.tree.len() {
-            return false;
-        }
-
-        let focused_removed = self
-            .navigation
-            .focused_root()
-            .is_some_and(|id| self.tree.is_descendant_or_same(id, node_id));
-        let selected_removed = self
-            .navigation
-            .selected_id()
-            .is_some_and(|id| self.tree.is_descendant_or_same(id, node_id));
-
-        let Some(detached) = self.tree.detach_subtree(node_id) else {
-            return false;
-        };
-
-        if let Some(parent_id) = detached.parent {
-            self.tree.repair_sorted_children(&detached.dirty_nodes);
-            if focused_removed {
-                self.navigation.enter_root(parent_id, false);
-            } else if selected_removed {
-                self.navigation.set_selected_id(Some(parent_id));
-            }
-            self.navigation.prune_invalid(&self.tree);
-            self.navigation.rebuild_breadcrumb_cache(&self.tree);
-            self.refresh_search_matches();
-        } else {
-            self.stop_watching();
-            self.navigation.clear_for_new_scan();
-            self.search.clear(0);
-            self.cached_visuals.clear();
-        }
-
-        self.hovered_id = None;
-        self.context_menu_target_id = None;
-        self.hovered_visual_kind = None;
-        self.trash_confirm_target_id = None;
-        self.cached_visuals.clear();
-        self.layout_dirty = true;
-        true
-    }
-
-    fn remove_cleanup_candidate(&mut self, node_id: NodeId) {
-        if let Some(candidate) = self.cleanup_queue.remove(node_id) {
-            if self.trash_confirm_target_id == Some(node_id) {
-                self.trash_confirm_target_id = None;
-            }
-            self.status = format!("Removed cleanup candidate: {}", candidate.path.display());
-            self.pending_repaint = true;
-        }
-    }
-
-    #[cfg(test)]
-    fn cleanup_item_count(&self, node_id: NodeId) -> usize {
-        if node_id >= self.tree.len() {
-            return 0;
-        }
-
-        let mut count = 1usize;
-        let mut stack = self.tree.node(node_id).children.clone();
-        while let Some(id) = stack.pop() {
-            if id >= self.tree.len() {
-                continue;
-            }
-            count += 1;
-            stack.extend(self.tree.node(id).children.iter().copied());
-        }
-        count
-    }
-
-    #[cfg(test)]
-    fn protected_path_reason(&self, path: &Path) -> Option<ProtectedPathReason> {
-        let user_deny_list = parse_protected_paths(&self.protected_paths_input);
-        protected_path_reason_with_deny_list(path, &user_deny_list)
-    }
-
-    fn cleanup_target_status(&self, path: &Path) -> CleanupTargetStatus {
-        let user_deny_list = parse_protected_paths(&self.protected_paths_input);
-        validate_cleanup_target(path, &user_deny_list)
     }
 
     fn handle_watch_events(&mut self) {
@@ -1965,6 +1741,7 @@ impl DiskMapApp {
     }
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
+        self.apply_profile_to_ui(&path.display().to_string());
         self.stop_watching();
         self.incremental_scan_active = false;
         self.scan
@@ -1982,8 +1759,7 @@ impl DiskMapApp {
         self.insight_report = None;
         self.search.clear(0);
         self.cached_visuals.clear();
-        self.reset_camera();
-        self.layout_dirty = true;
+        self.refresh_treemap_layout();
         self.path_input = path.display().to_string();
         self.status = format!("Scanning {}", path.display());
         self.pending_repaint = true;
@@ -2067,190 +1843,6 @@ impl DiskMapApp {
             .and_then(|root_id| self.tree.node_real_path(root_id))
     }
 
-    fn export_focused_subtree(&mut self, format: ExportFormat) {
-        let Some(root_id) = self.navigation.focused_root() else {
-            self.status = "Export unavailable: no focused directory".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match self.write_focused_export(root_id, format) {
-            Ok(path) => {
-                self.status = format!("Exported {} to {}", format.label(), path.display());
-            }
-            Err(error) => {
-                self.status = format!("Export failed: {error}");
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    fn export_scan_root(&mut self, format: ExportFormat) {
-        let Some(root_id) = self.tree.root else {
-            self.status = "Export unavailable: no scan root".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match self.write_focused_export(root_id, format) {
-            Ok(path) => {
-                self.status = format!("Exported {} to {}", format.label(), path.display());
-            }
-            Err(error) => {
-                self.status = format!("Export failed: {error}");
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    fn export_focused_report_json(&mut self) {
-        let Some(root_id) = self.navigation.focused_root() else {
-            self.status = "Report export unavailable: no focused directory".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match self.write_focused_report(root_id) {
-            Ok(path) => {
-                self.status = format!("Exported report to {}", path.display());
-            }
-            Err(error) => {
-                self.status = format!("Report export failed: {error}");
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    pub(super) fn analyze_duplicate_candidates(&mut self) {
-        self.last_report_mode = "duplicates".to_string();
-        let Some(root_id) = self.navigation.focused_root() else {
-            self.duplicate_report = None;
-            self.status = "Duplicate analysis unavailable: no focused directory".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match find_duplicate_candidates(&mut self.tree, root_id, DUPLICATE_REPORT_LIMIT) {
-            Some(report) => {
-                let status = if report.group_count == 0 {
-                    "Duplicate analysis found no candidates".to_string()
-                } else {
-                    format!(
-                        "Duplicate analysis found {}",
-                        pluralize(
-                            report.group_count as u64,
-                            "candidate group",
-                            "candidate groups"
-                        )
-                    )
-                };
-                self.duplicate_report = Some(report);
-                self.status = status;
-            }
-            None => {
-                self.duplicate_report = None;
-                self.status = "Duplicate analysis unavailable for this view".to_string();
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    pub(super) fn analyze_file_insights(&mut self) {
-        self.last_report_mode = "insights".to_string();
-        let Some(root_id) = self.navigation.focused_root() else {
-            self.insight_report = None;
-            self.status = "Insights unavailable: no focused directory".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match analyze_insights(
-            &mut self.tree,
-            root_id,
-            current_unix_secs(),
-            crate::insights::INSIGHT_REPORT_LIMIT,
-        ) {
-            Some(report) => {
-                self.status = format!(
-                    "Insights analyzed {}",
-                    pluralize(report.file_count as u64, "file", "files")
-                );
-                self.insight_report = Some(report);
-            }
-            None => {
-                self.insight_report = None;
-                self.status = "Insights unavailable for this view".to_string();
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    fn write_focused_export(
-        &mut self,
-        root_id: NodeId,
-        format: ExportFormat,
-    ) -> anyhow::Result<PathBuf> {
-        if root_id >= self.tree.len() {
-            anyhow::bail!("focused directory is no longer available");
-        }
-
-        let content = export_subtree(&mut self.tree, root_id, format);
-        let output_path = default_export_path(format);
-        std::fs::write(&output_path, content)?;
-        Ok(output_path)
-    }
-
-    fn write_focused_report(&mut self, root_id: NodeId) -> anyhow::Result<PathBuf> {
-        if root_id >= self.tree.len() {
-            anyhow::bail!("focused directory is no longer available");
-        }
-
-        let metadata = self.focused_report_metadata(root_id)?;
-        let content = export_focused_report(&mut self.tree, root_id, &metadata);
-        let output_path = default_report_path();
-        std::fs::write(&output_path, content)?;
-        Ok(output_path)
-    }
-
-    fn focused_report_metadata(
-        &mut self,
-        root_id: NodeId,
-    ) -> anyhow::Result<FocusedReportMetadata> {
-        let scan_root_id = self
-            .tree
-            .root
-            .ok_or_else(|| anyhow::anyhow!("scan root is no longer available"))?;
-        let scan_root_path = self
-            .tree
-            .node_real_path(scan_root_id)
-            .ok_or_else(|| anyhow::anyhow!("scan root has no real path"))?;
-        let focused_path = self
-            .tree
-            .node_real_path(root_id)
-            .ok_or_else(|| anyhow::anyhow!("focused node has no real path"))?;
-
-        Ok(FocusedReportMetadata {
-            generated_at_unix_secs: current_unix_secs(),
-            scan_root_path: scan_root_path.display().to_string(),
-            focused_path: focused_path.display().to_string(),
-            size_basis: size_basis_label(),
-            max_depth: self.max_depth,
-            search_query: self.search.query().to_string(),
-            search_filter_enabled: self.search_filter_enabled,
-            color_mode: if self.color_by_extension {
-                "extension"
-            } else {
-                "directory-depth"
-            },
-            include_hidden: self.include_hidden,
-            follow_symlinks: self.follow_symlinks,
-            stay_on_filesystem: self.stay_on_filesystem,
-            sqlite_cache_enabled: self.sqlite_cache_enabled,
-            realtime_watch_enabled: self.realtime_watch_enabled,
-            exclude_patterns: parse_exclude_patterns(&self.exclude_input),
-        })
-    }
-
     fn cancel_scan(&mut self) {
         if self.scan.cancel() {
             self.status = "Cancelling scan...".to_string();
@@ -2278,8 +1870,7 @@ impl DiskMapApp {
         self.apply_navigation_outcome(outcome);
     }
 
-    pub(super) fn reset_camera(&mut self) {
-        self.camera = Camera::default();
+    pub(super) fn refresh_treemap_layout(&mut self) {
         self.mark_layout_dirty_now();
     }
 
@@ -2293,13 +1884,12 @@ impl DiskMapApp {
     fn apply_navigation_outcome(&mut self, outcome: NavigationOutcome) {
         match outcome {
             NavigationOutcome::Noop => {}
-            NavigationOutcome::ResetCameraOnly => self.reset_camera(),
+            NavigationOutcome::RefreshLayoutOnly => self.mark_layout_dirty_now(),
             NavigationOutcome::FocusChanged { refresh_search } => {
-                self.reset_camera();
+                self.mark_layout_dirty_now();
                 if refresh_search {
                     self.refresh_search_matches();
                 }
-                self.layout_dirty = true;
                 self.navigation.rebuild_breadcrumb_cache(&self.tree);
             }
         }
@@ -2431,7 +2021,10 @@ impl DiskMapApp {
     }
 }
 
-pub(super) fn find_hovered_visual(visuals: &[VisualNode], pos: Option<Pos2>) -> Option<&VisualNode> {
+pub(super) fn find_hovered_visual(
+    visuals: &[VisualNode],
+    pos: Option<Pos2>,
+) -> Option<&VisualNode> {
     let pos = pos?;
     visuals.iter().rev().find(|visual| {
         visual.rect.contains(pos) && visual.rect.width() >= 2.0 && visual.rect.height() >= 2.0
@@ -2872,19 +2465,6 @@ pub(super) fn pluralize(count: u64, singular: &str, plural: &str) -> String {
     }
 }
 
-fn default_export_path(format: ExportFormat) -> PathBuf {
-    let timestamp = current_unix_secs();
-    PathBuf::from(format!(
-        "disk-map-export-{timestamp}.{}",
-        format.extension()
-    ))
-}
-
-fn default_report_path() -> PathBuf {
-    let timestamp = current_unix_secs();
-    PathBuf::from(format!("disk-map-report-{timestamp}.json"))
-}
-
 fn format_perf_stats(stats: &PerfStats) -> String {
     format!(
         "perf: messages={} batches={} entries={} nodes={} files={} dirs={} size_merges={} ancestor_delta_ms={:.2} parent_stack_hits={} parent_fallbacks={} progress_snapshots={} prefetched_files={} metadata_fallback_files={} scan_ms={:.2} metadata_ms={:.2} mtime_ms={:.2} size_ms={:.2} flush_ms={:.2} layouts={} layout_ms={:.2} search_rebuilds={} search_incremental={} db_hits={} db_misses={} db_flushes={}",
@@ -2936,8 +2516,7 @@ mod tests {
             .as_nanos();
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let p = std::env::temp_dir()
-            .join(format!("disk-map-prefs-test-{pid}-{nanos}-{n}"));
+        let p = std::env::temp_dir().join(format!("disk-map-prefs-test-{pid}-{nanos}-{n}"));
         std::fs::create_dir_all(&p).expect("temp dir should be creatable");
         p
     }
@@ -3037,6 +2616,27 @@ mod tests {
         temp_root.join(format!("{prefix}-{nanos}"))
     }
 
+    fn drain_scan_for_test(app: &mut DiskMapApp) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let Ok(message) = app.rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            let finished = matches!(message, ScanMessage::Finished { .. });
+            let terminal = matches!(
+                message,
+                ScanMessage::Finished { .. }
+                    | ScanMessage::Cancelled { .. }
+                    | ScanMessage::Error { .. }
+            );
+            app.apply_scan_message_for_test(message);
+            if terminal {
+                return finished;
+            }
+        }
+        false
+    }
+
     #[test]
     fn incremental_messages_build_tree_correctly() {
         let mut app = app_for_scan(1);
@@ -3105,20 +2705,29 @@ mod tests {
 
     #[test]
     fn default_scan_options_keep_cache_disabled() {
-        assert_eq!(
-            DiskMapApp::default().scan_options().cache_mode,
-            CacheMode::Disabled
-        );
+        let options = DiskMapApp::default().scan_options();
+
+        assert_eq!(options.cache_mode, CacheMode::Disabled);
+        assert!(options.cache_path.is_none());
     }
 
     #[test]
     fn sqlite_cache_setting_enables_cache_mode() {
         let app = DiskMapApp {
             sqlite_cache_enabled: true,
+            safe_storage: SafeStorage::new(&unique_temp_dir()),
             ..Default::default()
         };
+        let options = app.scan_options();
 
-        assert_eq!(app.scan_options().cache_mode, CacheMode::Enabled);
+        assert_eq!(options.cache_mode, CacheMode::Enabled);
+        assert_eq!(
+            options
+                .cache_path
+                .as_ref()
+                .and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("disk-map-cache.db"))
+        );
     }
 
     #[test]
@@ -3166,7 +2775,10 @@ mod tests {
         let prefs = store.read();
         assert_eq!(prefs.get(STORAGE_PATH_INPUT), Some("/next"));
         assert_eq!(prefs.get(STORAGE_MAX_DEPTH), Some("4"));
-        assert_eq!(prefs.get(STORAGE_EXCLUDE_INPUT), Some("node_modules;target"));
+        assert_eq!(
+            prefs.get(STORAGE_EXCLUDE_INPUT),
+            Some("node_modules;target")
+        );
         assert_eq!(prefs.get(STORAGE_PROTECTED_PATHS), Some("/keep\n/safe"));
         assert_eq!(prefs.get(STORAGE_INCLUDE_HIDDEN), Some("false"));
         assert_eq!(prefs.get(STORAGE_FOLLOW_SYMLINKS), Some("true"));
@@ -3195,10 +2807,7 @@ mod tests {
         prefs.set(STORAGE_SEARCH_FILTER, "true");
         prefs.set(STORAGE_COLOR_BY_EXTENSION, "true");
         prefs.set(STORAGE_REALTIME_WATCH, "false");
-        prefs.set(
-            STORAGE_RECENT_ROOTS,
-            "/recent-a\n\n/recent-b\n/recent-a",
-        );
+        prefs.set(STORAGE_RECENT_ROOTS, "/recent-a\n\n/recent-b\n/recent-a");
         prefs.set(STORAGE_PINNED_ROOTS, "/pinned-a\n/pinned-b\n/pinned-a");
         prefs.set(STORAGE_MAX_DEPTH, "99");
         prefs.set(STORAGE_THEME, "dark");
@@ -3249,6 +2858,115 @@ mod tests {
     }
 
     #[test]
+    fn local_state_restores_profiles_views_filter_presets_and_rules() {
+        let dir = unique_temp_dir();
+        let root = "/state-root";
+        let mut app = DiskMapApp {
+            safe_storage: SafeStorage::new(&dir),
+            ..Default::default()
+        };
+        app.path_input = root.into();
+        app.exclude_input = "target,.git".into();
+        app.include_hidden = false;
+        app.follow_symlinks = true;
+        app.stay_on_filesystem = true;
+        app.sqlite_cache_enabled = true;
+        app.search_filter_enabled = true;
+        app.color_by_extension = true;
+        app.realtime_watch_enabled = false;
+        app.save_current_as_profile(root);
+
+        app.max_depth = 5;
+        *app.search.input_mut() = "cache".into();
+        app.last_report_mode = "rules".into();
+        app.save_current_view(root);
+        assert!(app.add_filter_preset("cache-filter"));
+        assert!(app.set_rule_enabled("hidden-files", false));
+
+        let state = app.safe_storage.read_state();
+        let mut restored = DiskMapApp {
+            safe_storage: SafeStorage::new(&dir),
+            ..Default::default()
+        };
+        restored.restore_local_state(&state);
+
+        assert_eq!(restored.path_input, root);
+        let profile = restored
+            .profiles
+            .get(root)
+            .expect("profile should restore from local state");
+        assert_eq!(profile.exclude_patterns, vec!["target", ".git"]);
+        assert!(!profile.include_hidden);
+        assert!(profile.follow_symlinks);
+        assert!(profile.stay_on_filesystem);
+        assert!(profile.sqlite_cache_enabled);
+        assert!(!profile.realtime_watch_enabled);
+
+        let view = restored
+            .views
+            .get(root)
+            .expect("view should restore from local state");
+        assert_eq!(view.depth, 5);
+        assert_eq!(view.search_query, "cache");
+        assert_eq!(view.last_report_mode, "rules");
+
+        let preset = restored
+            .filter_presets
+            .get("cache-filter")
+            .expect("filter preset should restore from local state");
+        assert_eq!(preset.query, "cache");
+        assert!(preset.filter_enabled);
+        assert!(!restored.rules.get("hidden-files").unwrap().enabled);
+    }
+
+    #[test]
+    fn rules_import_preview_requires_confirmation_and_persists() {
+        let dir = unique_temp_dir();
+        let rules_path = dir.join("incoming-rules.json");
+        let mut incoming = crate::rules::RuleSet::new();
+        incoming.add(crate::rules::Rule {
+            id: "incoming-hidden".into(),
+            name: "Incoming Hidden".into(),
+            description: "Imported hidden-file hint".into(),
+            category: crate::rules::RuleCategory::AnomalyHint,
+            predicate: crate::rules::RulePredicate::Hidden,
+            enabled: false,
+        });
+        std::fs::write(&rules_path, crate::rules::export_ruleset_json(&incoming))
+            .expect("incoming ruleset should be writable");
+
+        let mut app = DiskMapApp {
+            safe_storage: SafeStorage::new(&dir),
+            ..Default::default()
+        };
+        assert!(app.rules.get("large-file-1gb").is_some());
+        assert!(app.rules.get("incoming-hidden").is_none());
+
+        app.rules_import_path = rules_path.display().to_string();
+        app.preview_rules_import_from_input();
+
+        let preview = app
+            .pending_rules_import
+            .as_ref()
+            .expect("rules import should create a preview");
+        assert_eq!(preview.incoming_rule_count, 1);
+        assert_eq!(preview.incoming_enabled_count, 0);
+        assert!(app.rules.get("incoming-hidden").is_none());
+
+        assert!(app.confirm_rules_import());
+        assert!(app.pending_rules_import.is_none());
+        assert!(app.rules_import_path.is_empty());
+        assert!(app.rules.get("incoming-hidden").is_some());
+        assert!(app.rules.get("large-file-1gb").is_none());
+        assert!(app
+            .safe_storage
+            .read_state()
+            .rules
+            .get("incoming-hidden")
+            .is_some());
+    }
+
+    #[test]
     fn record_recent_root_deduplicates_and_caps_history() {
         let mut app = DiskMapApp::default();
 
@@ -3278,6 +2996,113 @@ mod tests {
         app.apply_scan_message_for_test(root_started(1));
 
         assert_eq!(app.recent_roots, vec!["/root"]);
+    }
+
+    #[test]
+    fn start_scan_applies_saved_profile_before_spawning_scanner() {
+        let root = unique_temp_path("disk-map-profile-start");
+        std::fs::create_dir_all(&root).expect("profile scan test root should be created");
+        std::fs::write(root.join("keep.bin"), vec![1_u8; 20 * 1024])
+            .expect("profile scan keep file should be written");
+        std::fs::write(root.join("skip.bin"), vec![2_u8; 20 * 1024])
+            .expect("profile scan skip file should be written");
+
+        let root_key = root.display().to_string();
+        let mut app = DiskMapApp {
+            realtime_watch_enabled: false,
+            ..Default::default()
+        };
+        app.exclude_input = "skip.bin".into();
+        app.save_current_as_profile(&root_key);
+        app.exclude_input.clear();
+
+        app.start_scan_path(root.clone());
+        assert!(
+            drain_scan_for_test(&mut app),
+            "profile-backed scan should finish"
+        );
+
+        let names = app
+            .tree
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"keep.bin"));
+        assert!(!names.contains(&"skip.bin"));
+        assert_eq!(app.exclude_input, "skip.bin");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn primary_workflow_smoke_covers_scan_navigation_search_export_watch_cache_and_trash_confirmation(
+    ) {
+        let storage_dir = unique_temp_dir();
+        let root = unique_temp_path("disk-map-smoke");
+        let nested = root.join("nested");
+        let file = nested.join("large-match.bin");
+        std::fs::create_dir_all(&nested).expect("smoke test nested dir should be created");
+        std::fs::write(&file, vec![9_u8; 20 * 1024]).expect("smoke test file should be written");
+
+        let mut app = DiskMapApp {
+            sqlite_cache_enabled: true,
+            realtime_watch_enabled: false,
+            safe_storage: SafeStorage::new(&storage_dir),
+            ..Default::default()
+        };
+
+        app.start_scan_path(root.clone());
+        assert!(drain_scan_for_test(&mut app), "smoke scan should finish");
+        assert!(app.sqlite_cache_path().exists());
+        app.realtime_watch_enabled = true;
+        app.update_watch_state();
+        assert!(
+            app.watcher.is_some(),
+            "watcher should start for scanned temp root; status: {}",
+            app.status
+        );
+
+        let nested_id = app
+            .tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "nested")
+            .expect("nested directory should be present");
+        let file_id = app
+            .tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "large-match.bin")
+            .expect("large file should be present");
+
+        app.navigation.set_selected_id(Some(nested_id));
+        assert!(app.enter_selected_directory());
+        *app.search.input_mut() = "large-match".into();
+        app.refresh_search_matches();
+        app.navigate_search_match(SearchDirection::Next);
+        assert_eq!(app.navigation.selected_id(), Some(file_id));
+
+        app.export_focused_subtree(ExportFormat::Json);
+        let exported_path = PathBuf::from(
+            app.status
+                .rsplit_once(" to ")
+                .expect("export status should include output path")
+                .1,
+        );
+        let exported =
+            std::fs::read_to_string(&exported_path).expect("exported json should be readable");
+        assert!(exported.contains("large-match.bin"));
+        let _ = std::fs::remove_file(exported_path);
+
+        app.queue_cleanup_candidate(file_id);
+        app.arm_or_confirm_queued_trash(file_id);
+        assert_eq!(app.trash_confirm_target_id, Some(file_id));
+        assert!(app.status.contains(&file.display().to_string()));
+
+        app.stop_watching();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 
     #[test]

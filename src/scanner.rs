@@ -26,6 +26,7 @@ pub struct ScanOptions {
     pub max_pending_nodes: usize,
     pub max_pending_size_deltas: usize,
     pub cache_mode: CacheMode,
+    pub cache_path: Option<PathBuf>,
     pub exclude_patterns: Vec<String>,
     pub include_hidden: bool,
     pub follow_symlinks: bool,
@@ -39,6 +40,7 @@ impl Default for ScanOptions {
             max_pending_nodes: 2_048,
             max_pending_size_deltas: 4_096,
             cache_mode: CacheMode::Disabled,
+            cache_path: None,
             exclude_patterns: Vec::new(),
             include_hidden: true,
             follow_symlinks: false,
@@ -552,9 +554,9 @@ fn run_scan(
 
     let mut parent_lookup = ParentLookup::new(path.clone(), root_id);
 
-    let mut db = match options.cache_mode {
-        CacheMode::Disabled => None,
-        CacheMode::Enabled => ScanDb::new(&std::env::temp_dir().join("disk-map.db")).ok(),
+    let mut db = match (options.cache_mode, options.cache_path.as_deref()) {
+        (CacheMode::Enabled, Some(path)) => ScanDb::new(path).ok(),
+        _ => None,
     };
     let mut counters = ScanCounters::new(path.clone());
     let mut batch = BatchAccumulator::new(&options);
@@ -563,7 +565,7 @@ fn run_scan(
 
     let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
     let walker_prefetch_perf = Arc::clone(&prefetch_perf);
-    let cache_enabled = matches!(options.cache_mode, CacheMode::Enabled);
+    let cache_enabled = db.is_some();
     let exclude_matcher = ExcludeMatcher::new(options.exclude_patterns.clone());
     let same_filesystem_device = if options.stay_on_filesystem {
         root_device_id(&path)
@@ -1280,6 +1282,33 @@ mod tests {
         assert!(file.modified_secs.is_some());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_path_to_tree_uses_explicit_sqlite_cache_path() {
+        let dir = temp_path("sync-cache-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(
+            dir.join("large.bin"),
+            vec![1_u8; (AGGREGATE_SMALL_FILE_THRESHOLD_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let cache_root = temp_path("sync-cache-dir");
+        let cache_path = cache_root.join("nested").join("disk-map-cache.db");
+
+        let options = ScanOptions {
+            cache_mode: CacheMode::Enabled,
+            cache_path: Some(cache_path.clone()),
+            ..ScanOptions::default()
+        };
+
+        let tree = scan_path_to_tree(dir.clone(), options).unwrap();
+
+        assert!(tree.root.is_some());
+        assert!(cache_path.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(cache_root);
     }
 
     #[test]

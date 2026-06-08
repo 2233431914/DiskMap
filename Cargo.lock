@@ -916,6 +916,8 @@ dependencies = [
  "open",
  "rusqlite",
  "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
  "smallvec",
  "trash",
 ]
@@ -1001,6 +1003,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "home",

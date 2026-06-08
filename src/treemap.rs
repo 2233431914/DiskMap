@@ -35,12 +35,6 @@ pub struct VisualNode {
     pub label_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Camera {
-    pub pan: Vec2,
-    pub zoom: f32,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct SearchState {
     query_lower: String,
@@ -72,7 +66,6 @@ pub struct LayoutScratch {
 pub struct TreemapLayoutParams<'a, 'b> {
     pub root: NodeId,
     pub canvas_rect: Rect,
-    pub camera: Camera,
     pub max_depth: usize,
     pub search_state: &'a SearchState,
     pub filter_to_search: bool,
@@ -222,40 +215,9 @@ impl SearchState {
     }
 }
 
-impl Default for Camera {
-    fn default() -> Self {
-        Self {
-            pan: Vec2::ZERO,
-            zoom: 1.0,
-        }
-    }
-}
-
-impl Camera {
-    pub fn apply(&self, rect: Rect, viewport: Rect) -> Rect {
-        let center = viewport.center() + self.pan;
-        let size = rect.size() * self.zoom;
-        let min = pos2(
-            center.x + (rect.min.x - viewport.center().x) * self.zoom,
-            center.y + (rect.min.y - viewport.center().y) * self.zoom,
-        );
-        Rect::from_min_size(min, size)
-    }
-
-    pub fn zoom_around(&mut self, pointer: egui::Pos2, delta: f32) {
-        let old_zoom = self.zoom;
-        self.zoom = (self.zoom * delta).clamp(0.35, 6.0);
-        let factor = self.zoom / old_zoom;
-        self.pan = (self.pan + pointer.to_vec2()) * factor - pointer.to_vec2();
-    }
-}
-
 pub fn layout_treemap(tree: &mut TreeStore, params: TreemapLayoutParams<'_, '_>) {
     params.out.clear();
-    let layout_rect = params
-        .camera
-        .apply(params.canvas_rect, params.canvas_rect)
-        .shrink(8.0);
+    let layout_rect = params.canvas_rect.shrink(8.0);
     let mut context = LayoutContext {
         tree,
         root_id: params.root,
@@ -693,7 +655,6 @@ mod tests {
             TreemapLayoutParams {
                 root,
                 canvas_rect: canvas,
-                camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
                 filter_to_search: false,
@@ -786,7 +747,6 @@ mod tests {
             TreemapLayoutParams {
                 root,
                 canvas_rect: canvas,
-                camera: Camera::default(),
                 max_depth: 2,
                 search_state: &search_state,
                 filter_to_search: true,
@@ -823,7 +783,6 @@ mod tests {
             TreemapLayoutParams {
                 root,
                 canvas_rect: tiny,
-                camera: Camera::default(),
                 max_depth: 2,
                 search_state: &SearchState::default(),
                 filter_to_search: false,
@@ -846,7 +805,6 @@ mod tests {
             TreemapLayoutParams {
                 root,
                 canvas_rect: canvas,
-                camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
                 filter_to_search: false,
@@ -877,7 +835,6 @@ mod tests {
             TreemapLayoutParams {
                 root,
                 canvas_rect: canvas,
-                camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
                 filter_to_search: false,
@@ -903,7 +860,6 @@ mod tests {
             TreemapLayoutParams {
                 root,
                 canvas_rect: canvas,
-                camera: Camera::default(),
                 max_depth: 1,
                 search_state: &SearchState::default(),
                 filter_to_search: false,
