@@ -19,7 +19,7 @@
 
 use disk_map::format::format_bytes;
 use disk_map::scanner::{parse_exclude_patterns, scan_path_to_tree, ScanOptions};
-use disk_map::tree::NodeKind;
+use disk_map::tree::{NodeId, NodeKind};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -255,7 +255,7 @@ fn collect_rows(
 
 fn walk(
     tree: &mut disk_map::tree::TreeStore,
-    node_id: usize,
+    node_id: NodeId,
     depth: usize,
     max_depth: Option<usize>,
     rows: &mut Vec<Row>,

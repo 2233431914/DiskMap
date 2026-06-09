@@ -69,7 +69,7 @@ pub fn export_focused_report(
 }
 
 fn collect_records(tree: &mut TreeStore, node_id: NodeId, records: &mut Vec<ExportRecord>) {
-    if node_id >= tree.len() {
+    if !tree.contains_id(node_id) {
         return;
     }
 

@@ -2,7 +2,22 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-pub type NodeId = usize;
+pub type NodeId = u32;
+
+#[inline]
+pub fn node_index(id: NodeId) -> usize {
+    id as usize
+}
+
+#[inline]
+pub fn node_id_from_index(index: usize) -> NodeId {
+    NodeId::try_from(index).expect("node count exceeded u32::MAX")
+}
+
+#[inline]
+pub fn node_id_in_len(id: NodeId, len: usize) -> bool {
+    node_index(id) < len
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -23,7 +38,6 @@ pub struct Node {
     pub children: Vec<NodeId>,
     pub scanned: bool,
     pub error: Option<String>,
-    pub lower_name: String,
     sort_dirty: bool,
 }
 
@@ -85,6 +99,10 @@ impl TreeStore {
         self.nodes.is_empty()
     }
 
+    pub fn contains_id(&self, id: NodeId) -> bool {
+        node_id_in_len(id, self.nodes.len())
+    }
+
     pub fn add_node(
         &mut self,
         parent: Option<NodeId>,
@@ -115,22 +133,21 @@ impl TreeStore {
     }
 
     pub fn push_node(&mut self, parent: Option<NodeId>, record: NodeRecord) -> NodeId {
-        let id = self.nodes.len();
+        let id = node_id_from_index(self.nodes.len());
         self.insert_node(id, parent, record);
         id
     }
 
     pub fn insert_node(&mut self, id: NodeId, parent: Option<NodeId>, record: NodeRecord) {
         assert_eq!(
-            id,
+            node_index(id),
             self.nodes.len(),
             "incremental nodes must append in order"
         );
 
         self.nodes.push(Node {
             parent,
-            name: record.name.clone(),
-            lower_name: String::new(),
+            name: record.name,
             kind: record.kind,
             size: record.size,
             modified_secs: record.modified_secs,
@@ -141,8 +158,9 @@ impl TreeStore {
         });
 
         if let Some(parent_id) = parent {
-            self.nodes[parent_id].children.push(id);
-            self.nodes[parent_id].sort_dirty = true;
+            let parent_index = node_index(parent_id);
+            self.nodes[parent_index].children.push(id);
+            self.nodes[parent_index].sort_dirty = true;
         } else {
             self.root = Some(id);
             self.root_path.clear();
@@ -151,19 +169,21 @@ impl TreeStore {
     }
 
     pub fn node(&self, id: NodeId) -> &Node {
-        &self.nodes[id]
+        &self.nodes[node_index(id)]
     }
 
     pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
-        &mut self.nodes[id]
+        let index = node_index(id);
+        &mut self.nodes[index]
     }
 
-    pub fn node_name_matches_query(&mut self, id: NodeId, query_lower: &str) -> bool {
-        let node = &mut self.nodes[id];
-        if node.lower_name.is_empty() && !node.name.is_empty() {
-            node.lower_name = node.name.to_lowercase();
-        }
-        node.lower_name.contains(query_lower)
+    pub fn node_name_matches_query(
+        &self,
+        id: NodeId,
+        query_lower: &str,
+        lowercase_scratch: &mut String,
+    ) -> bool {
+        name_matches_query(&self.nodes[node_index(id)].name, query_lower, lowercase_scratch)
     }
 
     pub fn ancestors(&self, mut id: NodeId) -> Vec<NodeId> {
@@ -183,17 +203,18 @@ impl TreeStore {
         let mut current = Some(node_id);
         while let Some(id) = current {
             self.apply_direct_size_delta(id, delta);
-            current = self.nodes[id].parent;
+            current = self.nodes[node_index(id)].parent;
         }
     }
 
     pub fn apply_direct_size_delta(&mut self, node_id: NodeId, delta: u64) {
-        self.nodes[node_id].size += delta;
-        self.nodes[node_id].sort_dirty = true;
+        let index = node_index(node_id);
+        self.nodes[index].size += delta;
+        self.nodes[index].sort_dirty = true;
     }
 
     pub fn mark_scanned(&mut self, node_id: NodeId) {
-        self.nodes[node_id].scanned = true;
+        self.nodes[node_index(node_id)].scanned = true;
     }
 
     pub fn replace_children_from(
@@ -201,20 +222,23 @@ impl TreeStore {
         target_id: NodeId,
         source: &TreeStore,
     ) -> Option<Vec<NodeId>> {
-        if target_id >= self.nodes.len() || !matches!(self.nodes[target_id].kind, NodeKind::Dir) {
+        let target_index = node_index(target_id);
+        if target_index >= self.nodes.len()
+            || !matches!(self.nodes[target_index].kind, NodeKind::Dir)
+        {
             return None;
         }
 
         let source_root = source.root?;
         let source_root_node = source.node(source_root);
-        let old_size = self.nodes[target_id].size;
+        let old_size = self.nodes[target_index].size;
         let new_size = source_root_node.size;
 
-        self.nodes[target_id].children.clear();
-        self.nodes[target_id].size = new_size;
-        self.nodes[target_id].scanned = source_root_node.scanned;
-        self.nodes[target_id].error = source_root_node.error.clone();
-        self.nodes[target_id].sort_dirty = true;
+        self.nodes[target_index].children.clear();
+        self.nodes[target_index].size = new_size;
+        self.nodes[target_index].scanned = source_root_node.scanned;
+        self.nodes[target_index].error = source_root_node.error.clone();
+        self.nodes[target_index].sort_dirty = true;
 
         let mut appended_ids = Vec::new();
         for source_child in source_root_node.children.clone() {
@@ -227,7 +251,8 @@ impl TreeStore {
     }
 
     pub fn detach_subtree(&mut self, node_id: NodeId) -> Option<DetachedSubtree> {
-        if node_id >= self.nodes.len() {
+        let target_index = node_index(node_id);
+        if target_index >= self.nodes.len() {
             return None;
         }
 
@@ -239,24 +264,26 @@ impl TreeStore {
             });
         }
 
-        let parent_id = self.nodes[node_id].parent?;
-        let removed_size = self.nodes[node_id].size;
-        if let Some(index) = self.nodes[parent_id]
+        let parent_id = self.nodes[target_index].parent?;
+        let parent_index = node_index(parent_id);
+        let removed_size = self.nodes[target_index].size;
+        if let Some(index) = self.nodes[parent_index]
             .children
             .iter()
             .position(|child_id| *child_id == node_id)
         {
-            self.nodes[parent_id].children.remove(index);
+            self.nodes[parent_index].children.remove(index);
         }
-        self.nodes[node_id].parent = None;
+        self.nodes[target_index].parent = None;
 
         let mut dirty_nodes = Vec::new();
         let mut current = Some(parent_id);
         while let Some(id) = current {
-            self.nodes[id].size = self.nodes[id].size.saturating_sub(removed_size);
-            self.nodes[id].sort_dirty = true;
+            let index = node_index(id);
+            self.nodes[index].size = self.nodes[index].size.saturating_sub(removed_size);
+            self.nodes[index].sort_dirty = true;
             dirty_nodes.push(id);
-            current = self.nodes[id].parent;
+            current = self.nodes[index].parent;
         }
 
         self.path_cache.clear();
@@ -268,7 +295,8 @@ impl TreeStore {
 
     pub fn repair_sorted_children(&mut self, dirty_nodes: &[NodeId]) {
         for &id in dirty_nodes {
-            if id >= self.nodes.len() || !self.nodes[id].sort_dirty {
+            let index = node_index(id);
+            if index >= self.nodes.len() || !self.nodes[index].sort_dirty {
                 continue;
             }
             self.rebuild_sorted_children(id);
@@ -276,20 +304,21 @@ impl TreeStore {
     }
 
     pub fn ensure_sorted_children(&mut self, id: NodeId) {
-        if self.nodes[id].sort_dirty {
+        if self.nodes[node_index(id)].sort_dirty {
             self.rebuild_sorted_children(id);
         }
     }
 
     pub fn sorted_children(&self, id: NodeId) -> &[NodeId] {
-        &self.nodes[id].children
+        &self.nodes[node_index(id)].children
     }
 
     fn rebuild_sorted_children(&mut self, id: NodeId) {
-        let mut children = std::mem::take(&mut self.nodes[id].children);
+        let index = node_index(id);
+        let mut children = std::mem::take(&mut self.nodes[index].children);
         children.sort_by(|left, right| {
-            let left_node = &self.nodes[*left];
-            let right_node = &self.nodes[*right];
+            let left_node = &self.nodes[node_index(*left)];
+            let right_node = &self.nodes[node_index(*right)];
             let left_is_dir = matches!(left_node.kind, NodeKind::Dir);
             let right_is_dir = matches!(right_node.kind, NodeKind::Dir);
             right_is_dir
@@ -297,8 +326,8 @@ impl TreeStore {
                 .then_with(|| right_node.size.cmp(&left_node.size))
                 .then_with(|| left_node.name.cmp(&right_node.name))
         });
-        self.nodes[id].children = children;
-        self.nodes[id].sort_dirty = false;
+        self.nodes[index].children = children;
+        self.nodes[index].sort_dirty = false;
     }
 
     fn append_subtree_from(
@@ -326,15 +355,16 @@ impl TreeStore {
     }
 
     fn adjust_ancestor_sizes(&mut self, node_id: NodeId, old_size: u64, new_size: u64) {
-        let mut current = self.nodes[node_id].parent;
+        let mut current = self.nodes[node_index(node_id)].parent;
         while let Some(id) = current {
+            let index = node_index(id);
             if new_size >= old_size {
-                self.nodes[id].size = self.nodes[id].size.saturating_add(new_size - old_size);
+                self.nodes[index].size = self.nodes[index].size.saturating_add(new_size - old_size);
             } else {
-                self.nodes[id].size = self.nodes[id].size.saturating_sub(old_size - new_size);
+                self.nodes[index].size = self.nodes[index].size.saturating_sub(old_size - new_size);
             }
-            self.nodes[id].sort_dirty = true;
-            current = self.nodes[id].parent;
+            self.nodes[index].sort_dirty = true;
+            current = self.nodes[index].parent;
         }
     }
 
@@ -361,7 +391,7 @@ impl TreeStore {
             if node_id == root_id {
                 break;
             }
-            let node = &self.nodes[node_id];
+            let node = &self.nodes[node_index(node_id)];
             components.push(node.name.as_str());
             current = node.parent;
         }
@@ -388,7 +418,7 @@ impl TreeStore {
             if id == ancestor_id {
                 return true;
             }
-            current = self.nodes[id].parent;
+            current = self.nodes[node_index(id)].parent;
         }
         false
     }
@@ -403,6 +433,35 @@ impl TreeStore {
             error: None,
         }
     }
+}
+
+fn name_matches_query(name: &str, query_lower: &str, lowercase_scratch: &mut String) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    if name.is_ascii() && query_lower.is_ascii() {
+        return ascii_contains_case_insensitive(name.as_bytes(), query_lower.as_bytes());
+    }
+
+    lowercase_scratch.clear();
+    lowercase_scratch.extend(name.chars().flat_map(char::to_lowercase));
+    lowercase_scratch.contains(query_lower)
+}
+
+fn ascii_contains_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > haystack.len() {
+        return false;
+    }
+
+    haystack.windows(needle_lower.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle_lower)
+            .all(|(haystack_byte, needle_byte)| haystack_byte.to_ascii_lowercase() == *needle_byte)
+    })
 }
 
 #[cfg(test)]
@@ -437,6 +496,19 @@ mod tests {
         );
 
         assert!(tree.node_real_path(aggregate).is_none());
+    }
+
+    #[test]
+    fn node_name_query_matching_reuses_temporary_lowercase_buffer() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        let ascii = tree.add_node(Some(root), "Report.TXT".into(), NodeKind::File, 1);
+        let cjk = tree.add_node(Some(root), "项目文件.txt".into(), NodeKind::File, 1);
+        let mut scratch = String::new();
+
+        assert!(tree.node_name_matches_query(ascii, "report", &mut scratch));
+        assert!(tree.node_name_matches_query(cjk, "项目", &mut scratch));
+        assert!(!tree.node_name_matches_query(cjk, "missing", &mut scratch));
     }
 
     #[test]

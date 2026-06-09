@@ -144,7 +144,7 @@ impl DiskMapApp {
     }
 
     fn remove_deleted_node_from_view(&mut self, node_id: NodeId) -> bool {
-        if node_id >= self.tree.len() {
+        if !self.tree.contains_id(node_id) {
             return false;
         }
 
@@ -199,14 +199,14 @@ impl DiskMapApp {
 
     #[cfg(test)]
     fn cleanup_item_count(&self, node_id: NodeId) -> usize {
-        if node_id >= self.tree.len() {
+        if !self.tree.contains_id(node_id) {
             return 0;
         }
 
         let mut count = 1usize;
         let mut stack = self.tree.node(node_id).children.clone();
         while let Some(id) = stack.pop() {
-            if id >= self.tree.len() {
+            if !self.tree.contains_id(id) {
                 continue;
             }
             count += 1;

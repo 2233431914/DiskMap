@@ -64,7 +64,7 @@ impl DiskMapApp {
         root_id: NodeId,
         format: ExportFormat,
     ) -> anyhow::Result<PathBuf> {
-        if root_id >= self.tree.len() {
+        if !self.tree.contains_id(root_id) {
             anyhow::bail!("focused directory is no longer available");
         }
 
@@ -75,7 +75,7 @@ impl DiskMapApp {
     }
 
     fn write_focused_report(&mut self, root_id: NodeId) -> anyhow::Result<PathBuf> {
-        if root_id >= self.tree.len() {
+        if !self.tree.contains_id(root_id) {
             anyhow::bail!("focused directory is no longer available");
         }
 

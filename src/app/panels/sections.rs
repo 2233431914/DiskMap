@@ -13,7 +13,7 @@ use super::super::StateMessage;
 use crate::app::{describe_node_kind, palette, pluralize, truncate_middle};
 use crate::cleanup::CleanupCandidate;
 use crate::duplicates::DuplicateCandidate;
-use crate::format::format_bytes;
+use crate::format::{format_bytes, format_duration};
 use crate::insights::{AgeBucketSummary, FileTypeSummary, OldLargeFile};
 use crate::scanner::{size_basis_detail, size_basis_label};
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
@@ -30,13 +30,11 @@ pub fn show_progress_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMapApp) {
             .color(p.text_faint),
     );
     ui.add_space(4.0);
+    let files_text = file_progress_label(progress.files_scanned, progress.total_files);
     ui.label(
-        RichText::new(format!(
-            "{} files · {} dirs",
-            progress.files_scanned, progress.dirs_scanned
-        ))
-        .small()
-        .color(p.text_muted),
+        RichText::new(format!("{files_text} · {} dirs", progress.dirs_scanned))
+            .small()
+            .color(p.text_muted),
     );
     ui.label(
         RichText::new(format_bytes(progress.bytes_seen))
@@ -386,6 +384,30 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
         ui.painter().circle_filled(rect.center(), 4.0, dot_color);
         ui.label(RichText::new(&app.status).size(11.5).color(p.text_muted));
 
+        let elapsed_text = app
+            .scan
+            .elapsed()
+            .map(|elapsed| format!("Elapsed {}", format_duration(elapsed)));
+        if let Some(progress) = app.scan.progress() {
+            if let Some(fraction) = progress.file_progress_fraction() {
+                let available_width = ui.available_width();
+                if available_width >= 120.0 {
+                    let percent = (fraction * 100.0).round() as u64;
+                    ui.add_space(8.0);
+                    ui.add_sized(
+                        [available_width.min(150.0), 16.0],
+                        egui::ProgressBar::new(fraction).text(format!("{percent}%")),
+                    );
+                }
+            }
+        }
+        if let Some(elapsed_text) = elapsed_text {
+            if ui.available_width() >= 80.0 {
+                ui.add_space(8.0);
+                ui.label(RichText::new(elapsed_text).size(11.5).color(p.text_faint));
+            }
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(6.0);
             if !app.navigation.breadcrumb().is_empty() {
@@ -403,9 +425,10 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
                 ui.add_space(10.0);
                 ui.label(RichText::new("│").size(11.0).color(p.text_faint));
                 ui.add_space(10.0);
+                let files_text = file_progress_label(progress.files_scanned, progress.total_files);
                 let text = format!(
-                    "{} files · {} dirs · {}",
-                    progress.files_scanned,
+                    "{} · {} dirs · {}",
+                    files_text,
                     progress.dirs_scanned,
                     format_bytes(progress.bytes_seen)
                 );
@@ -427,6 +450,13 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
 }
 
 // --- private helpers used only by the section renderers above ---
+
+fn file_progress_label(files_scanned: u64, total_files: Option<u64>) -> String {
+    match total_files {
+        Some(total_files) => format!("{files_scanned}/{total_files} files"),
+        None => format!("{files_scanned} files"),
+    }
+}
 
 fn cleanup_candidate_row(ui: &mut egui::Ui, palette: &Palette, candidate: &CleanupCandidate) {
     ui.add_space(6.0);

@@ -57,7 +57,7 @@ impl SnapshotDiff {
 }
 
 pub fn capture_snapshot(tree: &mut TreeStore, root_id: NodeId) -> Option<ScanSnapshot> {
-    if root_id >= tree.len() {
+    if !tree.contains_id(root_id) {
         return None;
     }
 
@@ -154,7 +154,7 @@ fn collect_entries(
     node_id: NodeId,
     entries: &mut BTreeMap<String, SnapshotEntry>,
 ) {
-    if node_id >= tree.len() {
+    if !tree.contains_id(node_id) {
         return;
     }
 

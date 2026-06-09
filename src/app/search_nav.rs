@@ -1,4 +1,4 @@
-use crate::tree::{NodeId, TreeStore};
+use crate::tree::{node_index, NodeId, TreeStore};
 use crate::treemap::SearchState;
 use std::time::{Duration, Instant};
 
@@ -129,7 +129,7 @@ impl SearchController {
         };
 
         let node_id = self.state.matches().get(next_index).copied()?;
-        if node_id >= tree.len() {
+        if node_index(node_id) >= tree.len() {
             self.active_match = None;
             return None;
         }

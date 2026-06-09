@@ -1,5 +1,5 @@
 use crate::format::format_bytes;
-use crate::tree::{NodeId, TreeStore};
+use crate::tree::{node_index, NodeId, TreeStore};
 use egui::{pos2, Rect, Vec2};
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
@@ -38,6 +38,7 @@ pub struct VisualNode {
 #[derive(Debug, Default, Clone)]
 pub struct SearchState {
     query_lower: String,
+    lowercase_scratch: String,
     matched_bits: FixedBitSet,
     matched_ids: Vec<NodeId>,
     matched_descendant_counts: Vec<u32>,
@@ -95,6 +96,7 @@ impl SearchState {
 
     pub fn clear(&mut self, tree_len: usize) {
         self.query_lower.clear();
+        self.lowercase_scratch.clear();
         self.matched_bits.clear();
         self.matched_bits.grow(tree_len);
         self.matched_ids.clear();
@@ -151,12 +153,12 @@ impl SearchState {
     }
 
     pub fn is_match(&self, node_id: NodeId) -> bool {
-        self.matched_bits.contains(node_id)
+        self.matched_bits.contains(node_index(node_id))
     }
 
     pub fn is_ancestor_of_match(&self, node_id: NodeId) -> bool {
         self.matched_descendant_counts
-            .get(node_id)
+            .get(node_index(node_id))
             .copied()
             .unwrap_or_default()
             > 0
@@ -168,7 +170,7 @@ impl SearchState {
             && !self.is_match(node_id)
             && self
                 .matched_descendant_counts
-                .get(node_id)
+                .get(node_index(node_id))
                 .copied()
                 .unwrap_or_default()
                 == 0
@@ -191,24 +193,26 @@ impl SearchState {
     }
 
     fn ingest_node_if_matches(&mut self, tree: &mut TreeStore, node_id: NodeId) -> bool {
-        if self.query_lower.is_empty() || node_id >= tree.len() {
+        let current_index = node_index(node_id);
+        if self.query_lower.is_empty() || current_index >= tree.len() {
             return false;
         }
 
-        if !tree.node_name_matches_query(node_id, &self.query_lower)
-            || self.matched_bits.contains(node_id)
+        if !tree.node_name_matches_query(node_id, &self.query_lower, &mut self.lowercase_scratch)
+            || self.matched_bits.contains(current_index)
         {
             return false;
         }
-        self.matched_bits.insert(node_id);
+        self.matched_bits.insert(current_index);
         self.matched_ids.push(node_id);
 
         let mut current = tree.node(node_id).parent;
         while let Some(ancestor_id) = current {
-            if ancestor_id >= self.matched_descendant_counts.len() {
+            let ancestor_index = node_index(ancestor_id);
+            if ancestor_index >= self.matched_descendant_counts.len() {
                 self.matched_descendant_counts.resize(tree.len(), 0);
             }
-            self.matched_descendant_counts[ancestor_id] += 1;
+            self.matched_descendant_counts[ancestor_index] += 1;
             current = tree.node(ancestor_id).parent;
         }
         true

@@ -79,7 +79,7 @@ pub fn analyze_insights(
     now_secs: u64,
     limit: usize,
 ) -> Option<InsightReport> {
-    if root_id >= tree.len() {
+    if !tree.contains_id(root_id) {
         return None;
     }
 
@@ -217,7 +217,7 @@ impl InsightBuilder {
 }
 
 fn collect_files(tree: &mut TreeStore, node_id: NodeId, report: &mut InsightBuilder) {
-    if node_id >= tree.len() {
+    if !tree.contains_id(node_id) {
         return;
     }
 
@@ -377,9 +377,10 @@ mod tests {
             .nodes
             .iter()
             .position(|node| matches!(node.kind, NodeKind::Aggregate))
+            .map(crate::tree::node_id_from_index)
             .expect("aggregate");
 
-        assert!(analyze_insights(&mut tree, usize::MAX, NOW, 8).is_none());
+        assert!(analyze_insights(&mut tree, NodeId::MAX, NOW, 8).is_none());
         assert!(analyze_insights(&mut tree, aggregate, NOW, 8).is_none());
     }
 }

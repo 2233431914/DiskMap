@@ -9,7 +9,7 @@
 use disk_map::rules::{
     default_ruleset, evaluate_rules, RuleContext, RuleSet, RULES_FORMAT_VERSION,
 };
-use disk_map::tree::{NodeKind, TreeStore};
+use disk_map::tree::{NodeId, NodeKind, TreeStore};
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -121,12 +121,12 @@ fn write_file_with_size_and_mtime(path: &std::path::Path, size: u64, mtime: Syst
 /// `scan_path_to_tree` API but stays in this test file to keep the
 /// integration test self-contained (avoids cross-module imports that
 /// the lib treats as public).
-fn scan_dir_into_tree(root_path: &std::path::Path) -> (TreeStore, usize) {
+fn scan_dir_into_tree(root_path: &std::path::Path) -> (TreeStore, NodeId) {
     let mut tree = TreeStore::new();
     let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
     tree.set_root_path(root_path.to_path_buf());
     let mut total: u64 = 0;
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root_path.to_path_buf(), root)];
+    let mut stack: Vec<(std::path::PathBuf, NodeId)> = vec![(root_path.to_path_buf(), root)];
     while let Some((dir_path, parent_id)) = stack.pop() {
         let entries = match fs::read_dir(&dir_path) {
             Ok(it) => it,

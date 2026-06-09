@@ -2,14 +2,25 @@ use crate::scanner::{self, PerfStats, ProgressSnapshot, ScanHandle, ScanMessage,
 use crate::tree::{NodeKind, NodeRecord};
 use crossbeam_channel::Sender;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ProgressSummary {
     pub files_scanned: u64,
+    pub total_files: Option<u64>,
     pub dirs_scanned: u64,
     pub bytes_seen: u64,
     pub current_path: PathBuf,
+}
+
+impl ProgressSummary {
+    pub fn file_progress_fraction(&self) -> Option<f32> {
+        let total_files = self.total_files?;
+        if total_files == 0 {
+            return Some(1.0);
+        }
+        Some((self.files_scanned as f32 / total_files as f32).clamp(0.0, 1.0))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +50,7 @@ pub struct ScanSession {
     scan_counter: u64,
     handle: Option<ScanHandle>,
     scanning: bool,
+    started_at: Option<Instant>,
     progress: Option<ProgressSummary>,
     issue_summary: ScanIssueSummary,
     perf_stats: PerfStats,
@@ -82,6 +94,7 @@ impl ScanSession {
     pub fn apply_progress(&mut self, progress: ProgressSnapshot) {
         self.progress = Some(ProgressSummary {
             files_scanned: progress.files_scanned,
+            total_files: progress.total_files,
             dirs_scanned: progress.dirs_scanned,
             bytes_seen: progress.bytes_seen,
             current_path: progress.current_path,
@@ -120,6 +133,18 @@ impl ScanSession {
         self.scanning
     }
 
+    pub fn elapsed(&self) -> Option<Duration> {
+        if self.scanning {
+            return self.started_at.map(|started_at| started_at.elapsed());
+        }
+        if self.perf_stats.scan_elapsed_ms > 0.0 {
+            return Some(Duration::from_secs_f64(
+                self.perf_stats.scan_elapsed_ms / 1000.0,
+            ));
+        }
+        None
+    }
+
     #[cfg(test)]
     pub fn active_id(&self) -> u64 {
         self.active_scan_id
@@ -152,6 +177,7 @@ impl ScanSession {
         self.active_scan_id = self.scan_counter;
         self.handle = None;
         self.scanning = true;
+        self.started_at = Some(Instant::now());
         self.progress = None;
         self.issue_summary = ScanIssueSummary::default();
         self.perf_stats = PerfStats::default();
@@ -160,6 +186,7 @@ impl ScanSession {
 
     fn finish_with_perf_stats(&mut self, perf_stats: PerfStats) {
         self.scanning = false;
+        self.started_at = None;
         self.handle = None;
         self.merge_scan_perf_stats(perf_stats);
     }
@@ -221,6 +248,7 @@ mod tests {
         let mut session = ScanSession::default();
         session.apply_progress(ProgressSnapshot {
             files_scanned: 1,
+            total_files: Some(2),
             dirs_scanned: 1,
             bytes_seen: 8,
             current_path: "/root/file".into(),
@@ -248,6 +276,7 @@ mod tests {
 
         session.apply_progress(ProgressSnapshot {
             files_scanned: 3,
+            total_files: Some(6),
             dirs_scanned: 2,
             bytes_seen: 128,
             current_path: "/root/current/file.txt".into(),
@@ -255,12 +284,29 @@ mod tests {
 
         let progress = session.progress().expect("progress summary");
         assert_eq!(progress.files_scanned, 3);
+        assert_eq!(progress.total_files, Some(6));
+        assert_eq!(progress.file_progress_fraction(), Some(0.5));
         assert_eq!(progress.dirs_scanned, 2);
         assert_eq!(progress.bytes_seen, 128);
         assert_eq!(
             progress.current_path,
             PathBuf::from("/root/current/file.txt")
         );
+    }
+
+    #[test]
+    fn elapsed_reports_running_or_finished_scan_duration() {
+        let mut session = ScanSession::default();
+        session.begin_scan();
+
+        assert!(session.elapsed().is_some());
+
+        session.mark_finished(PerfStats {
+            scan_elapsed_ms: 1_250.0,
+            ..PerfStats::default()
+        });
+
+        assert_eq!(session.elapsed(), Some(Duration::from_millis(1250)));
     }
 
     #[test]

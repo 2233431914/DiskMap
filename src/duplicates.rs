@@ -21,7 +21,7 @@ pub struct DuplicateReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CandidateKey {
-    lower_name: String,
+    normalized_name: String,
     size: u64,
 }
 
@@ -36,7 +36,7 @@ pub fn find_duplicate_candidates(
     root_id: NodeId,
     limit: usize,
 ) -> Option<DuplicateReport> {
-    if root_id >= tree.len() {
+    if !tree.contains_id(root_id) {
         return None;
     }
 
@@ -58,7 +58,7 @@ pub fn find_duplicate_candidates(
                 name: files
                     .first()
                     .map(|file| file.name.clone())
-                    .unwrap_or_else(|| key.lower_name.clone()),
+                    .unwrap_or_else(|| key.normalized_name.clone()),
                 size: key.size,
                 paths: files.into_iter().map(|file| file.path).collect(),
                 reclaimable_bytes,
@@ -99,7 +99,7 @@ fn collect_files(
     node_id: NodeId,
     groups: &mut BTreeMap<CandidateKey, Vec<CandidateFile>>,
 ) {
-    if node_id >= tree.len() {
+    if !tree.contains_id(node_id) {
         return;
     }
 
@@ -118,7 +118,7 @@ fn collect_files(
         if let Some(path) = tree.node_real_path(node_id) {
             groups
                 .entry(CandidateKey {
-                    lower_name: name.to_lowercase(),
+                    normalized_name: name.to_lowercase(),
                     size,
                 })
                 .or_default()
@@ -194,7 +194,7 @@ mod tests {
         let root = tree.root.expect("root");
         let aggregate = tree.add_node(Some(root), "Other Files (3)".into(), NodeKind::Aggregate, 3);
 
-        assert!(find_duplicate_candidates(&mut tree, usize::MAX, 8).is_none());
+        assert!(find_duplicate_candidates(&mut tree, NodeId::MAX, 8).is_none());
         assert!(find_duplicate_candidates(&mut tree, aggregate, 8).is_none());
     }
 }

@@ -2,14 +2,14 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use disk_map::scanner::{
     CacheMode, DiscoveredNode, PerfStats, ProgressSnapshot, ScanBatch, ScanOptions,
 };
-use disk_map::tree::{NodeKind, NodeRecord, TreeStore};
+use disk_map::tree::{node_id_from_index, NodeId, NodeKind, NodeRecord, TreeStore};
 use disk_map::treemap::{layout_treemap, LayoutScratch, SearchState, TreemapLayoutParams};
 use egui::Rect;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
 use std::time::Duration;
 
-fn build_tree(node_count: usize) -> (TreeStore, usize) {
+fn build_tree(node_count: usize) -> (TreeStore, NodeId) {
     let mut tree = TreeStore::new();
     let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
     tree.set_root_path("/".into());
@@ -30,10 +30,10 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
     c.bench_function("scan_batch_aggregation_bench", |b| {
         b.iter(|| {
             let mut batch = ScanBatch::default();
-            let mut size_map = FxHashMap::<usize, u64>::default();
+            let mut size_map = FxHashMap::<NodeId, u64>::default();
             for index in 0..4096usize {
                 batch.discovered_nodes.push(DiscoveredNode {
-                    node_id: index + 1,
+                    node_id: node_id_from_index(index + 1),
                     parent_id: 0,
                     node: NodeRecord {
                         name: format!("node-{index}"),
@@ -44,11 +44,12 @@ fn scan_batch_aggregation_bench(c: &mut Criterion) {
                         error: None,
                     },
                 });
-                *size_map.entry(index % 16).or_insert(0) += 1;
+                *size_map.entry(node_id_from_index(index % 16)).or_insert(0) += 1;
             }
             batch.size_deltas = size_map.into_iter().collect();
             batch.progress = Some(ProgressSnapshot {
                 files_scanned: 4096,
+                total_files: Some(4096),
                 dirs_scanned: 16,
                 bytes_seen: 4096,
                 current_path: "/tmp".into(),

@@ -10,7 +10,7 @@ use crate::scanner::{
 };
 use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff};
 use crate::storage::{app_data_dir, LocalState, Preferences, SafeStorage};
-use crate::tree::{NodeId, NodeKind, TreeStore};
+use crate::tree::{node_id_from_index, NodeId, NodeKind, TreeStore};
 use crate::treemap::{LayoutScratch, VisualKind, VisualNode};
 use crate::watcher::{WatchPoll, WatchSession};
 
@@ -35,6 +35,7 @@ use egui::{
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
@@ -155,6 +156,7 @@ pub(super) fn pick_label_color(bg: Color32) -> Color32 {
 }
 
 pub fn configure_theme(ctx: &egui::Context) {
+    configure_fonts(ctx);
     ctx.set_visuals_of(Theme::Light, build_visuals(&LIGHT_PALETTE, false));
     ctx.set_visuals_of(Theme::Dark, build_visuals(&DARK_PALETTE, true));
 
@@ -180,6 +182,65 @@ pub fn configure_theme(ctx: &egui::Context) {
         .text_styles
         .insert(egui::TextStyle::Monospace, FontId::monospace(12.0));
     ctx.set_global_style(style);
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let Some(font_path) = first_readable_font_path(cjk_font_candidates().iter().copied()) else {
+        return;
+    };
+    let Ok(font_bytes) = std::fs::read(font_path) else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    install_cjk_font_data(&mut fonts, font_bytes);
+    ctx.set_fonts(fonts);
+}
+
+fn install_cjk_font_data(fonts: &mut egui::FontDefinitions, font_bytes: Vec<u8>) {
+    const CJK_FONT_NAME: &str = "disk-map-cjk";
+    fonts.font_data.insert(
+        CJK_FONT_NAME.to_string(),
+        Arc::new(egui::FontData::from_owned(font_bytes)),
+    );
+
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let entries = fonts.families.entry(family).or_default();
+        if !entries.iter().any(|entry| entry == CJK_FONT_NAME) {
+            entries.push(CJK_FONT_NAME.to_string());
+        }
+    }
+}
+
+fn first_readable_font_path<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    candidates
+        .into_iter()
+        .find(|path| std::fs::File::open(path).is_ok())
+}
+
+fn cjk_font_candidates() -> &'static [&'static str] {
+    &[
+        // Linux: Noto / Source Han are common on current desktop distributions.
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+        "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        // macOS: installed system CJK fonts.
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/System/Library/Fonts/Supplemental/Heiti.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
 }
 
 fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
@@ -879,7 +940,12 @@ impl DiskMapApp {
     }
 
     fn show_details_panel(&mut self, ui: &mut egui::Ui) {
-        panels::details::show(ui, self);
+        egui::ScrollArea::vertical()
+            .id_salt("details_panel_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                panels::details::show(ui, self);
+            });
     }
 
     fn show_progress_section(&self, ui: &mut egui::Ui, p: &Palette) {
@@ -1260,14 +1326,14 @@ impl DiskMapApp {
         }
 
         for (node_id, delta) in batch.size_deltas {
-            if node_id < self.tree.len() {
+            if self.tree.contains_id(node_id) {
                 self.tree.apply_direct_size_delta(node_id, delta);
                 dirty_nodes.push(node_id);
             }
         }
 
         for node_id in batch.scanned_nodes {
-            if node_id < self.tree.len() {
+            if self.tree.contains_id(node_id) {
                 self.tree.mark_scanned(node_id);
                 dirty_nodes.push(node_id);
             }
@@ -1467,12 +1533,12 @@ impl DiskMapApp {
         self.color_by_extension = view.color_by_extension;
         self.last_report_mode = view.last_report_mode;
         if let Some(focused) = view.focused_id {
-            if focused < self.tree.len() {
+            if self.tree.contains_id(focused) {
                 self.navigation.set_focused_root(Some(focused));
             }
         }
         if let Some(selected) = view.selected_id {
-            if selected < self.tree.len() {
+            if self.tree.contains_id(selected) {
                 self.navigation.set_selected_id(Some(selected));
             }
         }
@@ -1709,7 +1775,8 @@ impl DiskMapApp {
     fn closest_known_directory(&mut self, changed_path: &Path) -> Option<(NodeId, PathBuf)> {
         let root = self.tree.root?;
         let mut best: Option<(NodeId, PathBuf, usize)> = None;
-        for node_id in 0..self.tree.len() {
+        for index in 0..self.tree.len() {
+            let node_id = node_id_from_index(index);
             if !matches!(self.tree.node(node_id).kind, NodeKind::Dir) {
                 continue;
             }
@@ -1840,7 +1907,8 @@ impl DiskMapApp {
         self.navigation
             .focused_root()
             .filter(|&root_id| {
-                root_id < self.tree.len() && matches!(self.tree.node(root_id).kind, NodeKind::Dir)
+                self.tree.contains_id(root_id)
+                    && matches!(self.tree.node(root_id).kind, NodeKind::Dir)
             })
             .and_then(|root_id| self.tree.node_real_path(root_id))
     }
@@ -1938,7 +2006,7 @@ impl DiskMapApp {
         let Some(selected_id) = self.navigation.selected_id() else {
             return false;
         };
-        if selected_id >= self.tree.len() || self.tree.node(selected_id).children.is_empty() {
+        if !self.tree.contains_id(selected_id) || self.tree.node(selected_id).children.is_empty() {
             return false;
         }
         self.enter_root(selected_id, true);
@@ -2547,6 +2615,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scroll_wrapped_details_panel_does_not_expand_central_treemap_area() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+        let mut central_rect = None;
+
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                egui::Panel::top("layout_test_toolbar")
+                    .exact_size(40.0)
+                    .show_inside(ui, |ui| {
+                        ui.label("toolbar");
+                    });
+
+                egui::Panel::right("layout_test_details")
+                    .exact_size(280.0)
+                    .show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("layout_test_details_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for row in 0..200 {
+                                    ui.label(format!("details row {row}"));
+                                }
+                            });
+                    });
+
+                egui::Panel::bottom("layout_test_status")
+                    .exact_size(28.0)
+                    .show_inside(ui, |ui| {
+                        ui.label("status");
+                    });
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::central_panel(ui.style()).inner_margin(0))
+                    .show_inside(ui, |ui| {
+                        central_rect = Some(ui.max_rect().intersect(ui.clip_rect()));
+                    });
+            },
+        );
+
+        let central_rect = central_rect.expect("central panel should be shown");
+        let expected_bottom = screen.bottom() - 28.0;
+        assert!(
+            central_rect.bottom() <= expected_bottom + 1.0,
+            "central panel bottom {} should stay within visible viewport bottom {expected_bottom}",
+            central_rect.bottom()
+        );
+        assert!(
+            central_rect.height() <= screen.height() - 40.0 - 28.0 + 1.0,
+            "central panel height {} should not include overflowing details content",
+            central_rect.height()
+        );
+    }
+
+    #[test]
+    fn cjk_font_install_adds_fallback_to_ui_font_families() {
+        let mut fonts = egui::FontDefinitions::default();
+
+        install_cjk_font_data(&mut fonts, vec![0, 1, 2, 3]);
+
+        assert!(fonts.font_data.contains_key("disk-map-cjk"));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let entries = fonts
+                .families
+                .get(&family)
+                .expect("default font family should exist");
+            assert_eq!(entries.last().map(String::as_str), Some("disk-map-cjk"));
+        }
+    }
+
+    #[test]
+    fn first_readable_font_path_skips_missing_candidates() {
+        let dir = unique_temp_dir();
+        let missing = dir.join("missing-font.ttf");
+        let readable = dir.join("readable-font.ttf");
+        std::fs::write(&readable, b"font").expect("test font file should be writable");
+        let candidates = [
+            missing.display().to_string(),
+            readable.display().to_string(),
+        ];
+
+        let selected = first_readable_font_path(candidates.iter().map(String::as_str));
+
+        assert_eq!(selected, Some(candidates[1].as_str()));
+    }
+
     fn app_with_search_matches() -> DiskMapApp {
         let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started(1));
@@ -3070,12 +3230,14 @@ mod tests {
             .nodes
             .iter()
             .position(|node| node.name == "nested")
+            .map(node_id_from_index)
             .expect("nested directory should be present");
         let file_id = app
             .tree
             .nodes
             .iter()
             .position(|node| node.name == "large-match.bin")
+            .map(node_id_from_index)
             .expect("large file should be present");
 
         app.navigation.set_selected_id(Some(nested_id));
@@ -3869,6 +4031,7 @@ mod tests {
 
         app.apply_progress(ProgressSnapshot {
             files_scanned: 3,
+            total_files: Some(6),
             dirs_scanned: 2,
             bytes_seen: 128,
             current_path: "/root/current/file.txt".into(),
@@ -3876,6 +4039,8 @@ mod tests {
 
         let progress = app.scan.progress().expect("progress summary");
         assert_eq!(progress.files_scanned, 3);
+        assert_eq!(progress.total_files, Some(6));
+        assert_eq!(progress.file_progress_fraction(), Some(0.5));
         assert_eq!(progress.dirs_scanned, 2);
         assert_eq!(progress.bytes_seen, 128);
         assert_eq!(

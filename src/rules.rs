@@ -262,7 +262,7 @@ pub fn evaluate_rules(
     limit: usize,
 ) -> Vec<RuleHit> {
     let mut hits = Vec::new();
-    if root_id >= tree.len() {
+    if !tree.contains_id(root_id) {
         return hits;
     }
     walk(rules, tree, root_id, ctx, &mut hits, limit);

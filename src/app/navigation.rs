@@ -130,7 +130,7 @@ impl NavigationState {
     }
 
     pub fn focus_search_match(&mut self, tree: &TreeStore, node_id: NodeId) -> NavigationOutcome {
-        if node_id >= tree.len() {
+        if !tree.contains_id(node_id) {
             return NavigationOutcome::Noop;
         }
 
@@ -205,7 +205,7 @@ impl NavigationState {
 }
 
 fn node_is_reachable(tree: &TreeStore, node_id: NodeId) -> bool {
-    node_id < tree.len()
+    tree.contains_id(node_id)
         && tree
             .root
             .is_some_and(|root_id| tree.is_descendant_or_same(node_id, root_id))
