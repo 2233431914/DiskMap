@@ -60,9 +60,9 @@ will fail the build.
 ### Tests live next to the code
 
 Use `#[cfg(test)] mod tests {}` at the bottom of each source file. The
-project's `TestStorage` helper in `src/app.rs:3671-3686` mocks
-`eframe::Storage` for preference round-trip tests. Reuse it; do not introduce
-a parallel mock.
+project's preference and local-state tests use `src/storage.rs::SafeStorage`
+with temp directories. Reuse the existing helpers in `app.rs` / `storage.rs`;
+do not introduce a parallel storage mock.
 
 ### Threading model
 
@@ -75,16 +75,19 @@ a parallel mock.
 
 ### Persistence
 
-User-facing preferences live in `eframe::Storage` (one string per key). The
-key constants are grouped at the top of `src/app.rs` as `STORAGE_*`. To add a
-new preference:
+Compact user-facing app state lives in `src/storage.rs::SafeStorage`, which
+writes app data JSON with a temp-file + fsync + rename pattern. eframe still
+owns native window persistence (`persist_window: true`). Preference keys are
+grouped at the top of `src/app.rs` as `STORAGE_*`. To add a new preference:
 
 1. Add a `STORAGE_*` constant.
 2. Read it in `restore_preferences` with a `parse_storage_bool` /
    `parse_stored_paths` / `theme_preference_name` style helper.
-3. Write it in `save_preferences` (unconditional — Storage has no diff).
-4. Extend the two round-trip tests in the `#[cfg(test)] mod tests` block of
-   `app.rs`.
+3. Write it in `save_preferences` (unconditional — the app writes the compact
+   preferences map as part of local state).
+4. Extend the preference save/restore/round-trip tests in the `#[cfg(test)]`
+   mod tests block of `app.rs`. Reuse `SafeStorage`; do not introduce a
+   parallel storage mock.
 
 ### What **not** to do (or: how to read SPEC.md correctly)
 
@@ -165,7 +168,7 @@ not claim a "regression" without a stable input tree.
 
 ## Crash safety
 
-Crash-safe local writes (preferences, history, snapshots, cleanup audit)
-are **Phase 15** and not done. The current implementation relies on
-`eframe::Storage` doing atomic writes; do not extend it to write large
-state (history, snapshots) until the Phase 15 work lands.
+Crash-safe local writes for preferences and compact user state are implemented
+through `SafeStorage`. Large persisted state (full history, snapshots, cleanup
+audit logs) is still **Phase 15** and not done. Do not extend local storage to
+write large scan state until that design lands.

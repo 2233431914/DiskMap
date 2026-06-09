@@ -32,8 +32,10 @@ checklist remain roadmap work — see [SPEC.md](SPEC.md) for details.
 
 Requires Rust 1.85+ (edition 2021). macOS and Linux are supported runtime
 targets. Linux desktops also need the usual native GUI libraries used by
-`eframe`/`winit` plus a desktop portal or file manager command for `Open`,
-`Open Containing Folder`, and `Move to Trash` integration.
+`eframe`/`winit`, a desktop opener for `Open` / `Open Containing Folder`,
+and freedesktop Trash support for `Move to Trash`. Trash may fail in
+headless sessions or on filesystems that do not expose a compatible Trash
+location.
 
 ```bash
 cargo run --release

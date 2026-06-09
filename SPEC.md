@@ -15,7 +15,7 @@
 - **In-memory tree aggregation:** Custom TreeStore
 - **Treemap rendering:** egui::Painter (custom drawing)
 - **Shell open:** open (v5)
-- **Preference persistence:** crash-safe app data JSON for app state/preferences; eframe native window persistence
+- **Local persistence:** crash-safe app data JSON for compact app state/preferences; eframe native window persistence
 - **Experimental cache:** rusqlite (implemented, disabled by default)
 
 ## 3. Features (Current Implemented Scope)
@@ -178,7 +178,7 @@ struct TreeStore {
 │ Current:  │                                      │
 │ Size:     │         TREEMAP CANVAS                │
 │ [Open]    │         (egui::Painter)               │
-│ [Show]    │                                      │
+│ [Folder]  │                                      │
 │           │                                      │
 └────────────┴──────────────────────────────────────┘
 ```
