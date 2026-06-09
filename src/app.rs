@@ -755,7 +755,7 @@ impl DiskMapApp {
 
             ui.add_space(4.0);
 
-            let path_width = (ui.available_width() - 240.0).clamp(200.0, 560.0);
+            let path_width = (ui.available_width() - 230.0).clamp(200.0, 620.0);
             let path_edit = ui.add_sized(
                 [path_width, 28.0],
                 egui::TextEdit::singleline(&mut self.path_input).hint_text("/path/to/scan"),
@@ -782,32 +782,21 @@ impl DiskMapApp {
                 }
             }
 
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             ui.label(
-                RichText::new("RESCAN")
+                RichText::new("DEPTH")
                     .size(10.0)
                     .color(palette(ui.ctx()).text_faint)
                     .strong(),
             );
             if ui
-                .add_enabled(
-                    self.can_rescan_scan_root(),
-                    egui::Button::new("Root").min_size(Vec2::new(48.0, 28.0)),
+                .add_sized(
+                    [110.0, 18.0],
+                    egui::Slider::new(&mut self.max_depth, 1..=10).text(""),
                 )
-                .on_hover_text("Rescan the original scan root")
-                .clicked()
+                .changed()
             {
-                self.rescan_scan_root();
-            }
-            if ui
-                .add_enabled(
-                    self.can_rescan_focused_subtree(),
-                    egui::Button::new("View").min_size(Vec2::new(48.0, 28.0)),
-                )
-                .on_hover_text("Rescan the currently focused directory")
-                .clicked()
-            {
-                self.rescan_focused_subtree();
+                self.mark_layout_dirty_now();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1750,10 +1739,12 @@ impl DiskMapApp {
         self.watcher = None;
     }
 
+    #[cfg(test)]
     fn can_rescan_scan_root(&mut self) -> bool {
         !self.scan.is_scanning() && self.scan_root_rescan_path().is_some()
     }
 
+    #[cfg(test)]
     fn can_rescan_focused_subtree(&mut self) -> bool {
         !self.scan.is_scanning() && self.focused_subtree_rescan_path().is_some()
     }

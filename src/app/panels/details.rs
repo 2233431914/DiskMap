@@ -580,18 +580,6 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
             .color(p.text_faint),
     );
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Depth").small().color(p.text_muted));
-        if ui
-            .add_sized(
-                [ui.available_width().max(120.0), 18.0],
-                egui::Slider::new(&mut app.max_depth, 1..=10).text(""),
-            )
-            .changed()
-        {
-            app.mark_layout_dirty_now();
-        }
-    });
     if ui
         .checkbox(&mut app.color_by_extension, "Color by extension")
         .on_hover_text("Color files by extension")

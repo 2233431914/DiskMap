@@ -1,4 +1,4 @@
-//! Sidebar section renderers (progress, scan issues, cleanup queue, search,
+//! Sidebar section renderers (progress, scan issues, cleanup queue,
 //! snapshot diff, duplicate report, insight report) plus the bottom status
 //! bar. Extracted from `app.rs` so each section reads top-to-bottom.
 //!
