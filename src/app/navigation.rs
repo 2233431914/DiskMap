@@ -114,6 +114,7 @@ impl NavigationState {
         }
     }
 
+    #[cfg(test)]
     pub fn set_focused_root(&mut self, node_id: Option<NodeId>) {
         self.focused_root = node_id;
         self.breadcrumb_cache.clear();

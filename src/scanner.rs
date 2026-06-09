@@ -538,42 +538,6 @@ pub fn start_scan(
     ScanHandle { cancel }
 }
 
-fn count_total_files(path: &Path, options: &ScanOptions, cancel: &AtomicBool) -> Option<u64> {
-    let exclude_matcher = ExcludeMatcher::new(options.exclude_patterns.clone());
-    let same_filesystem_device = if options.stay_on_filesystem {
-        root_device_id(path)
-    } else {
-        None
-    };
-    let include_hidden = options.include_hidden;
-    let follow_symlinks = options.follow_symlinks;
-
-    let walker = WalkDirGeneric::<ScanWalkState>::new(path)
-        .skip_hidden(!include_hidden)
-        .follow_links(follow_symlinks)
-        .process_read_dir(move |_depth, _path, _state, children| {
-            retain_scan_candidates(children, &exclude_matcher, same_filesystem_device);
-        })
-        .into_iter()
-        .filter_map(|entry| entry.ok());
-
-    let mut total_files = 0_u64;
-    for entry in walker {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        if entry.path() == path {
-            continue;
-        }
-        let file_type = entry.file_type();
-        if !entry.path_is_symlink() && !file_type.is_symlink() && file_type.is_file() {
-            total_files += 1;
-        }
-    }
-
-    Some(total_files)
-}
-
 fn retain_scan_candidates(
     children: &mut Vec<jwalk::Result<jwalk::DirEntry<ScanWalkState>>>,
     exclude_matcher: &ExcludeMatcher,
@@ -689,19 +653,7 @@ fn run_scan(
         (CacheMode::Enabled, Some(path)) => ScanDb::new(path).ok(),
         _ => None,
     };
-    let total_files = match count_total_files(&path, &options, &cancel) {
-        Some(total_files) => Some(total_files),
-        None => {
-            perf_stats.scan_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            perf_stats.messages_sent += 1;
-            let _ = tx.send(ScanMessage::Cancelled {
-                scan_id,
-                perf_stats,
-            });
-            return;
-        }
-    };
-    let mut counters = ScanCounters::new(path.clone(), total_files);
+    let mut counters = ScanCounters::new(path.clone(), None);
     let mut batch = BatchAccumulator::new(&options);
     let mut aggregate_state = AggregateState::default();
     let mut last_flush = Instant::now();
@@ -1390,8 +1342,8 @@ mod tests {
     }
 
     #[test]
-    fn count_total_files_honors_scan_filters() {
-        let dir = temp_path("count-total-files");
+    fn scan_progress_does_not_precount_total_files() {
+        let dir = temp_path("no-precount-total-files");
         let nested = dir.join("nested");
         let ignored = dir.join("ignored");
         std::fs::create_dir_all(&nested).unwrap();
@@ -1401,16 +1353,42 @@ mod tests {
         write(dir.join(".hidden.txt"), b"hidden").unwrap();
         write(dir.join("skip.tmp"), b"skip").unwrap();
         write(ignored.join("ignored.txt"), b"ignored").unwrap();
-        let cancel = AtomicBool::new(false);
+        let (tx, rx) = unbounded();
         let options = ScanOptions {
             include_hidden: false,
             exclude_patterns: vec!["skip.tmp".into(), "ignored".into()],
             ..ScanOptions::default()
         };
 
-        let total_files = count_total_files(&dir, &options, &cancel);
+        run_scan(
+            dir.clone(),
+            1,
+            options,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
 
-        assert_eq!(total_files, Some(2));
+        let mut latest_progress = None;
+        let mut finished_stats = None;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                ScanMessage::Batch { batch, .. } => {
+                    latest_progress = batch.progress.or(latest_progress);
+                }
+                ScanMessage::Finished { perf_stats, .. } => {
+                    finished_stats = Some(perf_stats);
+                }
+                ScanMessage::Started { .. } => {}
+                ScanMessage::Cancelled { .. } | ScanMessage::Error { .. } => {
+                    panic!("test scan should finish successfully");
+                }
+            }
+        }
+
+        let progress = latest_progress.expect("scan should emit progress");
+        assert_eq!(progress.total_files, None);
+        assert_eq!(progress.files_scanned, 2);
+        assert_eq!(finished_stats.expect("scan should finish").files_scanned, 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

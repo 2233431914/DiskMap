@@ -1,5 +1,5 @@
 use super::{current_unix_secs, DiskMapApp};
-use crate::export::{export_focused_report, export_subtree, ExportFormat, FocusedReportMetadata};
+use crate::export::{export_subtree, ExportFormat, FocusedReportMetadata};
 use crate::scanner::{parse_exclude_patterns, size_basis_label};
 use crate::tree::NodeId;
 use std::path::PathBuf;
@@ -23,42 +23,6 @@ impl DiskMapApp {
         self.pending_repaint = true;
     }
 
-    pub(super) fn export_scan_root(&mut self, format: ExportFormat) {
-        let Some(root_id) = self.tree.root else {
-            self.status = "Export unavailable: no scan root".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match self.write_focused_export(root_id, format) {
-            Ok(path) => {
-                self.status = format!("Exported {} to {}", format.label(), path.display());
-            }
-            Err(error) => {
-                self.status = format!("Export failed: {error}");
-            }
-        }
-        self.pending_repaint = true;
-    }
-
-    pub(super) fn export_focused_report_json(&mut self) {
-        let Some(root_id) = self.navigation.focused_root() else {
-            self.status = "Report export unavailable: no focused directory".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-
-        match self.write_focused_report(root_id) {
-            Ok(path) => {
-                self.status = format!("Exported report to {}", path.display());
-            }
-            Err(error) => {
-                self.status = format!("Report export failed: {error}");
-            }
-        }
-        self.pending_repaint = true;
-    }
-
     fn write_focused_export(
         &mut self,
         root_id: NodeId,
@@ -70,18 +34,6 @@ impl DiskMapApp {
 
         let content = export_subtree(&mut self.tree, root_id, format);
         let output_path = default_export_path(format);
-        std::fs::write(&output_path, content)?;
-        Ok(output_path)
-    }
-
-    fn write_focused_report(&mut self, root_id: NodeId) -> anyhow::Result<PathBuf> {
-        if !self.tree.contains_id(root_id) {
-            anyhow::bail!("focused directory is no longer available");
-        }
-
-        let metadata = self.focused_report_metadata(root_id)?;
-        let content = export_focused_report(&mut self.tree, root_id, &metadata);
-        let output_path = default_report_path();
         std::fs::write(&output_path, content)?;
         Ok(output_path)
     }
@@ -132,9 +84,4 @@ fn default_export_path(format: ExportFormat) -> PathBuf {
         "disk-map-export-{timestamp}.{}",
         format.extension()
     ))
-}
-
-fn default_report_path() -> PathBuf {
-    let timestamp = current_unix_secs();
-    PathBuf::from(format!("disk-map-report-{timestamp}.json"))
 }

@@ -187,16 +187,6 @@ impl DiskMapApp {
         true
     }
 
-    pub(super) fn remove_cleanup_candidate(&mut self, node_id: NodeId) {
-        if let Some(candidate) = self.cleanup_queue.remove(node_id) {
-            if self.trash_confirm_target_id == Some(node_id) {
-                self.trash_confirm_target_id = None;
-            }
-            self.status = format!("Removed cleanup candidate: {}", candidate.path.display());
-            self.pending_repaint = true;
-        }
-    }
-
     #[cfg(test)]
     fn cleanup_item_count(&self, node_id: NodeId) -> usize {
         if !self.tree.contains_id(node_id) {

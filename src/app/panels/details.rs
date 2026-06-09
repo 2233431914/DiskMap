@@ -1,11 +1,8 @@
-//! Sidebar details panel: selected node metadata, primary/utility actions,
-//! export and analysis entry points. Extracted from `app.rs` so the panel
-//! layout reads top-to-bottom in one file.
+//! Sidebar details panel: search, selected-node metadata, and core file actions.
 
 use super::super::search_nav::SearchDirection;
 use super::super::DiskMapApp;
 use crate::app::{accent_button, describe_node_kind, palette, section_divider};
-use crate::export::ExportFormat;
 use crate::format::format_bytes;
 use crate::platform::{
     open_path, reveal_action_label, reveal_action_short_label, reveal_in_file_manager,
@@ -26,7 +23,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     section_divider(ui, p);
     ui.add_space(8.0);
     show_controls_section(ui, app, p);
-    app.show_filter_presets_section(ui, p);
     ui.add_space(12.0);
     ui.label(
         RichText::new("DETAILS")
@@ -187,235 +183,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             ui.ctx().copy_text(path.display().to_string());
         }
     }
-    ui.add_space(4.0);
-    ui.add_sized(
-        [ui.available_width(), 26.0],
-        egui::TextEdit::singleline(&mut app.protected_paths_input).hint_text("Protected paths"),
-    )
-    .on_hover_text("Extra protected roots; comma, semicolon, or newline separated");
-
-    let trash_width = ui.available_width();
-    let trash_response = ui.add_enabled(
-        path_available,
-        egui::Button::new("Move to Trash").min_size(Vec2::new(trash_width, 28.0)),
-    );
-    let trash_response = if !path_available {
-        trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
-    } else {
-        trash_response.on_hover_text("Move this item to Trash")
-    };
-    if trash_response.clicked() {
-        app.move_node_to_trash(node_id);
-    }
-    ui.add_space(4.0);
-    let focused_export_id = app.navigation.focused_root();
-    let scan_root_export_id = app.tree.root;
-    let scan_root_is_focused =
-        focused_export_id.is_some() && focused_export_id == scan_root_export_id;
-    ui.columns(2, |cols| {
-        let can_export = focused_export_id.is_some();
-        let w0 = cols[0].available_width();
-        if cols[0]
-            .add_enabled(
-                can_export,
-                egui::Button::new("Export View CSV").min_size(Vec2::new(w0, 28.0)),
-            )
-            .clicked()
-        {
-            app.export_focused_subtree(ExportFormat::Csv);
-        }
-        let w1 = cols[1].available_width();
-        if cols[1]
-            .add_enabled(
-                can_export,
-                egui::Button::new("Export View JSON").min_size(Vec2::new(w1, 28.0)),
-            )
-            .clicked()
-        {
-            app.export_focused_subtree(ExportFormat::Json);
-        }
-    });
-    if !scan_root_is_focused {
-        ui.add_space(4.0);
-        ui.columns(2, |cols| {
-            let can_export = scan_root_export_id.is_some();
-            let w0 = cols[0].available_width();
-            if cols[0]
-                .add_enabled(
-                    can_export,
-                    egui::Button::new("Export Root CSV").min_size(Vec2::new(w0, 28.0)),
-                )
-                .clicked()
-            {
-                app.export_scan_root(ExportFormat::Csv);
-            }
-            let w1 = cols[1].available_width();
-            if cols[1]
-                .add_enabled(
-                    can_export,
-                    egui::Button::new("Export Root JSON").min_size(Vec2::new(w1, 28.0)),
-                )
-                .clicked()
-            {
-                app.export_scan_root(ExportFormat::Json);
-            }
-        });
-    }
-    ui.add_space(4.0);
-    let report_width = ui.available_width();
-    if ui
-        .add_enabled(
-            focused_export_id.is_some(),
-            egui::Button::new("Export Report JSON").min_size(Vec2::new(report_width, 28.0)),
-        )
-        .on_hover_text("Export current view data plus metadata needed to reproduce this view")
-        .clicked()
-    {
-        app.export_focused_report_json();
-    }
-    ui.add_space(4.0);
-    let duplicate_width = ui.available_width();
-    if ui
-        .add_enabled(
-            focused_export_id.is_some() && !app.scan.is_scanning(),
-            egui::Button::new("Analyze Duplicates").min_size(Vec2::new(duplicate_width, 28.0)),
-        )
-        .on_hover_text("Read-only heuristic: same file name and same size in the current view")
-        .clicked()
-    {
-        app.analyze_duplicate_candidates();
-    }
-    ui.add_space(4.0);
-    let insight_width = ui.available_width();
-    if ui
-        .add_enabled(
-            focused_export_id.is_some() && !app.scan.is_scanning(),
-            egui::Button::new("Analyze Insights").min_size(Vec2::new(insight_width, 28.0)),
-        )
-        .on_hover_text("Read-only age buckets and extension category summary for this view")
-        .clicked()
-    {
-        app.analyze_file_insights();
-    }
-
-    // Per-root scan option profile controls. Only meaningful when
-    // there's a real path (not a virtual aggregate node) and that path
-    // is the focused root (or scan root) — we key profiles by the
-    // path string the user typed.
-    if let Some(view_root_path) = node_path.as_ref() {
-        let view_root = view_root_path.to_string_lossy().to_string();
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new("VIEW")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        let saved_view = app.views.get(&view_root);
-        if let Some(view) = saved_view {
-            ui.label(
-                RichText::new(format!(
-                    "Saved: depth {}, filter={}, last={}{}",
-                    view.depth,
-                    if view.search_filter_enabled {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    view.last_report_mode,
-                    if view.search_query.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", q=\"{}\"", view.search_query)
-                    },
-                ))
-                .small()
-                .color(p.text_muted),
-            );
-        } else {
-            ui.label(
-                RichText::new("No saved view for this root")
-                    .small()
-                    .color(p.text_muted),
-            );
-        }
-        ui.columns(2, |cols| {
-            let w0 = cols[0].available_width();
-            if cols[0]
-                .add(egui::Button::new("Save current view").min_size(Vec2::new(w0, 24.0)))
-                .on_hover_text("Capture depth, search query, focused/selected node, color mode, and last opened report panel under this root")
-                .clicked()
-            {
-                app.save_current_view(&view_root);
-            }
-            let w1 = cols[1].available_width();
-            let has_view = app.views.get(&view_root).is_some();
-            if cols[1]
-                .add_enabled(
-                    has_view,
-                    egui::Button::new("Apply saved view").min_size(Vec2::new(w1, 24.0)),
-                )
-                .clicked()
-            {
-                app.apply_saved_view(&view_root);
-            }
-        });
-    }
-
-    if let Some(profile_root_path) = node_path.as_ref() {
-        let profile_root = profile_root_path.to_string_lossy().to_string();
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new("PROFILE")
-                .size(10.0)
-                .strong()
-                .color(p.text_faint),
-        );
-        ui.add_space(4.0);
-        let profile_count = app.profiles.len();
-        if profile_count > 0 {
-            ui.label(
-                RichText::new(format!(
-                    "{} profile(s) stored (this root: {})",
-                    profile_count,
-                    if app.profiles.get(&profile_root).is_some() {
-                        "saved"
-                    } else {
-                        "not saved"
-                    }
-                ))
-                .small()
-                .color(p.text_muted),
-            );
-        } else {
-            ui.label(
-                RichText::new("No profiles yet — saved options are remembered per root")
-                    .small()
-                    .color(p.text_muted),
-            );
-        }
-        ui.columns(2, |cols| {
-            let w0 = cols[0].available_width();
-            if cols[0]
-                .add(egui::Button::new("Save for this root").min_size(Vec2::new(w0, 24.0)))
-                .clicked()
-            {
-                app.save_current_as_profile(&profile_root);
-            }
-            let w1 = cols[1].available_width();
-            let has_profile = app.profiles.get(&profile_root).is_some();
-            if cols[1]
-                .add_enabled(
-                    has_profile,
-                    egui::Button::new("Apply profile").min_size(Vec2::new(w1, 24.0)),
-                )
-                .clicked()
-            {
-                app.apply_profile_to_ui(&profile_root);
-            }
-        });
-    }
 
     if let Some(parent) = node_parent {
         ui.add_space(10.0);
@@ -441,12 +208,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
 
     app.show_progress_section(ui, p);
     app.show_scan_issue_section(ui, p);
-    app.show_cleanup_queue_section(ui, p);
-    app.show_snapshot_diff_section(ui, p);
-    app.show_duplicate_report_section(ui, p);
-    app.show_insight_report_section(ui, p);
-    app.show_rules_section(ui, p);
-    app.show_diagnostics_section(ui, p);
 }
 
 fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app::Palette) {
@@ -534,43 +295,6 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
                 p.text_muted
             }),
     );
-
-    ui.add_space(12.0);
-    ui.label(
-        RichText::new("SCAN CONDITIONS")
-            .size(10.0)
-            .strong()
-            .color(p.text_faint),
-    );
-    ui.add_space(4.0);
-    ui.add_sized(
-        [ui.available_width(), 28.0],
-        egui::TextEdit::singleline(&mut app.exclude_input).hint_text(".git,node_modules,target"),
-    )
-    .on_hover_text("Excluded names or path fragments; comma, semicolon, or newline separated");
-    ui.add_space(4.0);
-    ui.columns(2, |cols| {
-        cols[0]
-            .checkbox(&mut app.include_hidden, "Hidden")
-            .on_hover_text("Include hidden files and folders");
-        cols[1]
-            .checkbox(&mut app.follow_symlinks, "Links")
-            .on_hover_text("Follow symlinked directories during scan");
-    });
-    ui.columns(2, |cols| {
-        cols[0]
-            .checkbox(&mut app.stay_on_filesystem, "Same FS")
-            .on_hover_text("Stay on the scan root filesystem when supported");
-        let before_watch = app.realtime_watch_enabled;
-        cols[1]
-            .checkbox(&mut app.realtime_watch_enabled, "Watch")
-            .on_hover_text("Watch the scan root and rescan after debounced filesystem changes");
-        if app.realtime_watch_enabled != before_watch {
-            app.update_watch_state();
-        }
-    });
-    ui.checkbox(&mut app.sqlite_cache_enabled, "SQLite cache")
-        .on_hover_text("Experimental scan cache for faster rescans");
 
     ui.add_space(12.0);
     ui.label(

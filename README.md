@@ -2,40 +2,35 @@
 
 A native disk usage analyzer with a squarified treemap for macOS and Linux.
 Local-only, no network, no telemetry. Built for personal use — fast scans,
-keyboard-driven workflow, destructive actions guarded by review and
-protected-path checks.
+direct treemap browsing, and a compact SpaceSniffer-style workflow.
 
 Inspired by SpaceSniffer, written in Rust with `eframe`/`egui`.
 
 ## Status
 
-**MVP feature-complete.** All Phase 1–9 roadmap items landed:
+**MVP feature-complete, UI simplified toward the SpaceSniffer core.** The
+main app focuses on scan root selection, treemap browsing, search, and
+open/reveal actions:
 
 - Parallel scanning with `jwalk`, incremental UI refresh
 - Squarified treemap with hover, search, filter, depth control
-- Right-click: Open, Reveal in Finder / Open Containing Folder, Copy Path,
-  Move to Trash (with confirmation and protected-path validation)
+- Right-click: Open, Reveal in Finder / Open Containing Folder, Copy Path
+- Settings popup for scan root and scan conditions
 - Safe scan options: hidden files, symlink policy, stay-on-filesystem
 - Exclude rules (`.git`, `node_modules`, custom patterns)
 - Real-time filesystem watch with debounced subtree rescans
-- Snapshot comparison, duplicate-name report, file age/type insights
-- Focused report export (CSV / JSON) with reproduction metadata
-- Optional experimental SQLite scan cache (off by default)
 - Recent + pinned scan roots, persisted user-facing options
 
-The headless CLI and local macOS `.app` packaging path are available. Linux
-runs as a native desktop binary; distro packaging is not yet part of the
-roadmap. Accessibility hardening and a full signed/notarized public release
-checklist remain roadmap work — see [SPEC.md](SPEC.md) for details.
+The headless CLI and local macOS `.app` packaging path are available. The
+codebase still contains read-only analysis/export modules and guarded cleanup
+logic, but those are no longer exposed in the main GUI. Linux runs as a native
+desktop binary; distro packaging is not yet part of the roadmap.
 
 ## Build & Run
 
 Requires Rust 1.85+ (edition 2021). macOS and Linux are supported runtime
 targets. Linux desktops also need the usual native GUI libraries used by
-`eframe`/`winit`, a desktop opener for `Open` / `Open Containing Folder`,
-and freedesktop Trash support for `Move to Trash`. Trash may fail in
-headless sessions or on filesystems that do not expose a compatible Trash
-location.
+`eframe`/`winit` and a desktop opener for `Open` / `Open Containing Folder`.
 
 ```bash
 cargo run --release
@@ -101,17 +96,16 @@ preferences, no profiles, no destructive actions — read-only.
 
 ## Usage (60 seconds)
 
-1. Type or paste a directory path in the toolbar and press Enter (or click
-   **Scan**).
+1. Click the settings gear, edit the scan root if needed, and click
+   **Start Scan**. The default scan root is your home directory.
 2. Treemap shows the focused subtree. Hover for path/size tooltip, click to
    select, double-click a directory to drill in.
 3. `[/]` keys change depth, `Backspace` returns to the previous focus, `Esc`
-   clears search.
+   clears selection/search or closes Settings.
 4. `Roots` menu collects the last 10 successful scan roots and stores pinned
    favorites for one-click repeat analysis.
 5. Right-click a node for **Open / Reveal in Finder** on macOS or
-   **Open Containing Folder** on Linux, plus **Copy Path / Move to Trash**.
-   Trash shows a confirmation with path, size, and affected item count.
+   **Open Containing Folder** on Linux, plus **Copy Path**.
 
 ## Keyboard shortcuts
 
@@ -121,15 +115,12 @@ preferences, no profiles, no destructive actions — read-only.
 | `Backspace`    | Navigate back                           |
 | `Alt+←/→`     | Navigate back / forward                  |
 | `[` / `]`      | Decrease / increase treemap depth       |
-| `Esc`          | Clear selection / search / close palette |
-| `Cmd+K` / `Ctrl+K` | Open command palette                |
+| `Esc`          | Clear selection / search / close Settings |
 
 ## Privacy
 
-Everything is local. No network calls, no analytics, no remote cache. The
-optional SQLite cache lives in DiskMap's app data directory alongside
-crash-safe local preferences/state; reports and exports are written to the
-current working directory and named `disk-map-export-*` with a timestamp.
+Everything is local. No network calls, no analytics, no remote cache.
+Crash-safe local preferences/state live in DiskMap's app data directory.
 On Linux, the app data directory is `$XDG_DATA_HOME/disk-map` when
 `XDG_DATA_HOME` is an absolute path, otherwise `~/.local/share/disk-map`.
 

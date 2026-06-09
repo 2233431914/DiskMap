@@ -1,4 +1,4 @@
-use crate::cleanup::{CleanupQueue, ProtectedPathReason};
+use crate::cleanup::CleanupQueue;
 use crate::duplicates::DuplicateReport;
 #[cfg(test)]
 use crate::export::ExportFormat;
@@ -8,18 +8,24 @@ use crate::scanner::{
     parse_exclude_patterns, scan_path_to_tree, CacheMode, PerfStats, ProgressSnapshot, ScanBatch,
     ScanMessage, ScanOptions,
 };
-use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff};
+#[cfg(test)]
+use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot};
 use crate::storage::{app_data_dir, LocalState, Preferences, SafeStorage};
 use crate::tree::{node_id_from_index, NodeId, NodeKind, TreeStore};
 use crate::treemap::{LayoutScratch, VisualKind, VisualNode};
 use crate::watcher::{WatchPoll, WatchSession};
 
+#[cfg(test)]
 mod analysis_actions;
+#[cfg(test)]
 mod cleanup_actions;
+#[cfg(test)]
 mod export_actions;
 mod navigation;
 mod panels;
+#[cfg(test)]
 mod profile_actions;
+#[cfg(test)]
 mod rule_actions;
 mod scan_session;
 mod search_nav;
@@ -41,6 +47,9 @@ use std::time::{Duration, Instant};
 pub(super) const LAYOUT_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const CONTEXT_MENU_MIN_WIDTH: f32 = 240.0;
 pub(super) const CONTEXT_MENU_MAX_TITLE_CHARS: usize = 36;
+const HOVER_TOOLTIP_MAX_WIDTH: f32 = 720.0;
+const HOVER_TOOLTIP_MIN_WIDTH: f32 = 260.0;
+const HOVER_TOOLTIP_SCREEN_MARGIN: f32 = 48.0;
 const STORAGE_PATH_INPUT: &str = "disk_map.path_input";
 const STORAGE_EXCLUDE_INPUT: &str = "disk_map.exclude_input";
 const STORAGE_PROTECTED_PATHS: &str = "disk_map.protected_paths";
@@ -57,6 +66,7 @@ const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
 const MAX_RECENT_ROOTS: usize = 10;
 const MAX_PINNED_ROOTS: usize = 12;
+#[cfg(test)]
 const SNAPSHOT_DIFF_LIMIT: usize = 5;
 
 #[derive(Clone, Copy)]
@@ -334,8 +344,10 @@ pub struct DiskMapApp {
     pub(super) color_by_extension: bool,
     pub(super) recent_roots: Vec<String>,
     pub(super) pinned_roots: Vec<String>,
+    #[cfg(test)]
     last_snapshot: Option<ScanSnapshot>,
-    pub(super) snapshot_diff: Option<SnapshotDiff>,
+    #[cfg(test)]
+    pub(super) snapshot_diff: Option<crate::snapshot::SnapshotDiff>,
     pub(super) duplicate_report: Option<DuplicateReport>,
     pub(super) insight_report: Option<InsightReport>,
     pub(super) scan: ScanSession,
@@ -366,25 +378,23 @@ pub struct DiskMapApp {
     pub(super) rules: crate::rules::RuleSet,
     /// Most recent result from `evaluate_current_rules`, if any.
     /// Surfaced in the rules section as a small summary.
+    #[cfg(test)]
     pub(super) last_rule_hits: Option<Vec<crate::rules::RuleHit>>,
     /// Sticky text field for the rules import path. Self-clears after
     /// a successful import. Avoids spawning a native file dialog (we
     /// don't depend on a GUI toolkit for picking files).
+    #[cfg(test)]
     pub(super) rules_import_path: String,
     /// Pending rules import preview. Import only replaces the live
     /// ruleset after the user confirms this preview.
+    #[cfg(test)]
     pub(super) pending_rules_import: Option<crate::rules::RuleImportPreview>,
-    /// Per-root scan option profiles. Persisted in `SafeStorage` and
-    /// auto-applied when a scan starts.
+    /// Legacy per-root scan option profiles kept for local-state compatibility.
+    /// The simplified GUI no longer auto-applies hidden profile state.
     pub(super) profiles: crate::profiles::ProfileStore,
-    /// Command palette (Cmd+K) open state. The palette renders as a
-    /// top-anchored overlay only when this is true.
-    pub(super) palette_open: bool,
-    /// Live filter text for the palette.
-    pub(super) palette_query: String,
-    /// Index of the currently highlighted palette result. Reset to 0
-    /// on each query change.
-    pub(super) palette_selected: usize,
+    /// Settings window open state. The window owns the scan root path
+    /// and scan option controls.
+    pub(super) settings_open: bool,
     /// Per-root saved view state. One entry per scan root. Captured
     /// via the "Save current view" sidebar button.
     pub(super) views: crate::views::ViewStore,
@@ -393,12 +403,14 @@ pub struct DiskMapApp {
     /// when they saved. One of: "none" | "duplicates" | "insights"
     /// | "snapshot" | "rules". String rather than enum so future
     /// panels don't require a code change.
+    #[cfg(test)]
     pub(super) last_report_mode: String,
     /// Saved filter presets (named bundles of search query +
     /// filter_enabled toggle).
     pub(super) filter_presets: crate::views::FilterStore,
     /// Sticky text field for the new-preset name input. Self-clears
     /// after a successful add.
+    #[cfg(test)]
     pub(super) filter_preset_name: String,
 }
 
@@ -429,7 +441,9 @@ impl Default for DiskMapApp {
             color_by_extension: false,
             recent_roots: Vec::new(),
             pinned_roots: Vec::new(),
+            #[cfg(test)]
             last_snapshot: None,
+            #[cfg(test)]
             snapshot_diff: None,
             duplicate_report: None,
             insight_report: None,
@@ -452,16 +466,19 @@ impl Default for DiskMapApp {
             last_perf_stats: None,
             recent_errors: VecDeque::new(),
             rules: crate::rules::default_ruleset(),
+            #[cfg(test)]
             last_rule_hits: None,
+            #[cfg(test)]
             rules_import_path: String::new(),
+            #[cfg(test)]
             pending_rules_import: None,
             profiles: crate::profiles::ProfileStore::new(),
-            palette_open: false,
-            palette_query: String::new(),
-            palette_selected: 0,
+            settings_open: false,
             views: crate::views::ViewStore::new(),
+            #[cfg(test)]
             last_report_mode: "none".to_string(),
             filter_presets: crate::views::FilterStore::new(),
+            #[cfg(test)]
             filter_preset_name: String::new(),
         }
     }
@@ -486,8 +503,11 @@ impl DiskMapApp {
         self.views = state.views.clone();
         self.filter_presets = state.filter_presets.clone();
         self.rules = state.rules.clone();
-        self.pending_rules_import = None;
-        self.last_rule_hits = None;
+        #[cfg(test)]
+        {
+            self.pending_rules_import = None;
+            self.last_rule_hits = None;
+        }
     }
 
     fn restore_preferences(&mut self, prefs: &Preferences) {
@@ -526,11 +546,7 @@ impl DiskMapApp {
             self.stay_on_filesystem = stay_on_filesystem;
         }
 
-        if let Some(sqlite_cache_enabled) =
-            prefs.get(STORAGE_SQLITE_CACHE).and_then(parse_storage_bool)
-        {
-            self.sqlite_cache_enabled = sqlite_cache_enabled;
-        }
+        self.sqlite_cache_enabled = false;
 
         if let Some(search_filter_enabled) = prefs
             .get(STORAGE_SEARCH_FILTER)
@@ -582,7 +598,7 @@ impl DiskMapApp {
             STORAGE_STAY_ON_FILESYSTEM,
             self.stay_on_filesystem.to_string(),
         );
-        prefs.set(STORAGE_SQLITE_CACHE, self.sqlite_cache_enabled.to_string());
+        prefs.set(STORAGE_SQLITE_CACHE, false.to_string());
         prefs.set(
             STORAGE_SEARCH_FILTER,
             self.search_filter_enabled.to_string(),
@@ -621,6 +637,7 @@ impl DiskMapApp {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn persist_local_state(&mut self) {
         if let Err(error) = self.safe_storage.write_state(&self.collect_local_state()) {
             self.record_error(format!("local state save failed: {error}"));
@@ -632,25 +649,13 @@ impl DiskMapApp {
     fn scan_options(&self) -> ScanOptions {
         ScanOptions {
             exclude_patterns: parse_exclude_patterns(&self.exclude_input),
-            cache_mode: if self.sqlite_cache_enabled {
-                CacheMode::Enabled
-            } else {
-                CacheMode::Disabled
-            },
-            cache_path: self.sqlite_cache_enabled.then(|| self.sqlite_cache_path()),
+            cache_mode: CacheMode::Disabled,
+            cache_path: None,
             include_hidden: self.include_hidden,
             follow_symlinks: self.follow_symlinks,
             stay_on_filesystem: self.stay_on_filesystem,
             ..ScanOptions::default()
         }
-    }
-
-    fn sqlite_cache_path(&self) -> PathBuf {
-        self.safe_storage
-            .path()
-            .parent()
-            .map(|dir| dir.join("disk-map-cache.db"))
-            .unwrap_or_else(|| app_data_dir("disk-map").join("disk-map-cache.db"))
     }
 }
 
@@ -668,10 +673,7 @@ impl eframe::App for DiskMapApp {
         self.maybe_request_deferred_repaint(ctx);
         self.drive_background_updates(ctx);
 
-        // Command palette overlay (Cmd+K). Drawn last so it sits on
-        // top of everything else. Needs the egui::Context, which is
-        // only available in update() (not ui()).
-        panels::command_palette::show_command_palette(ctx, self);
+        panels::settings::show_settings_window(ctx, self);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -755,13 +757,11 @@ impl DiskMapApp {
 
             ui.add_space(4.0);
 
-            let path_width = (ui.available_width() - 230.0).clamp(200.0, 620.0);
-            let path_edit = ui.add_sized(
-                [path_width, 28.0],
-                egui::TextEdit::singleline(&mut self.path_input).hint_text("/path/to/scan"),
-            );
-            if path_edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                self.start_scan();
+            if icon_button(ui, true, ToolbarIcon::Settings)
+                .on_hover_text("Settings")
+                .clicked()
+            {
+                self.settings_open = true;
             }
 
             self.show_roots_menu(ui);
@@ -832,34 +832,6 @@ impl DiskMapApp {
         panels::sections::show_scan_issue_section(ui, p, self);
     }
 
-    fn show_cleanup_queue_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        panels::sections::show_cleanup_queue_section(ui, p, self);
-    }
-
-    fn show_snapshot_diff_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        panels::sections::show_snapshot_diff_section(ui, p, self);
-    }
-
-    fn show_duplicate_report_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        panels::sections::show_duplicate_report_section(ui, p, self);
-    }
-
-    fn show_insight_report_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        panels::sections::show_insight_report_section(ui, p, self);
-    }
-
-    fn show_diagnostics_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        panels::sections::show_diagnostics_section(ui, p, self);
-    }
-
-    fn show_rules_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        panels::rules_section::show_rules_section(ui, p, self);
-    }
-
-    fn show_filter_presets_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        panels::filter_presets::show_filter_presets_section(ui, p, self);
-    }
-
     fn show_status_bar(&self, ui: &mut egui::Ui) {
         panels::sections::show_status_bar(ui, self);
     }
@@ -898,14 +870,21 @@ impl DiskMapApp {
 
     fn empty_root_state_message(&self, root_id: NodeId) -> Option<StateMessage> {
         let root = self.tree.node(root_id);
-        if self.scan.is_scanning() || !root.children.is_empty() {
+        if !root.children.is_empty() {
             return None;
         }
 
-        Some(StateMessage {
-            title: "Empty folder",
-            detail: format!("{} has no visible files or child folders.", root.name),
-        })
+        if self.scan.is_scanning() {
+            Some(StateMessage {
+                title: "Waiting for first results",
+                detail: format!("Scanning {}.", self.path_input.trim()),
+            })
+        } else {
+            Some(StateMessage {
+                title: "Empty folder",
+                detail: format!("{} has no visible files or child folders.", root.name),
+            })
+        }
     }
 
     fn paint_state_message(
@@ -940,6 +919,8 @@ impl DiskMapApp {
         let p = palette(ui.ctx());
         let node_path = self.tree.node_real_path(node_id);
         let node = self.tree.node(node_id);
+        let tooltip_max_width = (ui.ctx().content_rect().width() - HOVER_TOOLTIP_SCREEN_MARGIN)
+            .clamp(HOVER_TOOLTIP_MIN_WIDTH, HOVER_TOOLTIP_MAX_WIDTH);
         egui::Area::new(egui::Id::new("hover_tooltip"))
             .order(egui::Order::Tooltip)
             .fixed_pos(pos + egui::vec2(16.0, 16.0))
@@ -951,7 +932,7 @@ impl DiskMapApp {
                     .inner_margin(Margin::same(10))
                     .shadow(ui.visuals().popup_shadow)
                     .show(ui, |ui| {
-                        ui.set_max_width(260.0);
+                        ui.set_max_width(tooltip_max_width);
                         ui.spacing_mut().item_spacing.y = 3.0;
 
                         ui.horizontal(|ui| {
@@ -979,7 +960,7 @@ impl DiskMapApp {
                                         .monospace()
                                         .color(p.text_muted),
                                 )
-                                .truncate(),
+                                .wrap(),
                             );
                         } else {
                             ui.label(
@@ -1080,25 +1061,12 @@ impl DiskMapApp {
         }
 
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            if self.palette_open {
-                self.palette_open = false;
-                self.palette_query.clear();
+            if self.settings_open {
+                self.settings_open = false;
             } else if self.navigation.selected_id().is_some() {
                 self.navigation.set_selected_id(None);
             } else if !self.search.input().is_empty() {
                 self.clear_search();
-            }
-        }
-
-        // Command palette: Cmd+K (mac) or Ctrl+K (other). Open on
-        // press; if already open, just keep it open (the panel handles
-        // its own focus).
-        let cmd_or_ctrl = ctx.input(|input| input.modifiers.command || input.modifiers.ctrl);
-        if cmd_or_ctrl && ctx.input(|input| input.key_pressed(egui::Key::K)) {
-            self.palette_open = !self.palette_open;
-            if self.palette_open {
-                self.palette_query.clear();
-                self.palette_selected = 0;
             }
         }
     }
@@ -1142,6 +1110,7 @@ impl DiskMapApp {
                     self.refresh_search_matches();
                     self.layout_dirty = true;
                     self.status = self.finished_status(total_bytes);
+                    #[cfg(test)]
                     self.update_snapshot_comparison();
                     self.update_watch_state();
                     self.pending_repaint = true;
@@ -1275,7 +1244,8 @@ impl DiskMapApp {
         );
     }
 
-    pub(super) fn update_snapshot_comparison(&mut self) {
+    #[cfg(test)]
+    fn update_snapshot_comparison(&mut self) {
         self.last_report_mode = "snapshot".to_string();
         let Some(root_id) = self.tree.root else {
             self.snapshot_diff = None;
@@ -1333,6 +1303,7 @@ impl DiskMapApp {
     /// Evaluate the current `rules` against the focused subtree and
     /// cache the result in `last_rule_hits`. Returns the number of
     /// hits found (capped at the same limit the engine uses).
+    #[cfg(test)]
     pub fn evaluate_current_rules(&mut self) -> usize {
         self.last_report_mode = "rules".to_string();
         use crate::rules::{evaluate_rules, RuleContext, INSIGHT_REPORT_LIMIT_FROM_RULES};
@@ -1371,6 +1342,7 @@ impl DiskMapApp {
     /// Capture the current view state under `root`. Existing entry
     /// for the same root is overwritten (last-write-wins, same
     /// convention as `ProfileStore::set`).
+    #[cfg(test)]
     pub fn save_current_view(&mut self, root: &str) {
         use crate::views::ViewState;
         let state = ViewState {
@@ -1391,6 +1363,7 @@ impl DiskMapApp {
     /// No-op if no view is stored for `root`. Does not change the
     /// loaded scan — the user re-runs the scan if they want to
     /// re-evaluate search results against new data.
+    #[cfg(test)]
     pub fn apply_saved_view(&mut self, root: &str) {
         let Some(view) = self.views.get(root).cloned() else {
             return;
@@ -1420,6 +1393,7 @@ impl DiskMapApp {
     /// search query and filter toggle as the preset body. Returns
     /// false (and does nothing) if the name is empty or already
     /// taken, so the UI can show a clear status.
+    #[cfg(test)]
     pub fn add_filter_preset(&mut self, name: &str) -> bool {
         use crate::views::FilterPreset;
         let trimmed = name.trim();
@@ -1452,6 +1426,7 @@ impl DiskMapApp {
     /// Apply a saved filter preset to the live search state. No-op
     /// if no preset by that name exists. Marks the search dirty so
     /// the next frame re-runs the matcher.
+    #[cfg(test)]
     pub fn apply_filter_preset(&mut self, name: &str) {
         let Some(preset) = self.filter_presets.get(name).cloned() else {
             return;
@@ -1465,6 +1440,7 @@ impl DiskMapApp {
     }
 
     /// Remove a saved filter preset by name.
+    #[cfg(test)]
     pub fn remove_filter_preset(&mut self, name: &str) -> bool {
         if self.filter_presets.remove(name).is_some() {
             self.status = format!("Removed filter preset '{}'", name);
@@ -1478,6 +1454,7 @@ impl DiskMapApp {
     /// Build a snapshot bundle from the current app state and write it
     /// to a timestamped directory under `dest_dir`. Returns the path to
     /// the created bundle directory, or an error if the write failed.
+    #[cfg(test)]
     pub fn export_diagnostics(&mut self, dest_dir: &Path) -> anyhow::Result<PathBuf> {
         use crate::diagnostics::DiagnosticsBundle;
         let scan_root = self.tree.root.and_then(|id| self.tree.node_real_path(id));
@@ -1678,7 +1655,6 @@ impl DiskMapApp {
     }
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
-        self.apply_profile_to_ui(&path.display().to_string());
         self.stop_watching();
         self.incremental_scan_active = false;
         self.scan
@@ -1691,7 +1667,10 @@ impl DiskMapApp {
         self.trash_confirm_target_id = None;
         self.cleanup_queue.clear();
         self.hovered_visual_kind = None;
-        self.snapshot_diff = None;
+        #[cfg(test)]
+        {
+            self.snapshot_diff = None;
+        }
         self.duplicate_report = None;
         self.insight_report = None;
         self.search.clear(0);
@@ -2068,6 +2047,7 @@ enum ToolbarIcon {
     Up,
     Home,
     Refresh,
+    Settings,
     ThemeLight,
     ThemeDark,
 }
@@ -2157,6 +2137,16 @@ fn paint_toolbar_icon(
             let end = Pos2::new(c.x + r * end_angle.cos(), c.y + r * end_angle.sin());
             painter.line_segment([end, Pos2::new(end.x - 2.5, end.y - 3.5)], stroke);
             painter.line_segment([end, Pos2::new(end.x + 3.5, end.y - 1.5)], stroke);
+        }
+        ToolbarIcon::Settings => {
+            painter.circle_stroke(c, 4.0, stroke);
+            painter.circle_filled(c, 1.35, color);
+            for i in 0..8 {
+                let theta = i as f32 * std::f32::consts::PI / 4.0;
+                let inner = Pos2::new(c.x + 5.2 * theta.cos(), c.y + 5.2 * theta.sin());
+                let outer = Pos2::new(c.x + 7.0 * theta.cos(), c.y + 7.0 * theta.sin());
+                painter.line_segment([inner, outer], stroke);
+            }
         }
         ToolbarIcon::ThemeLight => {
             painter.circle_filled(c, 3.0, color);
@@ -2326,7 +2316,8 @@ pub(super) fn accent_button(
     )
 }
 
-fn protected_path_status(reason: ProtectedPathReason, path: &Path) -> String {
+#[cfg(test)]
+fn protected_path_status(reason: crate::cleanup::ProtectedPathReason, path: &Path) -> String {
     format!(
         "Protected path blocked: {} ({})",
         path.display(),
@@ -2334,6 +2325,7 @@ fn protected_path_status(reason: ProtectedPathReason, path: &Path) -> String {
     )
 }
 
+#[cfg(test)]
 fn cleanup_target_missing_status(path: &Path) -> String {
     format!(
         "Move to Trash unavailable: target no longer exists: {}",
@@ -2341,6 +2333,7 @@ fn cleanup_target_missing_status(path: &Path) -> String {
     )
 }
 
+#[cfg(test)]
 fn cleanup_target_inaccessible_status(path: &Path, error: &str) -> String {
     format!(
         "Move to Trash unavailable: cannot verify {}: {}",
@@ -2349,6 +2342,7 @@ fn cleanup_target_inaccessible_status(path: &Path, error: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn current_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2727,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_cache_setting_enables_cache_mode() {
+    fn sqlite_cache_setting_is_ignored_for_simplified_ui() {
         let app = DiskMapApp {
             sqlite_cache_enabled: true,
             safe_storage: SafeStorage::new(&unique_temp_dir()),
@@ -2735,14 +2729,8 @@ mod tests {
         };
         let options = app.scan_options();
 
-        assert_eq!(options.cache_mode, CacheMode::Enabled);
-        assert_eq!(
-            options
-                .cache_path
-                .as_ref()
-                .and_then(|path| path.file_name()),
-            Some(std::ffi::OsStr::new("disk-map-cache.db"))
-        );
+        assert_eq!(options.cache_mode, CacheMode::Disabled);
+        assert!(options.cache_path.is_none());
     }
 
     #[test]
@@ -2798,7 +2786,7 @@ mod tests {
         assert_eq!(prefs.get(STORAGE_INCLUDE_HIDDEN), Some("false"));
         assert_eq!(prefs.get(STORAGE_FOLLOW_SYMLINKS), Some("true"));
         assert_eq!(prefs.get(STORAGE_STAY_ON_FILESYSTEM), Some("true"));
-        assert_eq!(prefs.get(STORAGE_SQLITE_CACHE), Some("true"));
+        assert_eq!(prefs.get(STORAGE_SQLITE_CACHE), Some("false"));
         assert_eq!(prefs.get(STORAGE_SEARCH_FILTER), Some("true"));
         assert_eq!(prefs.get(STORAGE_COLOR_BY_EXTENSION), Some("true"));
         assert_eq!(prefs.get(STORAGE_REALTIME_WATCH), Some("false"));
@@ -2841,7 +2829,7 @@ mod tests {
         assert!(app.follow_symlinks);
         assert!(app.stay_on_filesystem);
         assert!(!app.realtime_watch_enabled);
-        assert!(app.sqlite_cache_enabled);
+        assert!(!app.sqlite_cache_enabled);
         assert!(app.search_filter_enabled);
         assert!(app.color_by_extension);
         assert_eq!(app.recent_roots, vec!["/recent-a", "/recent-b"]);
@@ -2914,7 +2902,7 @@ mod tests {
         assert!(!profile.include_hidden);
         assert!(profile.follow_symlinks);
         assert!(profile.stay_on_filesystem);
-        assert!(profile.sqlite_cache_enabled);
+        assert!(!profile.sqlite_cache_enabled);
         assert!(!profile.realtime_watch_enabled);
 
         let view = restored
@@ -3014,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn start_scan_applies_saved_profile_before_spawning_scanner() {
+    fn start_scan_ignores_hidden_saved_profile_state() {
         let root = unique_temp_path("disk-map-profile-start");
         std::fs::create_dir_all(&root).expect("profile scan test root should be created");
         std::fs::write(root.join("keep.bin"), vec![1_u8; 20 * 1024])
@@ -3032,10 +3020,7 @@ mod tests {
         app.exclude_input.clear();
 
         app.start_scan_path(root.clone());
-        assert!(
-            drain_scan_for_test(&mut app),
-            "profile-backed scan should finish"
-        );
+        assert!(drain_scan_for_test(&mut app), "scan should finish");
 
         let names = app
             .tree
@@ -3044,15 +3029,14 @@ mod tests {
             .map(|node| node.name.as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"keep.bin"));
-        assert!(!names.contains(&"skip.bin"));
-        assert_eq!(app.exclude_input, "skip.bin");
+        assert!(names.contains(&"skip.bin"));
+        assert!(app.exclude_input.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn primary_workflow_smoke_covers_scan_navigation_search_export_watch_cache_and_trash_confirmation(
-    ) {
+    fn primary_workflow_smoke_covers_scan_navigation_search_export_watch_and_trash_confirmation() {
         let storage_dir = unique_temp_dir();
         let root = unique_temp_path("disk-map-smoke");
         let nested = root.join("nested");
@@ -3069,7 +3053,8 @@ mod tests {
 
         app.start_scan_path(root.clone());
         assert!(drain_scan_for_test(&mut app), "smoke scan should finish");
-        assert!(app.sqlite_cache_path().exists());
+        assert_eq!(app.scan_options().cache_mode, CacheMode::Disabled);
+        assert!(app.scan_options().cache_path.is_none());
         app.realtime_watch_enabled = true;
         app.update_watch_state();
         assert!(
@@ -3819,14 +3804,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_root_state_message_reports_empty_finished_folder() {
+    fn empty_root_state_message_reflects_scanning_and_finished_states() {
         let mut app = app_for_scan(1);
+        app.path_input = "/root".into();
         app.apply_scan_message_for_test(root_started(1));
+        app.scan.mark_started();
 
-        let message = app.empty_root_state_message(0).expect("empty root state");
+        let scanning_message = app.empty_root_state_message(0).expect("empty root state");
+        assert_eq!(scanning_message.title, "Waiting for first results");
+        assert!(scanning_message.detail.contains("/root"));
 
-        assert_eq!(message.title, "Empty folder");
-        assert!(message.detail.contains("root"));
+        app.scan.mark_finished(PerfStats::default());
+
+        let finished_message = app.empty_root_state_message(0).expect("empty root state");
+
+        assert_eq!(finished_message.title, "Empty folder");
+        assert!(finished_message.detail.contains("root"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! Command registry for the command palette (Cmd+K).
+//! Command registry for core app actions.
 //!
 //! Each `Command` is a labelled action that takes a `&mut DiskMapApp`
-//! and runs synchronously. The palette UI presents a filtered list
-//! of these commands and runs the chosen one when the user presses
-//! Enter.
+//! and runs synchronously. The GUI no longer exposes a command palette,
+//! but these lightweight actions remain useful for tests and any future
+//! keyboard command surface.
 //!
 //! The registry is static and built once at app startup. We don't
 //! load user-defined commands from disk — a self-use tool doesn't
@@ -11,7 +11,7 @@
 //!
 //! Substring match on `id` + `label` is case-insensitive. That's not
 //! full fuzzy match, but it covers the cases the user actually hits
-//! ("scan", "apply", "open", "export") and avoids pulling in a fuzzy
+//! ("scan", "home", "depth") and avoids pulling in a fuzzy
 //! dep.
 
 use crate::app::DiskMapApp;
@@ -70,77 +70,6 @@ pub fn builtin_commands() -> Vec<Command> {
             hint: "Drill into the currently selected directory",
             run: |app| {
                 let _ = app.enter_selected_directory();
-            },
-        },
-        Command {
-            id: "apply-rules",
-            label: "Apply Rules",
-            hint: "Run all enabled rules against the focused subtree",
-            run: |app| {
-                let _ = app.evaluate_current_rules();
-            },
-        },
-        Command {
-            id: "analyze-duplicates",
-            label: "Analyze duplicates",
-            hint: "Find same-name same-size file groups in the focused subtree",
-            run: |app| app.analyze_duplicate_candidates(),
-        },
-        Command {
-            id: "analyze-insights",
-            label: "Analyze insights",
-            hint: "Compute age + type breakdown for the focused subtree",
-            run: |app| app.analyze_file_insights(),
-        },
-        Command {
-            id: "snapshot-diff",
-            label: "Compare to last snapshot",
-            hint: "Diff the current scan against the previous in-memory snapshot",
-            run: |app| app.update_snapshot_comparison(),
-        },
-        Command {
-            id: "export-diagnostics",
-            label: "Export diagnostics bundle",
-            hint: "Write a snapshot of app state to disk-map-diagnostics-<ts>/",
-            run: |app| {
-                let dest =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                match app.export_diagnostics(&dest) {
-                    Ok(path) => app.status = format!("Wrote diagnostics: {}", path.display()),
-                    Err(e) => app.status = format!("Diagnostics export failed: {e}"),
-                }
-                app.pending_repaint = true;
-            },
-        },
-        Command {
-            id: "export-rules",
-            label: "Export rules to file",
-            hint: "Write the current ruleset to disk-map-rules-<ts>.json",
-            run: |app| {
-                let dest =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                match crate::rules::export_ruleset_to_dir(&app.rules, &dest) {
-                    Ok(path) => app.status = format!("Wrote rules: {}", path.display()),
-                    Err(e) => app.status = format!("Rules export failed: {e}"),
-                }
-                app.pending_repaint = true;
-            },
-        },
-        Command {
-            id: "toggle-watch",
-            label: "Toggle Watch",
-            hint: "Enable or disable filesystem watch for the current scan",
-            run: |app| {
-                app.realtime_watch_enabled = !app.realtime_watch_enabled;
-                app.status = format!(
-                    "Watch {}",
-                    if app.realtime_watch_enabled {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                );
-                app.pending_repaint = true;
             },
         },
         Command {
@@ -237,13 +166,13 @@ mod tests {
     #[test]
     fn case_insensitive_substring_match_on_id() {
         let cmds = vec![Command {
-            id: "export-rules",
-            label: "Export rules to file",
+            id: "scan-root",
+            label: "Rescan from scan root",
             hint: "",
             run: dummy_run,
         }];
-        assert_eq!(filter_commands("rules", &cmds).len(), 1);
-        assert_eq!(filter_commands("EXPORT", &cmds).len(), 1);
+        assert_eq!(filter_commands("root", &cmds).len(), 1);
+        assert_eq!(filter_commands("SCAN", &cmds).len(), 1);
         assert_eq!(filter_commands("exp-rt", &cmds).len(), 0);
     }
 
@@ -263,16 +192,24 @@ mod tests {
     fn builtin_registry_includes_core_commands() {
         let cmds = builtin_commands();
         let ids: Vec<&str> = cmds.iter().map(|c| c.id).collect();
-        for required in [
-            "scan",
-            "go-home",
-            "apply-rules",
-            "export-diagnostics",
-            "toggle-watch",
-        ] {
+        for required in ["scan", "scan-root", "go-home", "go-up", "go-selected"] {
             assert!(
                 ids.contains(&required),
                 "builtin registry missing command: {required}"
+            );
+        }
+        for removed in [
+            "apply-rules",
+            "analyze-duplicates",
+            "analyze-insights",
+            "snapshot-diff",
+            "export-diagnostics",
+            "export-rules",
+            "toggle-watch",
+        ] {
+            assert!(
+                !ids.contains(&removed),
+                "non-core command still registered: {removed}"
             );
         }
         // No duplicates
@@ -286,8 +223,8 @@ mod tests {
     fn builtin_filter_for_typical_queries() {
         let cmds = builtin_commands();
         assert!(filter_commands("scan", &cmds).len() >= 2); // scan + scan-root
-        assert!(filter_commands("export", &cmds).len() >= 2);
-        assert!(filter_commands("toggle", &cmds).len() >= 3);
+        assert_eq!(filter_commands("export", &cmds).len(), 0);
+        assert!(filter_commands("toggle", &cmds).len() >= 2);
         assert!(filter_commands("zzznotacommand", &cmds).is_empty());
     }
 }
