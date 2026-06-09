@@ -78,7 +78,7 @@ pub fn size_basis_label() -> &'static str {
 pub fn size_basis_detail() -> &'static str {
     #[cfg(unix)]
     {
-        "Uses filesystem allocated blocks when available, with apparent byte length as fallback."
+        "Uses filesystem allocated blocks so sparse and virtual files do not count apparent bytes."
     }
 
     #[cfg(not(unix))]
@@ -363,10 +363,7 @@ impl ScanIndex {
     }
 
     fn parent_of(&self, node_id: NodeId) -> Option<NodeId> {
-        self.parents
-            .get(node_index(node_id))
-            .copied()
-            .flatten()
+        self.parents.get(node_index(node_id)).copied().flatten()
     }
 
     fn dir_node_ids(&self) -> &[NodeId] {
@@ -1207,6 +1204,11 @@ fn measured_size_for_file(
             let _ = db.insert(path, measured_size, 0);
             return measured_size;
         };
+        if should_bypass_cached_size(measured_size) {
+            perf_stats.db_cache_misses += 1;
+            let _ = db.insert(path, measured_size, mtime);
+            return measured_size;
+        }
         if let Some(cached_size) = db.get_cached(path, mtime) {
             perf_stats.db_cache_hits += 1;
             return cached_size;
@@ -1215,6 +1217,16 @@ fn measured_size_for_file(
         let _ = db.insert(path, measured_size, mtime);
     }
     measured_size
+}
+
+#[cfg(unix)]
+fn should_bypass_cached_size(measured_size: u64) -> bool {
+    measured_size == 0
+}
+
+#[cfg(not(unix))]
+fn should_bypass_cached_size(_measured_size: u64) -> bool {
+    false
 }
 
 fn modified_secs_for_metadata(metadata: &Metadata) -> Option<u64> {
@@ -1233,20 +1245,22 @@ fn size_on_disk_bytes(metadata: &Metadata) -> u64 {
     #[cfg(unix)]
     {
         // st_blocks is reported in 512-byte units and reflects allocated disk usage,
-        // which avoids treating sparse/cloned files as fully materialized bytes.
-        let allocated = metadata.blocks().saturating_mul(512);
-        if allocated > 0 || metadata.len() == 0 {
-            return allocated;
-        }
+        // including 0 for sparse and virtual files such as /proc/kcore.
+        metadata.blocks().saturating_mul(512)
     }
 
-    metadata.len()
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::write;
+    #[cfg(unix)]
+    use std::fs::File;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(label: &str) -> PathBuf {
@@ -1482,6 +1496,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn sparse_files_do_not_count_apparent_size_as_disk_usage() {
+        let path = temp_path("sparse-blocks");
+        let file = File::create(&path).unwrap();
+        file.set_len(128 * 1024 * 1024).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let measured = size_on_disk_bytes(&metadata);
+
+        assert_eq!(measured, metadata.blocks().saturating_mul(512));
+        if metadata.blocks() == 0 {
+            assert_eq!(metadata.len(), 128 * 1024 * 1024);
+            assert_eq!(measured, 0);
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_allocated_size_bypasses_stale_sqlite_cache_entry() {
+        let file_path = temp_path("zero-allocated-cache-file");
+        write(&file_path, b"metadata source").unwrap();
+        let metadata = std::fs::metadata(&file_path).unwrap();
+        let cache_path = temp_path("zero-allocated-cache-db");
+        let mut db = ScanDb::new(&cache_path).unwrap();
+        db.insert(&file_path, 140_737_471_598_592, 7).unwrap();
+        db.flush().unwrap();
+        let mut stats = PerfStats::default();
+
+        let measured =
+            measured_size_for_file(&file_path, &metadata, Some(7), 0, Some(&mut db), &mut stats);
+
+        assert_eq!(measured, 0);
+        assert_eq!(db.get_cached(&file_path, 7), Some(0));
+        assert_eq!(stats.db_cache_hits, 0);
+        assert_eq!(stats.db_cache_misses, 1);
+
+        let _ = std::fs::remove_file(file_path);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn root_device_id_matches_metadata_device() {
         let path = temp_path("root-device");
         write(&path, b"disk-map").unwrap();
@@ -1556,7 +1613,12 @@ mod tests {
 
         aggregate_state.add_file(root, 10);
         aggregate_state.add_file(root, 20);
-        emit_aggregate_nodes(&mut scan_index, &mut aggregate_state, &mut batch, &mut stats);
+        emit_aggregate_nodes(
+            &mut scan_index,
+            &mut aggregate_state,
+            &mut batch,
+            &mut stats,
+        );
 
         assert_eq!(scan_index.len(), 2);
         assert_eq!(stats.nodes_discovered, 1);

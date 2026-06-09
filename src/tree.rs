@@ -183,7 +183,11 @@ impl TreeStore {
         query_lower: &str,
         lowercase_scratch: &mut String,
     ) -> bool {
-        name_matches_query(&self.nodes[node_index(id)].name, query_lower, lowercase_scratch)
+        name_matches_query(
+            &self.nodes[node_index(id)].name,
+            query_lower,
+            lowercase_scratch,
+        )
     }
 
     pub fn ancestors(&self, mut id: NodeId) -> Vec<NodeId> {

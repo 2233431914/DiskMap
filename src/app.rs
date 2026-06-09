@@ -681,9 +681,9 @@ impl eframe::App for DiskMapApp {
 
         egui::Panel::right("details_panel")
             .resizable(true)
-            .default_size(280.0)
-            .min_size(260.0)
-            .max_size(340.0)
+            .default_size(320.0)
+            .min_size(280.0)
+            .max_size(420.0)
             .show_inside(ui, |ui| self.show_details_panel(ui));
 
         egui::Panel::bottom("status_bar")
@@ -706,13 +706,6 @@ impl eframe::App for DiskMapApp {
 }
 
 impl DiskMapApp {
-    // The toolbar is intentionally kept in `app.rs` rather than moved to
-    // `app/panels/toolbar.rs`: it composes 25+ fields (path input, exclude
-    // input, all scan-option toggles, search bar, depth controls, nav
-    // buttons, roots menu) and ~30 method calls. Splitting it would either
-    // require exposing a wide slice of `DiskMapApp` internals or threading
-    // a "view" struct through every helper. Cost/benefit is poor for a
-    // single per-frame renderer. Revisit if app.rs grows further.
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if icon_button(ui, self.navigation.can_go_back(), ToolbarIcon::ArrowLeft)
@@ -762,8 +755,7 @@ impl DiskMapApp {
 
             ui.add_space(4.0);
 
-            let path_width = ui.available_width().clamp(220.0, 420.0) - 280.0;
-            let path_width = path_width.max(200.0);
+            let path_width = (ui.available_width() - 240.0).clamp(200.0, 560.0);
             let path_edit = ui.add_sized(
                 [path_width, 28.0],
                 egui::TextEdit::singleline(&mut self.path_input).hint_text("/path/to/scan"),
@@ -818,115 +810,6 @@ impl DiskMapApp {
                 self.rescan_focused_subtree();
             }
 
-            ui.add_space(6.0);
-
-            ui.label(
-                RichText::new("EXCLUDE")
-                    .size(10.0)
-                    .color(palette(ui.ctx()).text_faint)
-                    .strong(),
-            );
-            ui.add_sized(
-                [150.0, 28.0],
-                egui::TextEdit::singleline(&mut self.exclude_input)
-                    .hint_text(".git,node_modules,target"),
-            );
-
-            ui.add_space(4.0);
-            ui.checkbox(&mut self.include_hidden, "Hidden")
-                .on_hover_text("Include hidden files and folders");
-            ui.checkbox(&mut self.follow_symlinks, "Links")
-                .on_hover_text("Follow symlinked directories during scan");
-            ui.checkbox(&mut self.stay_on_filesystem, "Same FS")
-                .on_hover_text("Stay on the scan root filesystem when supported");
-
-            let before_watch = self.realtime_watch_enabled;
-            ui.checkbox(&mut self.realtime_watch_enabled, "Watch")
-                .on_hover_text("Watch the scan root and rescan after debounced filesystem changes");
-            if self.realtime_watch_enabled != before_watch {
-                self.update_watch_state();
-            }
-            ui.checkbox(&mut self.sqlite_cache_enabled, "SQLite")
-                .on_hover_text("Experimental scan cache for faster rescans");
-
-            ui.add_space(6.0);
-
-            let search_response = ui.add_sized(
-                [180.0, 28.0],
-                egui::TextEdit::singleline(self.search.input_mut())
-                    .hint_text("Search files & folders"),
-            );
-            if search_response.changed() {
-                self.mark_search_dirty();
-            }
-            if search_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
-            {
-                if ui.input(|input| input.modifiers.shift) {
-                    self.navigate_search_match(SearchDirection::Previous);
-                } else {
-                    self.navigate_search_match(SearchDirection::Next);
-                }
-            }
-            ui.add_space(2.0);
-            if icon_button(
-                ui,
-                self.can_navigate_search_matches(),
-                ToolbarIcon::ArrowLeft,
-            )
-            .on_hover_text("Previous search match")
-            .clicked()
-            {
-                self.navigate_search_match(SearchDirection::Previous);
-            }
-            if icon_button(
-                ui,
-                self.can_navigate_search_matches(),
-                ToolbarIcon::ArrowRight,
-            )
-            .on_hover_text("Next search match")
-            .clicked()
-            {
-                self.navigate_search_match(SearchDirection::Next);
-            }
-            if !self.search.input().is_empty()
-                && icon_button(ui, true, ToolbarIcon::Close)
-                    .on_hover_text("Clear search")
-                    .clicked()
-            {
-                self.clear_search();
-            }
-            if ui
-                .checkbox(&mut self.search_filter_enabled, "Filter")
-                .on_hover_text("Show only search matches and their ancestor folders")
-                .changed()
-            {
-                self.mark_layout_dirty_now();
-            }
-
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("DEPTH")
-                    .size(10.0)
-                    .color(palette(ui.ctx()).text_faint)
-                    .strong(),
-            );
-            if ui
-                .add_sized(
-                    [96.0, 18.0],
-                    egui::Slider::new(&mut self.max_depth, 1..=10).text(""),
-                )
-                .changed()
-            {
-                self.mark_layout_dirty_now();
-            }
-            if ui
-                .checkbox(&mut self.color_by_extension, "Ext")
-                .on_hover_text("Color files by extension")
-                .changed()
-            {
-                self.mark_layout_dirty_now();
-            }
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(theme) = theme_cycle_button(ui) {
                     self.theme_preference = Some(theme);
@@ -962,10 +845,6 @@ impl DiskMapApp {
 
     fn show_cleanup_queue_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
         panels::sections::show_cleanup_queue_section(ui, p, self);
-    }
-
-    fn show_search_section(&self, ui: &mut egui::Ui, p: &Palette) {
-        panels::sections::show_search_section(ui, p, self);
     }
 
     fn show_snapshot_diff_section(&self, ui: &mut egui::Ui, p: &Palette) {
@@ -2198,7 +2077,6 @@ enum ToolbarIcon {
     Up,
     Home,
     Refresh,
-    Close,
     ThemeLight,
     ThemeDark,
 }
@@ -2288,22 +2166,6 @@ fn paint_toolbar_icon(
             let end = Pos2::new(c.x + r * end_angle.cos(), c.y + r * end_angle.sin());
             painter.line_segment([end, Pos2::new(end.x - 2.5, end.y - 3.5)], stroke);
             painter.line_segment([end, Pos2::new(end.x + 3.5, end.y - 1.5)], stroke);
-        }
-        ToolbarIcon::Close => {
-            painter.line_segment(
-                [
-                    Pos2::new(c.x - 4.5, c.y - 4.5),
-                    Pos2::new(c.x + 4.5, c.y + 4.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    Pos2::new(c.x - 4.5, c.y + 4.5),
-                    Pos2::new(c.x + 4.5, c.y - 4.5),
-                ],
-                stroke,
-            );
         }
         ToolbarIcon::ThemeLight => {
             painter.circle_filled(c, 3.0, color);

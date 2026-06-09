@@ -2,6 +2,7 @@
 //! export and analysis entry points. Extracted from `app.rs` so the panel
 //! layout reads top-to-bottom in one file.
 
+use super::super::search_nav::SearchDirection;
 use super::super::DiskMapApp;
 use crate::app::{accent_button, describe_node_kind, palette, section_divider};
 use crate::export::ExportFormat;
@@ -15,6 +16,18 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     let p = palette(ui.ctx());
     ui.add_space(4.0);
+    ui.label(
+        RichText::new("CONTROLS")
+            .size(11.0)
+            .strong()
+            .color(p.text_muted),
+    );
+    ui.add_space(2.0);
+    section_divider(ui, p);
+    ui.add_space(8.0);
+    show_controls_section(ui, app, p);
+    app.show_filter_presets_section(ui, p);
+    ui.add_space(12.0);
     ui.label(
         RichText::new("DETAILS")
             .size(11.0)
@@ -33,7 +46,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         app.show_state_message(ui, p, &app.no_root_state_message());
         app.show_progress_section(ui, p);
         app.show_scan_issue_section(ui, p);
-        app.show_search_section(ui, p);
         return;
     };
 
@@ -434,7 +446,157 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     app.show_duplicate_report_section(ui, p);
     app.show_insight_report_section(ui, p);
     app.show_rules_section(ui, p);
-    app.show_filter_presets_section(ui, p);
     app.show_diagnostics_section(ui, p);
-    app.show_search_section(ui, p);
+}
+
+fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app::Palette) {
+    ui.label(
+        RichText::new("SEARCH")
+            .size(10.0)
+            .strong()
+            .color(p.text_faint),
+    );
+    ui.add_space(4.0);
+    let search_response = ui.add_sized(
+        [ui.available_width(), 28.0],
+        egui::TextEdit::singleline(app.search.input_mut()).hint_text("Search files & folders"),
+    );
+    if search_response.changed() {
+        app.mark_search_dirty();
+    }
+    if search_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+        if ui.input(|input| input.modifiers.shift) {
+            app.navigate_search_match(SearchDirection::Previous);
+        } else {
+            app.navigate_search_match(SearchDirection::Next);
+        }
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let can_nav = app.can_navigate_search_matches();
+        if ui
+            .add_enabled(
+                can_nav,
+                egui::Button::new("<").min_size(Vec2::new(30.0, 26.0)),
+            )
+            .on_hover_text("Previous search match")
+            .clicked()
+        {
+            app.navigate_search_match(SearchDirection::Previous);
+        }
+        if ui
+            .add_enabled(
+                can_nav,
+                egui::Button::new(">").min_size(Vec2::new(30.0, 26.0)),
+            )
+            .on_hover_text("Next search match")
+            .clicked()
+        {
+            app.navigate_search_match(SearchDirection::Next);
+        }
+        if ui
+            .add_enabled(
+                !app.search.input().is_empty(),
+                egui::Button::new("Clear").min_size(Vec2::new(52.0, 26.0)),
+            )
+            .on_hover_text("Clear search")
+            .clicked()
+        {
+            app.clear_search();
+        }
+        if ui
+            .checkbox(&mut app.search_filter_enabled, "Filter")
+            .on_hover_text("Show only search matches and their ancestor folders")
+            .changed()
+        {
+            app.mark_layout_dirty_now();
+        }
+    });
+    let match_text = if app.search.query().is_empty() {
+        "No search query".to_string()
+    } else if app.search.is_dirty() {
+        format!("{} matches · Updating...", app.search.state().match_count())
+    } else if let Some(index) = app.search.active_match() {
+        format!(
+            "{} / {} matches",
+            index + 1,
+            app.search.state().match_count()
+        )
+    } else {
+        format!("{} matches", app.search.state().match_count())
+    };
+    ui.label(
+        RichText::new(match_text)
+            .small()
+            .color(if app.search.is_dirty() {
+                p.accent
+            } else {
+                p.text_muted
+            }),
+    );
+
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new("SCAN CONDITIONS")
+            .size(10.0)
+            .strong()
+            .color(p.text_faint),
+    );
+    ui.add_space(4.0);
+    ui.add_sized(
+        [ui.available_width(), 28.0],
+        egui::TextEdit::singleline(&mut app.exclude_input).hint_text(".git,node_modules,target"),
+    )
+    .on_hover_text("Excluded names or path fragments; comma, semicolon, or newline separated");
+    ui.add_space(4.0);
+    ui.columns(2, |cols| {
+        cols[0]
+            .checkbox(&mut app.include_hidden, "Hidden")
+            .on_hover_text("Include hidden files and folders");
+        cols[1]
+            .checkbox(&mut app.follow_symlinks, "Links")
+            .on_hover_text("Follow symlinked directories during scan");
+    });
+    ui.columns(2, |cols| {
+        cols[0]
+            .checkbox(&mut app.stay_on_filesystem, "Same FS")
+            .on_hover_text("Stay on the scan root filesystem when supported");
+        let before_watch = app.realtime_watch_enabled;
+        cols[1]
+            .checkbox(&mut app.realtime_watch_enabled, "Watch")
+            .on_hover_text("Watch the scan root and rescan after debounced filesystem changes");
+        if app.realtime_watch_enabled != before_watch {
+            app.update_watch_state();
+        }
+    });
+    ui.checkbox(&mut app.sqlite_cache_enabled, "SQLite cache")
+        .on_hover_text("Experimental scan cache for faster rescans");
+
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new("VIEW")
+            .size(10.0)
+            .strong()
+            .color(p.text_faint),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Depth").small().color(p.text_muted));
+        if ui
+            .add_sized(
+                [ui.available_width().max(120.0), 18.0],
+                egui::Slider::new(&mut app.max_depth, 1..=10).text(""),
+            )
+            .changed()
+        {
+            app.mark_layout_dirty_now();
+        }
+    });
+    if ui
+        .checkbox(&mut app.color_by_extension, "Color by extension")
+        .on_hover_text("Color files by extension")
+        .changed()
+    {
+        app.mark_layout_dirty_now();
+    }
 }

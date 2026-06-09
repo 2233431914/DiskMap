@@ -154,46 +154,6 @@ pub fn show_cleanup_queue_section(ui: &mut egui::Ui, p: &Palette, app: &mut Disk
     }
 }
 
-pub fn show_search_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMapApp) {
-    let query = app.search.query();
-    if query.is_empty() {
-        return;
-    }
-    ui.add_space(12.0);
-    ui.label(
-        RichText::new("SEARCH")
-            .size(10.0)
-            .strong()
-            .color(p.text_faint),
-    );
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(format!("Query: {query}"))
-            .small()
-            .color(p.text_muted),
-    );
-    let match_text = if app.search.is_dirty() {
-        format!("{} matches · Updating…", app.search.state().match_count())
-    } else if let Some(index) = app.search.active_match() {
-        format!(
-            "{} / {} matches · Ready",
-            index + 1,
-            app.search.state().match_count()
-        )
-    } else {
-        format!("{} matches · Ready", app.search.state().match_count())
-    };
-    ui.label(
-        RichText::new(match_text)
-            .small()
-            .color(if app.search.is_dirty() {
-                p.accent
-            } else {
-                p.text_muted
-            }),
-    );
-}
-
 pub fn show_snapshot_diff_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMapApp) {
     let Some(diff) = &app.snapshot_diff else {
         return;
