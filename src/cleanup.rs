@@ -1,5 +1,6 @@
+use crate::platform::{self, PlatformProtectedPathReason};
 use crate::tree::{NodeId, NodeKind};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupCandidate {
@@ -122,21 +123,13 @@ pub fn protected_path_reason_with_deny_list(
         }
     }
 
-    let components = path.components().collect::<Vec<_>>();
-    let [Component::RootDir, Component::Normal(first), rest @ ..] = components.as_slice() else {
-        return None;
-    };
-    let first = first.to_string_lossy();
-
-    if first == "Volumes" && rest.len() <= 1 {
-        return Some(ProtectedPathReason::MountedVolumeRoot);
-    }
-
-    if matches!(
-        first.as_ref(),
-        "Applications" | "Library" | "System" | "bin" | "etc" | "private" | "sbin" | "usr" | "var"
-    ) {
-        return Some(ProtectedPathReason::SystemLocation);
+    if let Some(reason) = platform::protected_path_reason(path) {
+        return Some(match reason {
+            PlatformProtectedPathReason::SystemLocation => ProtectedPathReason::SystemLocation,
+            PlatformProtectedPathReason::MountedVolumeRoot => {
+                ProtectedPathReason::MountedVolumeRoot
+            }
+        });
     }
 
     if user_deny_list
@@ -224,14 +217,27 @@ mod tests {
             protected_path_reason(Path::new("/")),
             Some(ProtectedPathReason::FilesystemRoot)
         );
-        assert_eq!(
-            protected_path_reason(Path::new("/System/Library")),
-            Some(ProtectedPathReason::SystemLocation)
-        );
-        assert_eq!(
-            protected_path_reason(Path::new("/Volumes/External")),
-            Some(ProtectedPathReason::MountedVolumeRoot)
-        );
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                protected_path_reason(Path::new("/System/Library")),
+                Some(ProtectedPathReason::SystemLocation)
+            );
+            assert_eq!(
+                protected_path_reason(Path::new("/Volumes/External")),
+                Some(ProtectedPathReason::MountedVolumeRoot)
+            );
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(
+                protected_path_reason(Path::new("/proc/self")),
+                Some(ProtectedPathReason::SystemLocation)
+            );
+            assert_eq!(
+                protected_path_reason(Path::new("/media/user/External")),
+                Some(ProtectedPathReason::MountedVolumeRoot)
+            );
+        }
+
         assert_eq!(protected_path_reason(Path::new("/tmp/file.txt")), None);
     }
 

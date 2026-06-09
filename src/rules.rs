@@ -21,10 +21,11 @@
 //! post-walk aggregation, not per-node matching. It can be added as a
 //! new `RulePredicate` variant later without breaking the data model.
 
+use crate::platform;
 use crate::tree::{Node, NodeId, NodeKind, TreeStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Cap on how many hits `evaluate_rules` will collect and return.
 /// Matches the convention in `insights::INSIGHT_REPORT_LIMIT` so the
@@ -165,6 +166,15 @@ pub struct RuleImportPreview {
 /// written to `reason_out` and a heuristic `score` (0-100) for
 /// ranking. Read-only: never mutates anything.
 pub fn matches(rule: &Rule, node: &Node, ctx: &RuleContext) -> Option<(u32, String)> {
+    matches_with_path(rule, node, None, ctx)
+}
+
+fn matches_with_path(
+    rule: &Rule,
+    node: &Node,
+    real_path: Option<&Path>,
+    ctx: &RuleContext,
+) -> Option<(u32, String)> {
     if !rule.enabled {
         return None;
     }
@@ -224,15 +234,13 @@ pub fn matches(rule: &Rule, node: &Node, ctx: &RuleContext) -> Option<(u32, Stri
             }
         }
         RulePredicate::AlwaysProtected { path_pattern } => {
-            // We don't have the real path on the Node itself; we
-            // accept a "best-effort" match using node.name for
-            // top-level entries and rely on the caller (rule editor
-            // UI or future scan-aware version) to refine.
-            let name_match = node.name == path_pattern.trim_start_matches('/');
-            if name_match {
+            let path = real_path?;
+            if platform::protected_path_reason(path).is_some()
+                && path_matches_pattern(path, path_pattern)
+            {
                 Some((
                     100,
-                    format!("name matches protected pattern {path_pattern}"),
+                    format!("protected path {} matches {path_pattern}", path.display()),
                 ))
             } else {
                 None
@@ -279,12 +287,13 @@ fn walk(
     if hits.len() >= limit {
         return;
     }
+    let real_path = tree.node_real_path(node_id);
     let node = tree.node(node_id).clone();
     for rule in &rules.rules {
         if hits.len() >= limit {
             return;
         }
-        if let Some((score, reason)) = matches(rule, &node, ctx) {
+        if let Some((score, reason)) = matches_with_path(rule, &node, real_path.as_deref(), ctx) {
             hits.push(RuleHit {
                 rule_id: rule.id.clone(),
                 node_id,
@@ -345,39 +354,18 @@ pub fn default_ruleset() -> RuleSet {
         predicate: RulePredicate::Symlink,
         enabled: false,
     });
-    set.add(Rule {
-        id: "protected-system".into(),
-        name: "System location".into(),
-        description: "Top-level /System entry. Destructive actions against this are blocked."
-            .into(),
-        category: RuleCategory::ProtectedPath,
-        predicate: RulePredicate::AlwaysProtected {
-            path_pattern: "System".into(),
-        },
-        enabled: true,
-    });
-    set.add(Rule {
-        id: "protected-library".into(),
-        name: "Library location".into(),
-        description: "Top-level /Library entry. Destructive actions against this are blocked."
-            .into(),
-        category: RuleCategory::ProtectedPath,
-        predicate: RulePredicate::AlwaysProtected {
-            path_pattern: "Library".into(),
-        },
-        enabled: true,
-    });
-    set.add(Rule {
-        id: "protected-applications".into(),
-        name: "Applications location".into(),
-        description: "Top-level /Applications entry. Destructive actions against this are blocked."
-            .into(),
-        category: RuleCategory::ProtectedPath,
-        predicate: RulePredicate::AlwaysProtected {
-            path_pattern: "Applications".into(),
-        },
-        enabled: true,
-    });
+    for protected in platform::default_protected_path_rules() {
+        set.add(Rule {
+            id: protected.id.into(),
+            name: protected.name.into(),
+            description: protected.description.into(),
+            category: RuleCategory::ProtectedPath,
+            predicate: RulePredicate::AlwaysProtected {
+                path_pattern: protected.path_pattern.into(),
+            },
+            enabled: true,
+        });
+    }
     set
 }
 
@@ -529,6 +517,30 @@ fn score_for_age(actual_days: u64, threshold_days: u64) -> u32 {
     let ratio = (actual_days / threshold_days.max(1)) as f64;
     let score = 30.0_f64 + (ratio.log10().max(0.0) * 30.0);
     score.round().clamp(0.0, 100.0) as u32
+}
+
+fn path_matches_pattern(path: &Path, path_pattern: &str) -> bool {
+    let pattern_parts = path_pattern
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty());
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+
+    let mut saw_pattern = false;
+    for pattern_part in pattern_parts {
+        saw_pattern = true;
+        let Some(Component::Normal(component)) = components.next() else {
+            return false;
+        };
+        if component.to_string_lossy() != pattern_part {
+            return false;
+        }
+    }
+
+    saw_pattern
 }
 
 #[cfg(test)]
@@ -726,15 +738,52 @@ mod tests {
     }
 
     #[test]
+    fn protected_rules_use_real_paths_instead_of_node_names() {
+        let mut rules = RuleSet::new();
+        rules.add(Rule {
+            id: "protected-usr".into(),
+            name: "Protected usr".into(),
+            description: "".into(),
+            category: RuleCategory::ProtectedPath,
+            predicate: RulePredicate::AlwaysProtected {
+                path_pattern: "usr".into(),
+            },
+            enabled: true,
+        });
+        let ctx = RuleContext::default();
+
+        let mut project_tree = TreeStore::new();
+        let project_root = project_tree.add_node(None, "project".into(), NodeKind::Dir, 0);
+        project_tree.set_root_path("/home/user/project".into());
+        project_tree.add_node(Some(project_root), "usr".into(), NodeKind::Dir, 0);
+        assert!(
+            evaluate_rules(&rules, &mut project_tree, project_root, &ctx, 100).is_empty(),
+            "a project directory named usr should not be reported as a protected system path"
+        );
+
+        let mut system_tree = TreeStore::new();
+        let system_root = system_tree.add_node(None, "usr".into(), NodeKind::Dir, 0);
+        system_tree.set_root_path("/usr".into());
+        let hits = evaluate_rules(&rules, &mut system_tree, system_root, &ctx, 100);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node_id, system_root);
+    }
+
+    #[test]
     fn default_ruleset_has_seven_rules() {
         let rules = default_ruleset();
-        assert_eq!(rules.rules.len(), 7);
+        assert_eq!(
+            rules.rules.len(),
+            4 + crate::platform::default_protected_path_rules().len()
+        );
         assert!(
             rules.enabled_count() >= 5,
             "most defaults should be enabled"
         );
         assert!(rules.get("large-file-1gb").is_some());
-        assert!(rules.get("protected-system").is_some());
+        assert!(crate::platform::default_protected_path_rules()
+            .iter()
+            .all(|rule| rules.get(rule.id).is_some()));
     }
 
     #[test]

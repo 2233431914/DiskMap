@@ -13,7 +13,7 @@ use crate::app::{
     CONTEXT_MENU_MIN_WIDTH, LAYOUT_REFRESH_INTERVAL,
 };
 use crate::format::format_bytes;
-use crate::platform::{open_path, reveal_in_finder};
+use crate::platform::{open_path, reveal_action_label, reveal_in_file_manager};
 use crate::treemap::{layout_treemap, TreemapLayoutParams, VisualKind};
 use eframe::egui::{self, RichText, Sense, Vec2};
 use std::time::Instant;
@@ -146,13 +146,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                 if ui
                     .add_enabled(
                         node_path.is_some(),
-                        egui::Button::new("Reveal in Finder")
+                        egui::Button::new(reveal_action_label())
                             .min_size(Vec2::new(ui.available_width(), 24.0)),
                     )
                     .clicked()
                 {
                     if let Some(path) = &node_path {
-                        app.apply_platform_result("Reveal", reveal_in_finder(path));
+                        app.apply_platform_result(
+                            reveal_action_label(),
+                            reveal_in_file_manager(path),
+                        );
                     }
                     ui.close();
                 }

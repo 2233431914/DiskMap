@@ -1,10 +1,11 @@
 # AGENTS.md
 
 Engineering conventions for human and AI contributors working on DiskMap.
-Project context: personal-use macOS tool, MVP feature-complete, single user,
-single repo. Optimize for: **UX speed, stability, fast iteration**. Do **not**
-optimize for: cross-platform distribution, external-contributor friendliness,
-or compatibility with old eframe/egui versions.
+Project context: personal-use macOS and Linux desktop tool, MVP
+feature-complete, single user, single repo. Optimize for: **UX speed,
+stability, fast iteration**. Do **not** optimize for broad cross-platform
+distribution, external-contributor friendliness, or compatibility with old
+eframe/egui versions.
 
 ## Project Layout
 
@@ -26,14 +27,14 @@ disk-map/
     ├── scanner.rs     # jwalk parallel traversal, batched channel messages
     ├── tree.rs        # TreeStore / Node / NodeId — core data model
     ├── treemap.rs     # Squarified layout, search state, visual nodes
-    ├── watcher.rs     # notify (FSEvents/kqueue) debounce
+    ├── watcher.rs     # notify platform backend debounce
     ├── cleanup.rs     # CleanupQueue, protected-path guardrails
     ├── duplicates.rs  # read-only name+size duplicate candidates
     ├── insights.rs    # read-only age/type insight report
     ├── snapshot.rs    # capture + diff for snapshot comparison
     ├── export.rs      # CSV/JSON focused report export
     ├── db.rs          # experimental rusqlite scan cache
-    ├── platform.rs    # macOS open/reveal/trash adapters
+    ├── platform.rs    # platform open/reveal/trash/storage adapters
     └── format.rs      # byte size + duration formatting
 ```
 
@@ -144,8 +145,8 @@ Do not add new phases without a discussion first.
 
 - Rust 1.85+, edition 2021. `rustup` not required but the project does not
   pin a toolchain; homebrew rustc is fine.
-- macOS 13+ for `notify` / FSEvents; the code compiles on Linux but is
-  untested there.
+- macOS 13+ or a current Linux desktop. Linux builds need the native
+  `eframe`/`winit` GUI dependencies documented in README.md.
 - No `rust-toolchain` file. Add one only when reproducing a specific build
   becomes a problem.
 - No CI config. Add `.github/workflows/ci.yml` if / when you stop running

@@ -12,6 +12,7 @@
 //! is left to eframe's own storage since it's small and infrequently
 //! written.
 
+use crate::platform;
 use crate::profiles::ProfileStore;
 use crate::rules::{default_ruleset, RuleSet};
 use crate::views::{FilterStore, ViewStore};
@@ -130,6 +131,7 @@ impl SafeStorage {
     /// 1. Serialize to JSON.
     /// 2. Write to `disk-map-prefs.json.tmp` and `sync_all()` (fsync).
     /// 3. `rename` over the final file — atomic on POSIX.
+    /// 4. Best-effort directory `fsync` after the rename for durability.
     ///
     /// On crash between any two steps, the previous on-disk file remains
     /// intact and the temp file may be partially written. The next read
@@ -145,16 +147,16 @@ impl SafeStorage {
             f.write_all(json.as_bytes()).context("write to temp file")?;
             f.sync_all().context("fsync temp file")?;
         }
-        // fsync the directory so the rename is durable. Best-effort —
-        // some filesystems (e.g. some FUSE) don't support it; ignore the
-        // error rather than fail the whole write.
+        fs::rename(&self.tmp_path, &self.path)
+            .with_context(|| format!("atomic rename to {}", self.path.display()))?;
+        // fsync the directory after rename so the new directory entry is
+        // durable on Linux filesystems that require it. Best-effort —
+        // some filesystems (e.g. some FUSE) don't support it.
         if let Some(parent) = self.path.parent() {
             if let Ok(dir) = fs::File::open(parent) {
                 let _ = dir.sync_all();
             }
         }
-        fs::rename(&self.tmp_path, &self.path)
-            .with_context(|| format!("atomic rename to {}", self.path.display()))?;
         Ok(())
     }
 
@@ -199,20 +201,8 @@ impl SafeStorage {
 }
 
 /// Best-effort resolution of the per-user app data directory.
-///
-/// On macOS, this is `$HOME/Library/Application Support/<app_id>`. We
-/// intentionally do not use the `dirs` crate to keep the dependency
-/// surface small — the layout is stable on macOS (the only target
-/// that matters for this app).
 pub fn app_data_dir(app_id: &str) -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join(app_id);
-        return path;
-    }
-    PathBuf::from("/tmp").join(app_id)
+    platform::app_data_dir(app_id)
 }
 
 #[cfg(test)]

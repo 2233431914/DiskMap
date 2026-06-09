@@ -5,7 +5,7 @@
 **Project Name:** DiskMap
 **Type:** Native desktop disk analysis tool
 **Core Feature:** Scan directories and visualize space usage with Treemap
-**Target:** macOS (primary), similar to SpaceSniffer
+**Target:** macOS and Linux desktop, similar to SpaceSniffer
 
 ## 2. Technology Stack
 
@@ -15,7 +15,7 @@
 - **In-memory tree aggregation:** Custom TreeStore
 - **Treemap rendering:** egui::Painter (custom drawing)
 - **Shell open:** open (v5)
-- **Preference persistence:** eframe native storage/window persistence
+- **Preference persistence:** crash-safe app data JSON for app state/preferences; eframe native window persistence
 - **Experimental cache:** rusqlite (implemented, disabled by default)
 
 ## 3. Features (Current Implemented Scope)
@@ -28,7 +28,7 @@
 - [x] Treemap visualization by area (Squarified Treemap algorithm)
 - [x] Hover tooltip showing path and size
 - [x] Left-click to select, double-click to drill into directory
-- [x] Right-click context menu: Open / Reveal in Finder / Copy Path / Move to Trash
+- [x] Right-click context menu: Open / Reveal in Finder or Open Containing Folder / Copy Path / Move to Trash
 - [x] Search result navigation with Previous/Next and Enter/Shift+Enter
 - [x] Search filter mode showing only matches and ancestor folders
 - [x] Small-file aggregation as virtual "Other Files" nodes
@@ -53,7 +53,7 @@
 ### 3.3 Sidebar Features
 - [x] Current directory path display
 - [x] Current directory size display
-- [x] Open in Finder button
+- [x] Open and platform file-manager action buttons
 
 ### 3.4 Navigation
 - [x] Breadcrumb path display
@@ -155,9 +155,9 @@ struct TreeStore {
 
 ## 7. Platform Integration
 
-### 7.1 macOS Specific
-- `open -R <path>` for Reveal in Finder
-- `open <path>` for Open
+### 7.1 Platform Shell Integration
+- macOS: `open -R <path>` for Reveal in Finder, `open <path>` for Open
+- Linux and other desktops: `open` crate integration for Open; the file-manager action opens the directory itself or the selected file's containing directory
 
 ### 7.2 Clipboard
 - Copy full path string through egui clipboard integration
@@ -178,7 +178,7 @@ struct TreeStore {
 │ Current:  │                                      │
 │ Size:     │         TREEMAP CANVAS                │
 │ [Open]    │         (egui::Painter)               │
-│ [Reveal]  │                                      │
+│ [Show]    │                                      │
 │           │                                      │
 └────────────┴──────────────────────────────────────┘
 ```
@@ -222,7 +222,7 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - Decision: do not expose a size basis toggle yet. `TreeStore` currently stores one canonical size per node, and scanner/cache/export paths do not retain both apparent and allocated sizes. A future toggle must first add dual-size fields and migration tests so switching basis changes aggregation, treemap area, progress, and exports consistently.
 
 ### Phase 5: Real-time Monitoring
-- [x] Add notify crate (FSEvents/kqueue)
+- [x] Add notify crate (platform backend: FSEvents/kqueue/inotify as available)
 - [x] Debounce 300-1000ms
 - [x] Add default-on Watch control for debounced scan-root rescans after filesystem changes
 - Watch is enabled by default and observes the current scan root. Users can disable it for the current session from the toolbar.

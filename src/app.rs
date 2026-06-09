@@ -3419,7 +3419,8 @@ mod tests {
     #[test]
     fn cleanup_queue_is_available_without_enable_toggle() {
         let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
+        let root = unique_temp_path("disk-map-cleanup-queue");
+        app.tree.set_root_path(root);
 
         app.queue_cleanup_candidate(2);
 
@@ -3431,7 +3432,8 @@ mod tests {
     #[test]
     fn trash_action_queues_real_path_before_confirmation() {
         let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
+        let root = unique_temp_path("disk-map-trash-queue-file");
+        app.tree.set_root_path(root.clone());
         let active_scan_id = app.scan.active_id();
 
         app.queue_cleanup_candidate(2);
@@ -3439,7 +3441,7 @@ mod tests {
         assert_eq!(app.cleanup_queue.len(), 1);
         assert_eq!(
             app.cleanup_queue.candidates()[0].path,
-            PathBuf::from("/root/match-dir/match-file")
+            root.join("match-dir").join("match-file")
         );
         assert_eq!(app.cleanup_queue.candidates()[0].item_count, 1);
         assert_eq!(app.trash_confirm_target_id, None);
@@ -3497,13 +3499,14 @@ mod tests {
     #[test]
     fn trash_action_queues_directories_with_affected_item_count() {
         let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
+        let root = unique_temp_path("disk-map-trash-queue-dir");
+        app.tree.set_root_path(root.clone());
 
         app.queue_cleanup_candidate(1);
 
         assert_eq!(app.cleanup_queue.len(), 1);
         let candidate = &app.cleanup_queue.candidates()[0];
-        assert_eq!(candidate.path, PathBuf::from("/root/match-dir"));
+        assert_eq!(candidate.path, root.join("match-dir"));
         assert_eq!(candidate.kind, NodeKind::Dir);
         assert_eq!(candidate.item_count, 2);
     }
@@ -3527,10 +3530,11 @@ mod tests {
     #[test]
     fn queued_trash_rechecks_user_protected_paths_before_confirmation() {
         let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
+        let root = unique_temp_path("disk-map-trash-user-protected");
+        app.tree.set_root_path(root.clone());
 
         app.queue_cleanup_candidate(2);
-        app.protected_paths_input = "/root/match-dir".into();
+        app.protected_paths_input = root.join("match-dir").display().to_string();
         app.arm_or_confirm_queued_trash(2);
 
         assert_eq!(app.trash_confirm_target_id, None);
@@ -3569,13 +3573,16 @@ mod tests {
     #[test]
     fn cleanup_queue_blocks_user_protected_paths() {
         let mut app = app_with_search_matches();
-        app.protected_paths_input = "/root/match-dir".into();
+        let root = unique_temp_path("disk-map-cleanup-user-protected");
+        app.tree.set_root_path(root.clone());
+        app.protected_paths_input = root.join("match-dir").display().to_string();
 
         app.queue_cleanup_candidate(2);
 
-        assert!(app
-            .status
-            .contains("Protected path blocked: /root/match-dir/match-file"));
+        assert!(app.status.contains(&format!(
+            "Protected path blocked: {}",
+            root.join("match-dir").join("match-file").display()
+        )));
         assert!(app.status.contains("user protected path"));
         assert!(app.cleanup_queue.is_empty());
     }
@@ -3672,11 +3679,14 @@ mod tests {
     #[test]
     fn incremental_rescan_target_uses_parent_when_known_directory_was_deleted() {
         let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
+        let root = unique_temp_path("disk-map-incremental-deleted-dir");
+        std::fs::create_dir_all(&root).expect("incremental rescan test root should be created");
+        app.tree.set_root_path(root.clone());
 
-        let target = app.incremental_rescan_target(&[PathBuf::from("/root/match-dir")]);
+        let target = app.incremental_rescan_target(&[root.join("match-dir")]);
 
-        assert_eq!(target, Some((0, PathBuf::from("/root"))));
+        assert_eq!(target, Some((0, root.clone())));
+        std::fs::remove_dir_all(root).expect("incremental rescan test root should be removed");
     }
 
     #[test]

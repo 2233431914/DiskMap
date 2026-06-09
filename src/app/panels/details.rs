@@ -6,7 +6,9 @@ use super::super::DiskMapApp;
 use crate::app::{accent_button, describe_node_kind, palette, section_divider};
 use crate::export::ExportFormat;
 use crate::format::format_bytes;
-use crate::platform::{open_path, reveal_in_finder};
+use crate::platform::{
+    open_path, reveal_action_label, reveal_action_short_label, reveal_in_file_manager,
+};
 use crate::scanner::{size_basis_detail, size_basis_label};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 
@@ -141,15 +143,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             }
         }
         let w1 = cols[1].available_width();
-        if cols[1]
-            .add_enabled(
-                path_available,
-                egui::Button::new("Reveal").min_size(Vec2::new(w1, 32.0)),
-            )
-            .clicked()
-        {
+        let reveal_response = cols[1].add_enabled(
+            path_available,
+            egui::Button::new(reveal_action_short_label()).min_size(Vec2::new(w1, 32.0)),
+        );
+        let reveal_response = reveal_response.on_hover_text(reveal_action_label());
+        if reveal_response.clicked() {
             if let Some(path) = &node_path {
-                app.apply_platform_result("Reveal", reveal_in_finder(path));
+                app.apply_platform_result(reveal_action_label(), reveal_in_file_manager(path));
             }
         }
     });

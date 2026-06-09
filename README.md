@@ -1,8 +1,9 @@
 # DiskMap
 
-A native macOS disk usage analyzer with a squarified treemap. Local-only, no
-network, no telemetry. Built for personal use — fast scans, keyboard-driven
-workflow, destructive actions guarded by review and protected-path checks.
+A native disk usage analyzer with a squarified treemap for macOS and Linux.
+Local-only, no network, no telemetry. Built for personal use — fast scans,
+keyboard-driven workflow, destructive actions guarded by review and
+protected-path checks.
 
 Inspired by SpaceSniffer, written in Rust with `eframe`/`egui`.
 
@@ -12,31 +13,47 @@ Inspired by SpaceSniffer, written in Rust with `eframe`/`egui`.
 
 - Parallel scanning with `jwalk`, incremental UI refresh
 - Squarified treemap with hover, search, filter, depth control
-- Right-click: Open, Reveal in Finder, Copy Path, Move to Trash (with
-  confirmation and protected-path validation)
+- Right-click: Open, Reveal in Finder / Open Containing Folder, Copy Path,
+  Move to Trash (with confirmation and protected-path validation)
 - Safe scan options: hidden files, symlink policy, stay-on-filesystem
 - Exclude rules (`.git`, `node_modules`, custom patterns)
-- Real-time filesystem watch (FSEvents/kqueue) with debounced subtree rescans
+- Real-time filesystem watch with debounced subtree rescans
 - Snapshot comparison, duplicate-name report, file age/type insights
 - Focused report export (CSV / JSON) with reproduction metadata
 - Optional experimental SQLite scan cache (off by default)
 - Recent + pinned scan roots, persisted user-facing options
 
-The headless CLI and local macOS `.app` packaging path are available.
-Accessibility hardening and a full signed/notarized public release checklist
-remain roadmap work — see [SPEC.md](SPEC.md) for details.
+The headless CLI and local macOS `.app` packaging path are available. Linux
+runs as a native desktop binary; distro packaging is not yet part of the
+roadmap. Accessibility hardening and a full signed/notarized public release
+checklist remain roadmap work — see [SPEC.md](SPEC.md) for details.
 
 ## Build & Run
 
-Requires Rust 1.85+ (edition 2021). macOS is the primary target; the code
-compiles for other platforms but only macOS has the platform `Move to Trash`
-integration.
+Requires Rust 1.85+ (edition 2021). macOS and Linux are supported runtime
+targets. Linux desktops also need the usual native GUI libraries used by
+`eframe`/`winit` plus a desktop portal or file manager command for `Open`,
+`Open Containing Folder`, and `Move to Trash` integration.
 
 ```bash
 cargo run --release
 ```
 
 `target/release/disk-map` is a standalone binary.
+
+On Ubuntu/Debian, the native dependencies tested for local Linux builds are:
+
+```bash
+sudo apt install build-essential pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libxkbcommon-dev libasound2-dev
+```
+
+For very large watched trees on Linux, the inotify watch limit can be the
+runtime bottleneck:
+
+```bash
+cat /proc/sys/fs/inotify/max_user_watches
+sudo sysctl fs.inotify.max_user_watches=524288
+```
 
 ### macOS App Bundle
 
@@ -52,7 +69,7 @@ are documented in [packaging/macos/README.md](packaging/macos/README.md).
 ### Dev commands
 
 ```bash
-cargo test --lib                      # 166 unit tests, <1s on M-series
+cargo test --lib                      # library unit tests
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release                 # optimized GUI binary (target/release/disk-map)
 scripts/package-macos.sh              # build target/dist/DiskMap.app + zip
@@ -90,8 +107,9 @@ preferences, no profiles, no destructive actions — read-only.
    clears search.
 4. `Roots` menu collects the last 10 successful scan roots and stores pinned
    favorites for one-click repeat analysis.
-5. Right-click a node for **Open / Reveal / Copy Path / Move to Trash**. Trash
-   shows a confirmation with path, size, and affected item count.
+5. Right-click a node for **Open / Reveal in Finder** on macOS or
+   **Open Containing Folder** on Linux, plus **Copy Path / Move to Trash**.
+   Trash shows a confirmation with path, size, and affected item count.
 
 ## Keyboard shortcuts
 
@@ -107,9 +125,11 @@ preferences, no profiles, no destructive actions — read-only.
 ## Privacy
 
 Everything is local. No network calls, no analytics, no remote cache. The
-optional SQLite cache lives in the eframe storage directory; reports and
-exports are written to the current working directory and named
-`disk-map-export-*` with a timestamp.
+optional SQLite cache lives in DiskMap's app data directory alongside
+crash-safe local preferences/state; reports and exports are written to the
+current working directory and named `disk-map-export-*` with a timestamp.
+On Linux, the app data directory is `$XDG_DATA_HOME/disk-map` when
+`XDG_DATA_HOME` is an absolute path, otherwise `~/.local/share/disk-map`.
 
 ## License
 
