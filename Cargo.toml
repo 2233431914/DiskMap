@@ -2,6 +2,7 @@
 name = "disk-map"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.34", features = ["persistence", "glow"] }
