@@ -17,7 +17,6 @@ use crate::watcher::{WatchPoll, WatchSession};
 
 #[cfg(test)]
 mod analysis_actions;
-#[cfg(test)]
 mod cleanup_actions;
 #[cfg(test)]
 mod export_actions;
@@ -2316,7 +2315,6 @@ pub(super) fn accent_button(
     )
 }
 
-#[cfg(test)]
 fn protected_path_status(reason: crate::cleanup::ProtectedPathReason, path: &Path) -> String {
     format!(
         "Protected path blocked: {} ({})",
@@ -2325,7 +2323,6 @@ fn protected_path_status(reason: crate::cleanup::ProtectedPathReason, path: &Pat
     )
 }
 
-#[cfg(test)]
 fn cleanup_target_missing_status(path: &Path) -> String {
     format!(
         "Move to Trash unavailable: target no longer exists: {}",
@@ -2333,7 +2330,6 @@ fn cleanup_target_missing_status(path: &Path) -> String {
     )
 }
 
-#[cfg(test)]
 fn cleanup_target_inaccessible_status(path: &Path, error: &str) -> String {
     format!(
         "Move to Trash unavailable: cannot verify {}: {}",

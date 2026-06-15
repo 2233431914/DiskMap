@@ -5,6 +5,7 @@ use super::{
 use crate::cleanup::{parse_protected_paths, validate_cleanup_target, CleanupTargetStatus};
 #[cfg(test)]
 use crate::cleanup::{protected_path_reason_with_deny_list, CleanupCandidate, QueueAddResult};
+#[cfg(test)]
 use crate::format::format_bytes;
 use crate::platform::move_to_trash;
 use crate::tree::NodeId;
@@ -53,6 +54,7 @@ impl DiskMapApp {
         self.move_path_to_trash(node_id, path);
     }
 
+    #[cfg(test)]
     pub(super) fn arm_or_confirm_queued_trash(&mut self, node_id: NodeId) {
         let Some(candidate) = self.cleanup_queue.get(node_id).cloned() else {
             self.status = "Move to Trash unavailable: candidate is not queued".to_string();

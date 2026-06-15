@@ -172,6 +172,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                     }
                     ui.close();
                 }
+                ui.separator();
+                let trash_response = ui.add_enabled(
+                    node_path.is_some(),
+                    egui::Button::new("Move to Trash")
+                        .min_size(Vec2::new(ui.available_width(), 24.0)),
+                );
+                let trash_response = if node_path.is_none() {
+                    trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
+                } else {
+                    trash_response.on_hover_text("Move this item to Trash")
+                };
+                if trash_response.clicked() {
+                    app.move_node_to_trash(node_id);
+                    ui.close();
+                }
             });
         }
     });

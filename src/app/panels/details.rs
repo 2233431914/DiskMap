@@ -183,6 +183,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             ui.ctx().copy_text(path.display().to_string());
         }
     }
+    ui.add_space(4.0);
+    let trash_width = ui.available_width();
+    let trash_response = ui.add_enabled(
+        path_available,
+        egui::Button::new("Move to Trash").min_size(Vec2::new(trash_width, 28.0)),
+    );
+    let trash_response = if !path_available {
+        trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
+    } else {
+        trash_response.on_hover_text("Move this item to Trash")
+    };
+    if trash_response.clicked() {
+        app.move_node_to_trash(node_id);
+    }
 
     if let Some(parent) = node_parent {
         ui.add_space(10.0);
