@@ -37,7 +37,6 @@ OPTIONS:
                                     separated when given once)
     --max-depth <N>                 Limit how deep the scan recurses (1+)
     --include-hidden                Include dotfiles
-    --follow-symlinks                Follow symlinks (off by default)
     --stay-on-filesystem            Don't cross filesystem boundaries
     --sort-by <path|size>           Output row order (default: path)
     -h, --help                      Show this help
@@ -135,7 +134,6 @@ fn parse_scan(argv: &[String]) -> Result<CliOptions, String> {
     let mut exclude_patterns: Vec<String> = Vec::new();
     let mut max_depth: Option<usize> = None;
     let mut include_hidden = ScanOptions::default().include_hidden;
-    let mut follow_symlinks = ScanOptions::default().follow_symlinks;
     let mut stay_on_filesystem = ScanOptions::default().stay_on_filesystem;
     let mut sort_by = SortBy::Path;
 
@@ -182,8 +180,10 @@ fn parse_scan(argv: &[String]) -> Result<CliOptions, String> {
                 i += 1;
             }
             "--follow-symlinks" => {
-                follow_symlinks = true;
-                i += 1;
+                return Err(
+                    "--follow-symlinks is temporarily disabled; symlinks are reported without traversal"
+                        .to_string(),
+                );
             }
             "--stay-on-filesystem" => {
                 stay_on_filesystem = true;
@@ -213,7 +213,7 @@ fn parse_scan(argv: &[String]) -> Result<CliOptions, String> {
     let scan_options = ScanOptions {
         exclude_patterns: parse_exclude_patterns(&exclude_patterns.join(",")),
         include_hidden,
-        follow_symlinks,
+        follow_symlinks: false,
         stay_on_filesystem,
         ..ScanOptions::default()
     };
@@ -546,7 +546,6 @@ mod tests {
             "--max-depth",
             "3",
             "--include-hidden",
-            "--follow-symlinks",
             "--sort-by",
             "size",
         ]));
@@ -570,11 +569,20 @@ mod tests {
                 assert_eq!(sort_by, SortBy::Size);
                 assert_eq!(max_depth, Some(3));
                 assert!(scan_options.include_hidden);
-                assert!(scan_options.follow_symlinks);
+                assert!(!scan_options.follow_symlinks);
                 assert_eq!(scan_options.exclude_patterns, vec![".git", "target"]);
             }
             _ => panic!("expected Scan"),
         }
+    }
+
+    #[test]
+    fn scan_rejects_follow_symlinks() {
+        let result = parse_args(&args(&["scan", "/tmp", "--follow-symlinks"]));
+
+        assert!(result
+            .expect_err("symlink traversal should be rejected")
+            .contains("temporarily disabled"));
     }
 
     #[test]

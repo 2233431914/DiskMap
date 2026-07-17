@@ -10,7 +10,8 @@
 //! Run with:
 //!   cargo bench --bench large_tree
 //!
-//! To regenerate fixtures, delete `target/bench-fixtures/disk-map-tree-*`.
+//! To regenerate fixtures, delete the matching `disk-map-tree-*` directories
+//! and their `.complete` marker files under `target/bench-fixtures/`.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use disk_map::scanner::{scan_path_to_tree, ScanOptions};
@@ -20,74 +21,55 @@ use egui::Rect;
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const FIXTURE_SIZES: &[usize] = &[1_000, 10_000, 100_000];
 
-/// Build a synthetic tree of `target_count` entries at `dest`. Returns
-/// the canonical root path. Idempotent: skips generation if `dest` exists
-/// and contains any file. Distribution: roughly 90% files, 10% dirs,
-/// balanced branching factor of 10. Capped at depth 8 to keep paths
-/// under the 255-byte filesystem limit even at 100k entries.
+/// Build a synthetic tree with exactly `target_count` entries at `dest`.
+/// A sibling completion marker makes fixture reuse deterministic.
 fn generate_tree_if_missing(target_count: usize, dest: &Path) {
-    if dest.exists()
-        && fs::read_dir(dest)
-            .map(|mut it| it.next().is_some())
-            .unwrap_or(false)
+    let marker = dest.with_extension("complete");
+    if dest.is_dir()
+        && fs::read_to_string(&marker)
+            .ok()
+            .is_some_and(|value| value.trim() == target_count.to_string())
     {
         return;
     }
-    fs::create_dir_all(dest).expect("create fixture root");
-    let mut count = 1; // the root itself
-                       // BFS frontier with depth tracking so we can stop recursing deep
-    let mut frontier: Vec<(PathBuf, usize)> = vec![(dest.to_path_buf(), 0)];
-    let max_depth = 8usize;
-    while count < target_count && !frontier.is_empty() {
-        let (dir, depth) = frontier.remove(0);
-        // 9 files + 1 subdir per directory, but don't make subdirs past max_depth
-        for i in 0..9 {
-            if count >= target_count {
-                break;
-            }
-            let name = format!("f{}.txt", i);
-            let p = dir.join(&name);
-            fs::write(&p, b"x").expect("write fixture file");
-            count += 1;
-        }
-        if count < target_count && depth + 1 < max_depth {
-            let name = format!("d{}", frontier.len());
-            let p = dir.join(&name);
-            fs::create_dir(&p).expect("mkdir fixture subdir");
-            frontier.push((p, depth + 1));
-            count += 1;
-        }
+    if dest.exists() {
+        fs::remove_dir_all(dest).expect("remove stale benchmark fixture");
     }
+    fs::create_dir_all(dest).expect("create fixture root");
+    let directory_count = (target_count / 100).max(1);
+    let mut directories = Vec::with_capacity(directory_count);
+    for index in 0..directory_count {
+        let directory = dest.join(format!("d{index:04}"));
+        fs::create_dir(&directory).expect("mkdir fixture directory");
+        directories.push(directory);
+    }
+
+    let mut count = 1 + directory_count;
+    let mut file_index = 0usize;
+    while count < target_count {
+        let directory = &directories[file_index % directories.len()];
+        fs::write(directory.join(format!("f{file_index:06}.txt")), b"x")
+            .expect("write fixture file");
+        file_index += 1;
+        count += 1;
+    }
+    fs::write(marker, target_count.to_string()).expect("write fixture marker");
 }
 
-fn fixture_dir() -> PathBuf {
-    // CARGO_MANIFEST_DIR is set by cargo at compile time for benches.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir)
-        .join("target")
-        .join("bench-fixtures")
-}
-
-fn root_path() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    fixture_dir().join(format!("disk-map-bench-fixture-{pid}-{nanos}-{n}"))
+fn fixture_path(target_count: usize) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/bench-fixtures")
+        .join(format!("disk-map-tree-{target_count}"))
 }
 
 fn scan_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_tree_scan");
     for &size in FIXTURE_SIZES {
-        let dest = root_path().join(format!("tree-{size}"));
+        let dest = fixture_path(size);
         generate_tree_if_missing(size, &dest);
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter(|| {
@@ -106,7 +88,7 @@ fn scan_bench(c: &mut Criterion) {
 fn layout_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_tree_layout");
     for &size in FIXTURE_SIZES {
-        let dest = root_path().join(format!("tree-{size}"));
+        let dest = fixture_path(size);
         generate_tree_if_missing(size, &dest);
         // Pre-scan once to get a tree to layout
         let mut tree = scan_path_to_tree(dest.clone(), ScanOptions::default())
@@ -142,7 +124,7 @@ fn layout_bench(c: &mut Criterion) {
 fn baseline_measurement(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_tree_baseline");
     for &size in FIXTURE_SIZES {
-        let dest = root_path().join(format!("tree-{size}"));
+        let dest = fixture_path(size);
         generate_tree_if_missing(size, &dest);
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter_custom(|iters| {

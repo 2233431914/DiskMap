@@ -69,7 +69,7 @@ impl DiskMapApp {
                 "directory-depth"
             },
             include_hidden: self.include_hidden,
-            follow_symlinks: self.follow_symlinks,
+            follow_symlinks: false,
             stay_on_filesystem: self.stay_on_filesystem,
             sqlite_cache_enabled: self.sqlite_cache_enabled,
             realtime_watch_enabled: self.realtime_watch_enabled,

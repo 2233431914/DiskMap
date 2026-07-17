@@ -1,6 +1,6 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub const WATCH_DEBOUNCE_MIN: Duration = Duration::from_millis(300);
@@ -41,9 +41,15 @@ pub enum WatchPoll {
 
 impl WatchSession {
     pub fn start(root_path: PathBuf) -> notify::Result<Self> {
+        let root_path: PathBuf = root_path.components().collect();
         let (tx, rx) = unbounded();
         let mut watcher = create_watcher(tx)?;
-        watcher.watch(&root_path, RecursiveMode::Recursive)?;
+        let mode = if root_is_directory_without_following_symlinks(&root_path) {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher.watch(&root_path, mode)?;
 
         Ok(Self {
             _watcher: watcher,
@@ -103,6 +109,13 @@ impl WatchSession {
 
         debounce_ready(pending.first_seen, pending.last_seen, now)
     }
+}
+
+fn root_is_directory_without_following_symlinks(path: &Path) -> bool {
+    let path: PathBuf = path.components().collect();
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 fn create_watcher(tx: Sender<WatchMessage>) -> notify::Result<RecommendedWatcher> {
@@ -182,5 +195,25 @@ mod tests {
         ]);
 
         assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_root_is_not_classified_as_recursive_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::current_dir()
+            .expect("test current dir should be available")
+            .join("target/test-temp/watcher-symlink-root");
+        std::fs::create_dir_all(&root).expect("watcher symlink fixture should be created");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir(&target).expect("watcher target should be created");
+        symlink(&target, &link).expect("watcher symlink should be created");
+
+        assert!(!root_is_directory_without_following_symlinks(&link));
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

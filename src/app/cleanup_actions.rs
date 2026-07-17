@@ -2,23 +2,30 @@ use super::{
     cleanup_target_inaccessible_status, cleanup_target_missing_status, protected_path_status,
     DiskMapApp,
 };
-use crate::cleanup::{parse_protected_paths, validate_cleanup_target, CleanupTargetStatus};
+use crate::cleanup::{
+    normalize_cleanup_path, parse_protected_paths, validate_cleanup_target, CleanupTargetStatus,
+};
 #[cfg(test)]
 use crate::cleanup::{protected_path_reason_with_deny_list, CleanupCandidate, QueueAddResult};
-#[cfg(test)]
 use crate::format::format_bytes;
 use crate::platform::move_to_trash;
 use crate::tree::NodeId;
 use std::path::{Path, PathBuf};
 
 impl DiskMapApp {
+    pub(super) fn clear_trash_confirmation(&mut self) {
+        self.trash_confirm_target_id = None;
+        self.trash_confirm_path = None;
+    }
+
     #[cfg(test)]
     pub(super) fn queue_cleanup_candidate(&mut self, node_id: NodeId) {
-        let Some(path) = self.tree.node_real_path(node_id) else {
+        let Some(raw_path) = self.tree.node_real_path(node_id) else {
             self.status = "Cleanup queue unavailable for virtual nodes".to_string();
             self.pending_repaint = true;
             return;
         };
+        let path = normalize_cleanup_path(&raw_path);
 
         if let Some(reason) = self.protected_path_reason(&path) {
             self.status = protected_path_status(reason, &path);
@@ -51,7 +58,7 @@ impl DiskMapApp {
             return;
         };
 
-        self.move_path_to_trash(node_id, path);
+        self.arm_or_confirm_trash(node_id, normalize_cleanup_path(&path));
     }
 
     #[cfg(test)]
@@ -62,55 +69,22 @@ impl DiskMapApp {
             return;
         };
 
-        match self.cleanup_target_status(&candidate.path) {
-            CleanupTargetStatus::Ready => {}
-            CleanupTargetStatus::Protected(reason) => {
-                self.trash_confirm_target_id = None;
-                self.status = protected_path_status(reason, &candidate.path);
-                self.pending_repaint = true;
-                return;
-            }
-            CleanupTargetStatus::Missing => {
-                self.trash_confirm_target_id = None;
-                self.cleanup_queue.remove(node_id);
-                self.status = cleanup_target_missing_status(&candidate.path);
-                self.pending_repaint = true;
-                return;
-            }
-            CleanupTargetStatus::Inaccessible(error) => {
-                self.trash_confirm_target_id = None;
-                self.status = cleanup_target_inaccessible_status(&candidate.path, &error);
-                self.pending_repaint = true;
-                return;
-            }
-        }
-
-        if self.trash_confirm_target_id != Some(node_id) {
-            self.trash_confirm_target_id = Some(node_id);
-            self.status = format!(
-                "Confirm Trash: {} · {} · {}",
-                candidate.path.display(),
-                format_bytes(candidate.size),
-                super::pluralize(candidate.item_count as u64, "item", "items")
-            );
-            self.pending_repaint = true;
-            return;
-        }
-
-        self.move_path_to_trash(node_id, candidate.path);
+        self.arm_or_confirm_trash(node_id, normalize_cleanup_path(&candidate.path));
     }
 
-    fn move_path_to_trash(&mut self, node_id: NodeId, path: PathBuf) {
+    fn arm_or_confirm_trash(&mut self, node_id: NodeId, path: PathBuf) {
         match self.cleanup_target_status(&path) {
             CleanupTargetStatus::Ready => {}
             CleanupTargetStatus::Protected(reason) => {
                 self.trash_confirm_target_id = None;
+                self.trash_confirm_path = None;
                 self.status = protected_path_status(reason, &path);
                 self.pending_repaint = true;
                 return;
             }
             CleanupTargetStatus::Missing => {
                 self.trash_confirm_target_id = None;
+                self.trash_confirm_path = None;
                 self.cleanup_queue.remove(node_id);
                 self.status = cleanup_target_missing_status(&path);
                 self.pending_repaint = true;
@@ -118,6 +92,64 @@ impl DiskMapApp {
             }
             CleanupTargetStatus::Inaccessible(error) => {
                 self.trash_confirm_target_id = None;
+                self.trash_confirm_path = None;
+                self.status = cleanup_target_inaccessible_status(&path, &error);
+                self.pending_repaint = true;
+                return;
+            }
+        }
+
+        if self.trash_confirm_target_id != Some(node_id)
+            || self.trash_confirm_path.as_ref() != Some(&path)
+        {
+            let node = self.tree.node(node_id);
+            let size = node.size;
+            let kind = super::describe_node_kind(node.kind, !node.children.is_empty());
+            let item_count = self.cleanup_item_count(node_id);
+            self.trash_confirm_target_id = Some(node_id);
+            self.trash_confirm_path = Some(path.clone());
+            self.status = format!(
+                "Confirm Move to Trash: {} · {} · {} · {}",
+                path.display(),
+                kind,
+                format_bytes(size),
+                super::pluralize(item_count as u64, "item", "items")
+            );
+            self.pending_repaint = true;
+            return;
+        }
+
+        self.move_path_to_trash(node_id, path);
+    }
+
+    fn move_path_to_trash(&mut self, node_id: NodeId, path: PathBuf) {
+        if self.trash_confirm_target_id != Some(node_id)
+            || self.trash_confirm_path.as_ref() != Some(&path)
+        {
+            self.arm_or_confirm_trash(node_id, path);
+            return;
+        }
+
+        match self.cleanup_target_status(&path) {
+            CleanupTargetStatus::Ready => {}
+            CleanupTargetStatus::Protected(reason) => {
+                self.trash_confirm_target_id = None;
+                self.trash_confirm_path = None;
+                self.status = protected_path_status(reason, &path);
+                self.pending_repaint = true;
+                return;
+            }
+            CleanupTargetStatus::Missing => {
+                self.trash_confirm_target_id = None;
+                self.trash_confirm_path = None;
+                self.cleanup_queue.remove(node_id);
+                self.status = cleanup_target_missing_status(&path);
+                self.pending_repaint = true;
+                return;
+            }
+            CleanupTargetStatus::Inaccessible(error) => {
+                self.trash_confirm_target_id = None;
+                self.trash_confirm_path = None;
                 self.status = cleanup_target_inaccessible_status(&path, &error);
                 self.pending_repaint = true;
                 return;
@@ -126,6 +158,7 @@ impl DiskMapApp {
 
         if self.trash_confirm_target_id == Some(node_id) {
             self.trash_confirm_target_id = None;
+            self.trash_confirm_path = None;
         }
 
         match move_to_trash(&path) {
@@ -184,12 +217,12 @@ impl DiskMapApp {
         self.context_menu_target_id = None;
         self.hovered_visual_kind = None;
         self.trash_confirm_target_id = None;
+        self.trash_confirm_path = None;
         self.cached_visuals.clear();
         self.layout_dirty = true;
         true
     }
 
-    #[cfg(test)]
     fn cleanup_item_count(&self, node_id: NodeId) -> usize {
         if !self.tree.contains_id(node_id) {
             return 0;

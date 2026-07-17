@@ -9,8 +9,10 @@
 use disk_map::rules::{
     default_ruleset, evaluate_rules, RuleContext, RuleSet, RULES_FORMAT_VERSION,
 };
+use disk_map::scanner::{scan_path_to_tree, ScanOptions};
 use disk_map::tree::{NodeId, NodeKind, TreeStore};
 use std::fs::{self, File};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +24,9 @@ fn unique_temp_dir() -> std::path::PathBuf {
         .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
-    let p = std::env::temp_dir().join(format!("disk-map-rules-fixture-{pid}-{nanos}-{n}"));
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-temp")
+        .join(format!("disk-map-rules-fixture-{pid}-{nanos}-{n}"));
     fs::create_dir_all(&p).expect("temp dir should be creatable");
     p
 }
@@ -30,15 +34,15 @@ fn unique_temp_dir() -> std::path::PathBuf {
 /// Build a fixture tree:
 ///
 ///   root/
-///   ├── big.bin               (1.5 GB, mtime now)
-///   ├── small.txt             (1 KB)
-///   ├── old_log.log           (500 MB, mtime 2 years ago)
-///   ├── fresh_log.log         (500 MB, mtime 10 days ago)
-///   ├── .hidden               (10 KB)
-///   ├── recent_normal.bin     (50 MB, mtime 5 days ago)
+///   ├── big.bin               (64 KiB, mtime now)
+///   ├── small.txt             (1 KiB)
+///   ├── old_log.log           (32 KiB, mtime 2 years ago)
+///   ├── fresh_log.log         (32 KiB, mtime 10 days ago)
+///   ├── .hidden               (10 KiB)
+///   ├── recent_normal.bin     (8 KiB, mtime 5 days ago)
 ///   └── sub/
-///       ├── nested_big.bin    (1.2 GB, mtime 6 months ago)
-///       └── nested_small.txt  (1 KB)
+///       ├── nested_big.bin    (48 KiB, mtime 6 months ago)
+///       └── nested_small.txt  (1 KiB)
 ///
 /// Returns (root_path, now_secs).
 fn build_default_fixture() -> (std::path::PathBuf, u64) {
@@ -49,10 +53,10 @@ fn build_default_fixture() -> (std::path::PathBuf, u64) {
         .as_secs();
     const DAY: u64 = 24 * 60 * 60;
 
-    // big.bin: 1.5 GB, now
+    // big.bin: 64 KiB, now
     write_file_with_size_and_mtime(
         &dir.join("big.bin"),
-        1_500_000_000,
+        64 * 1024,
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 60),
     );
 
@@ -63,17 +67,17 @@ fn build_default_fixture() -> (std::path::PathBuf, u64) {
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 30),
     );
 
-    // old_log.log: 500 MB, 2 years ago
+    // old_log.log: 32 KiB, 2 years ago
     write_file_with_size_and_mtime(
         &dir.join("old_log.log"),
-        500 * 1_048_576,
+        32 * 1024,
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 730 * DAY),
     );
 
-    // fresh_log.log: 500 MB, 10 days ago
+    // fresh_log.log: 32 KiB, 10 days ago
     write_file_with_size_and_mtime(
         &dir.join("fresh_log.log"),
-        500 * 1_048_576,
+        32 * 1024,
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 10 * DAY),
     );
 
@@ -84,10 +88,10 @@ fn build_default_fixture() -> (std::path::PathBuf, u64) {
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 60),
     );
 
-    // recent_normal.bin: 50 MB, 5 days ago
+    // recent_normal.bin: 8 KiB, 5 days ago
     write_file_with_size_and_mtime(
         &dir.join("recent_normal.bin"),
-        50 * 1_048_576,
+        8 * 1024,
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 5 * DAY),
     );
 
@@ -96,7 +100,7 @@ fn build_default_fixture() -> (std::path::PathBuf, u64) {
     fs::create_dir(&sub).unwrap();
     write_file_with_size_and_mtime(
         &sub.join("nested_big.bin"),
-        1_200_000_000,
+        48 * 1024,
         SystemTime::UNIX_EPOCH + Duration::from_secs(now - 180 * DAY),
     );
     write_file_with_size_and_mtime(
@@ -109,75 +113,45 @@ fn build_default_fixture() -> (std::path::PathBuf, u64) {
 }
 
 fn write_file_with_size_and_mtime(path: &std::path::Path, size: u64, mtime: SystemTime) {
-    // Sparsely-written file: just seek to the end. Avoids actually
-    // writing 1.5 GB to disk. stat() reports the seeked size.
-    let f = File::create(path).expect("create fixture file");
-    f.set_len(size).expect("set fixture file size");
+    let mut f = File::create(path).expect("create fixture file");
+    f.write_all(&vec![
+        0xA5;
+        usize::try_from(size).expect("fixture fits memory")
+    ])
+    .expect("write fixture file");
     f.set_modified(mtime).expect("set fixture mtime");
     drop(f);
 }
 
-/// Scan a real on-disk directory into a TreeStore. Mirrors the
-/// `scan_path_to_tree` API but stays in this test file to keep the
-/// integration test self-contained (avoids cross-module imports that
-/// the lib treats as public).
+/// Scan a real on-disk directory through the production scanner.
 fn scan_dir_into_tree(root_path: &std::path::Path) -> (TreeStore, NodeId) {
-    let mut tree = TreeStore::new();
-    let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
-    tree.set_root_path(root_path.to_path_buf());
-    let mut total: u64 = 0;
-    let mut stack: Vec<(std::path::PathBuf, NodeId)> = vec![(root_path.to_path_buf(), root)];
-    while let Some((dir_path, parent_id)) = stack.pop() {
-        let entries = match fs::read_dir(&dir_path) {
-            Ok(it) => it,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let full = entry.path();
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let kind = if metadata.is_symlink() {
-                NodeKind::Symlink
-            } else if metadata.is_dir() {
-                NodeKind::Dir
-            } else {
-                NodeKind::File
-            };
-            let size = if kind == NodeKind::File {
-                metadata.len()
-            } else {
-                0
-            };
-            let mtime = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-            let child = tree.add_node_with_modified(Some(parent_id), name, kind, size, mtime);
-            // Track the node so we can verify by name.
-            let _ = child;
-            if kind == NodeKind::File {
-                total += size;
-            } else if kind == NodeKind::Dir {
-                stack.push((full, child));
-            }
-        }
-    }
-    tree.apply_direct_size_delta(root, total);
-    // Don't call repair_sorted_children (we don't have the list of
-    // dirty node_ids); the engine calls ensure_sorted_children
-    // internally during evaluation, so order is restored there.
+    let tree = scan_path_to_tree(root_path.to_path_buf(), ScanOptions::default())
+        .expect("production scanner should scan fixture");
+    let root = tree.root.expect("scanner should create fixture root");
     (tree, root)
+}
+
+fn fixture_ruleset() -> disk_map::rules::RuleSet {
+    let mut rules = default_ruleset();
+    if let Some(rule) = rules.get_mut("large-file-1gb") {
+        rule.predicate = disk_map::rules::RulePredicate::LargeFile {
+            min_size: 16 * 1024,
+        };
+    }
+    if let Some(rule) = rules.get_mut("old-large-file") {
+        rule.predicate = disk_map::rules::RulePredicate::OldFile {
+            min_age_days: 365,
+            min_size: 16 * 1024,
+        };
+    }
+    rules
 }
 
 #[test]
 fn default_ruleset_finds_expected_hits() {
     let (fixture, now) = build_default_fixture();
     let (mut tree, root) = scan_dir_into_tree(&fixture);
-    let rules = default_ruleset();
+    let rules = fixture_ruleset();
     let ctx = RuleContext { now_unix_secs: now };
     let hits = evaluate_rules(&rules, &mut tree, root, &ctx, 100);
 
@@ -186,17 +160,17 @@ fn default_ruleset_finds_expected_hits() {
         .map(|h| tree.node(h.node_id).name.clone())
         .collect();
 
-    // big.bin (1.5 GB) — matches large-file-1gb
+    // big.bin (64 KiB) — matches the lowered large-file-1gb test threshold
     assert!(
         hit_names.iter().any(|n| n == "big.bin"),
         "expected big.bin in hits, got: {hit_names:?}"
     );
-    // old_log.log (500 MB, 2 years old) — matches old-large-file
+    // old_log.log (32 KiB, 2 years old) — matches old-large-file
     assert!(
         hit_names.iter().any(|n| n == "old_log.log"),
         "expected old_log.log in hits, got: {hit_names:?}"
     );
-    // nested_big.bin (1.2 GB) — matches large-file-1gb
+    // nested_big.bin (48 KiB) — matches the lowered large-file-1gb test threshold
     assert!(
         hit_names.iter().any(|n| n == "nested_big.bin"),
         "expected nested_big.bin in hits, got: {hit_names:?}"
@@ -207,12 +181,11 @@ fn default_ruleset_finds_expected_hits() {
         "expected .hidden in hits, got: {hit_names:?}"
     );
 
-    // fresh_log.log (500 MB, 10 days old) — large enough but too
-    // recent for old-large-file. Should NOT be in old-large-file hits
-    // but might still appear in large-file-1gb — it's < 1 GB.
+    // fresh_log.log is large enough for the test large-file rule but too
+    // recent for old-large-file.
     let old_log_hits: Vec<_> = hits
         .iter()
-        .filter(|h| tree.node(h.node_id).name == "fresh_log.log")
+        .filter(|h| tree.node(h.node_id).name == "fresh_log.log" && h.rule_id == "old-large-file")
         .collect();
     assert!(
         old_log_hits.is_empty(),
@@ -220,7 +193,7 @@ fn default_ruleset_finds_expected_hits() {
         old_log_hits
     );
 
-    // recent_normal.bin (50 MB, 5 days) — too small AND too recent
+    // recent_normal.bin (8 KiB, 5 days) — too small AND too recent
     let recent_hits: Vec<_> = hits
         .iter()
         .filter(|h| tree.node(h.node_id).name == "recent_normal.bin")
@@ -236,7 +209,7 @@ fn default_ruleset_finds_expected_hits() {
 fn disabling_rule_removes_its_hits() {
     let (fixture, now) = build_default_fixture();
     let (mut tree, root) = scan_dir_into_tree(&fixture);
-    let mut rules = default_ruleset();
+    let mut rules = fixture_ruleset();
     let ctx = RuleContext { now_unix_secs: now };
 
     // Disable the large-file rule. big.bin should drop out.
@@ -261,7 +234,7 @@ fn disabling_rule_removes_its_hits() {
 fn limit_caps_results() {
     let (fixture, now) = build_default_fixture();
     let (mut tree, root) = scan_dir_into_tree(&fixture);
-    let rules = default_ruleset();
+    let rules = fixture_ruleset();
     let ctx = RuleContext { now_unix_secs: now };
     // Our fixture has roughly 4 hits. A limit of 2 should return 2.
     let hits = evaluate_rules(&rules, &mut tree, root, &ctx, 2);

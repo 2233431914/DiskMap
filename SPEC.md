@@ -12,7 +12,7 @@
 - **Framework:** Rust + eframe/egui (v0.34)
 - **Parallel scanning:** jwalk (v0.8)
 - **Thread communication:** crossbeam-channel (v0.5)
-- **In-memory tree aggregation:** Custom TreeStore
+- **In-memory tree:** Custom TreeStore with lossless file nodes; treemap aggregation is display-only
 - **Treemap rendering:** egui::Painter (custom drawing)
 - **Shell open:** open (v5)
 - **Local persistence:** crash-safe app data JSON for compact app state/preferences; eframe native window persistence
@@ -23,7 +23,7 @@
 ### 3.1 Core Features
 - [x] Input/select scan directory path
 - [x] Background scanning with jwalk parallel traversal
-- [x] Real-time UI refresh during scan (snapshots at depth <= 1)
+- [x] Real-time UI refresh during scan (batched scan messages)
 - [x] Scan exclude rules with persisted user patterns
 - [x] Treemap visualization by area (Squarified Treemap algorithm)
 - [x] Hover tooltip showing path and size
@@ -31,17 +31,17 @@
 - [x] Right-click context menu: Open / Reveal in Finder or Open Containing Folder / Copy Path / Move to Trash
 - [x] Search result navigation with Previous/Next and Enter/Shift+Enter
 - [x] Search filter mode showing only matches and ancestor folders
-- [x] Small-file aggregation as virtual "Other Files" nodes
-- [x] Manual rescan for scan root and focused subtree
-- [x] Default-on filesystem watch with debounced incremental subtree rescan
-- [x] CSV/JSON export for scan root or focused subtree
-- [x] Focused report JSON export with reproduction metadata for the current view
-- [x] Manual read-only file age/type insight report for the focused subtree
+- [x] Display-only small-file aggregation in treemap (the underlying TreeStore keeps every file)
+- [ ] Manual filesystem rescan for the scan root or focused subtree
+- Deferred: the shipped refresh control only recomputes the treemap; filesystem refresh is driven by starting a new scan or the watcher.
+- [x] Default-on filesystem watch with debounced full scan-root rescan
+- [ ] GUI CSV/JSON export and focused report panels (deferred; headless CLI export remains available)
+- [ ] GUI file age/type insight report (deferred; analysis module is retained as a library)
 - [x] Active size basis display
-- [x] Optional SQLite scan cache setting, disabled by default
+- [ ] GUI SQLite scan cache setting (deferred; cache implementation remains disabled)
 - [x] Extension-based color mode
-- [x] Direct Move to Trash with protected-path validation and immediate view update
-- [x] Cleanup review queue before platform Trash actions
+- [x] Direct Move to Trash with normalized protected-path validation, explicit confirmation, and immediate view update
+- [ ] Cleanup review queue UI (deferred; no production queue entry point)
 
 ### 3.2 Explicitly Out of Current Default Path
 - SQLite storage enabled by default
@@ -73,9 +73,9 @@ UI Thread
     ↓ StartScan(path)
 Scan Thread (jwalk)
     ↓ ScanMessage::Batch/Error via channel
-Aggregator (TreeStore)
-    ↓ accumulate sizes
-    ↓ emit incremental batches/Finished
+TreeStore on UI thread
+    ↓ append lossless nodes and update ancestor sizes
+    ↓ mark layout/search state dirty
 egui Painter
     ↓ draw Treemap
 ```
@@ -116,6 +116,9 @@ disk-map/
 enum NodeKind { File, Dir, Symlink, Error, Aggregate }
 ```
 
+`Aggregate` is retained for library compatibility and report fixtures; the
+production scanner emits real file nodes and treemap aggregation is visual-only.
+
 ### 5.2 Node
 ```rust
 struct Node {
@@ -127,7 +130,6 @@ struct Node {
     children: Vec<NodeId>,
     scanned: bool,
     error: Option<String>,
-    lower_name: String,
 }
 ```
 
@@ -151,7 +153,7 @@ struct TreeStore {
   - Search navigation cycles through matches in the current focused subtree using tree display order
   - Directory palette cycles by depth
   - Minimum rect threshold: 2px (skip render)
-- **Small files:** files at or below 16 KiB are aggregated per parent into a virtual `Other Files` node. Virtual aggregate nodes have no real filesystem path and cannot be opened, revealed, or copied as a path.
+- **Small files:** the scanner keeps every file and path. When a directory has at least eight files at or below 16 KiB, treemap layout groups them into a display-only `Other Files` block; search disables this grouping. The block has no filesystem path and cannot be opened, revealed, copied, or moved to Trash.
 
 ## 7. Platform Integration
 
@@ -164,9 +166,9 @@ struct TreeStore {
 
 ### 7.3 Destructive Actions
 - Move to Trash is available from the selected-node details panel and the right-click menu.
-- Direct Trash validates protected paths and target existence before calling the platform adapter.
+- Direct Trash normalizes paths, validates protected paths and target existence, then requires a second explicit confirmation before calling the platform adapter.
 - Successful Trash removes the node from the in-memory view immediately; failed platform actions only report status.
-- Review-queue Trash still supports a second confirmation click with path, size, and affected item count.
+- Any production Trash entry point uses the same second confirmation with normalized path, size, and affected item count.
 
 ## 8. UI Layout
 
@@ -208,14 +210,14 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [x] Add safe scan mode options:
   - [x] Do not cross filesystem or mount boundaries where platform device IDs are available
   - [x] Include or exclude hidden files
-  - [x] Follow or do not follow symlinks
-- Safe scan options are persisted with other user-facing scan options. Defaults preserve the original scan behavior: hidden files included, symlinks not followed, and filesystem boundaries not restricted until enabled.
-- [x] Add manual rescan for the current scan root and focused subtree without enabling real-time monitoring
-- Manual rescan reuses the active scan options and starts a new scan for either the original scan root or the currently focused directory.
+  - [x] Show symlinks without following them
+- Symlink traversal is intentionally disabled and legacy preference/CLI values are migrated or rejected. Hidden files are included by default and filesystem boundaries are not restricted until enabled.
+- [ ] Manual rescan for the current scan root and focused subtree without enabling real-time monitoring
+- Deferred: the shipped refresh control only recomputes the treemap; filesystem refresh is driven by starting a new scan or the watcher.
 
 ### Phase 4: Reporting and Size Model
-- [x] Export the current scan tree or focused subtree as CSV/JSON with path, size, kind, and error fields
-- Export actions write timestamped `disk-map-export-*` files to the current working directory and report the saved path in status.
+- [x] Headless CLI export of scan rows as text/CSV/JSON with path, size, kind, and error fields
+- `diskmap-cli` writes text/CSV/JSON to stdout by default or to the exact path supplied with `-o`.
 - [x] Clearly display the active size basis, such as apparent size or allocated size on disk
 - Current size basis is shown in details/progress UI. On Unix it is allocated size from filesystem blocks when available, with apparent byte length fallback; on other platforms it is apparent byte length from metadata.
 - [x] Evaluate a user-facing size basis toggle if both size measurements are reliable on the target platform
@@ -226,8 +228,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [x] Debounce 300-1000ms
 - [x] Add default-on Watch control for debounced scan-root rescans after filesystem changes
 - Watch is enabled by default and observes the current scan root. Users can disable it for the current session from the toolbar.
-- [x] Incremental rescan of changed directories
-- Debounced events are mapped to the deepest known directory containing the changed path. The app rescans that directory off the UI thread and replaces its in-memory subtree; unresolved changes fall back to the scan root.
+- [x] Full scan-root rescan after debounced changes
+- The watcher remains attached to the current root while scans run. Events are coalesced and trigger a generation-guarded full rescan; changes observed during a scan schedule one follow-up rescan.
 
 ### Phase 6: Treemap Upgrade
 - [x] Preserve Squarified Treemap interface
@@ -235,8 +237,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - Current workflow keeps the Squarified layout and adds keyboard-driven depth control (`[` / `]`) plus Enter-to-drill for selected directories. Search navigation remains scoped to the focused subtree and can move focus to matching directories or parent directories for file matches.
 
 ### Phase 7: Productization
-- [x] Enable SQLite index for faster rescans behind a user setting
-- SQLite remains disabled by default. The experimental `SQLite` toolbar setting switches scan cache mode to `Enabled` and is persisted with other scan options.
+- [ ] Enable SQLite index for faster rescans behind a user setting
+- Deferred: the cache implementation remains available for experiments but production UI forces `CacheMode::Disabled`.
 - [x] Search and filter
 - Filter mode is an optional search display mode. It does not change search scope; it only removes non-matching branches from treemap layout while preserving the current focused subtree.
 - [x] Extension-based coloring
@@ -247,22 +249,18 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 ### Phase 8: Analysis Workflows
 - [x] Recent scan roots and pinned favorites for repeat analysis
 - The `Roots` menu keeps successful scan roots in a capped recent list and stores pinned favorites separately in local preferences. Selecting a root starts a new scan with the current scan options.
-- [x] Snapshot comparison to show growth, shrinkage, and newly added large paths between scans
-- Snapshot diff is read-only and compares the latest completed scan with the previous in-memory snapshot for the same root. It reports total delta plus top added, grown, shrunk, and removed paths by byte impact.
-- [x] Optional duplicate-file candidate analysis as a read-only report before any cleanup workflow
-- Duplicate analysis is manual and read-only. The current heuristic groups files by same normalized file name and same measured size inside the focused subtree; it does not hash file contents and does not enable cleanup actions.
-- [x] File age and file type insights, including modified-time filters and category summaries
-- Insight analysis is manual and read-only for the current focused subtree. File modified times are captured when available; category summaries are extension-based, and age buckets are best-effort with unknown mtime reported separately.
-- [x] Export/share a focused report with enough metadata to reproduce the visible result
-- Focused reports export JSON with generated time, scan root path, focused path, size basis, depth, search/filter state, color mode, scan options, exclude patterns, and the focused subtree entries.
+- [ ] Snapshot comparison, duplicate candidates, and file age/type reports in the GUI
+- Deferred: pure read-only analysis modules remain in the crate, but no GUI action claims these workflows are currently delivered.
+- [ ] Focused report export from the GUI
+- Deferred: the headless CLI export is the supported production report surface.
 
 ### Phase 9: Cleanup Workflow Safety
-- [x] Add a review queue for cleanup candidates before any destructive action
-- Selected nodes can be moved directly to Trash from the details panel or right-click menu. The cleanup queue remains available internally for review-style flows and shows path, size, kind, and affected item count.
+- [ ] Add a review queue for cleanup candidates before any destructive action
+- Deferred: selected nodes use the single-item confirmation flow; no queue UI is exposed.
 - [x] Add protected-path guardrails for system folders, mounted volumes, and user-configured deny lists
 - Guardrails block filesystem root, the home root, common system locations, mounted volume roots, and user-configured protected roots. User paths are comma, semicolon, or newline separated and apply to the path itself plus descendants.
 - [x] Require explicit confirmation with path, size, and affected item count before Move to Trash
-- The queued Trash action first enters a confirmation state and reports the target path, selected byte size, and affected item count before the second click can call the platform Trash adapter. Direct Move to Trash keeps protected-path and existence validation before platform calls.
+- Every production Trash action first enters a confirmation state and reports the normalized target path, selected byte size, and affected item count before the second click can call the platform Trash adapter.
 - [x] Keep cleanup actions separate from scanning and search so a failed platform action never mutates scan state
 - Successful Move to Trash removes the node from the in-memory tree immediately; failed platform actions only report status and leave scan/search state unchanged.
 
@@ -308,21 +306,23 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [ ] Undo guidance that explains platform Trash recovery options when supported, without promising guaranteed restoration
 
 ### Phase 14: Power User Workflow
-- [x] Command palette for navigation, scan, export, filter, and view-mode actions (Implemented in: 62c1d7a; 17 builtin commands; Cmd+K / Ctrl+K to open; case-insensitive substring filter; Enter / Esc / Up / Down keyboard handling)
-- [x] Keyboard-first triage flow for moving between search matches, report rows, and selected treemap nodes (Implemented in: existing handle_keyboard + new Esc/Cmd+K bindings; Enter=enter selected, Backspace=back, Alt+←/→=back/forward, [/]=depth, Esc=clear/close)
+- [ ] Command palette for navigation, scan, export, filter, and view-mode actions
+- Deferred: no command registry or command-palette UI is shipped.
+- [x] Keyboard-first navigation for the shipped scan/search/treemap flow
 - [ ] Saved filter presets for extension, category, size threshold, modified age, hidden files, symlink policy, and exclude patterns
   - Partial: `FilterPreset` + `FilterStore` in `src/views.rs` support persisted named search-query/filter-mode presets in the sidebar. Typed presets for extension/category/size/age/hidden/symlink/exclude controls remain deferred.
 - [ ] Multi-root comparison workspace for comparing several scan roots side by side
 - [ ] Bookmark selected nodes inside a scan for later review
-- [x] Saved views that remember focused node, depth, search/filter state, color mode, and selected report mode (Implemented in: 7ac572a; per-root `ViewState` with depth/search_query/search_filter_enabled/color_by_extension/last_report_mode/focused_id/selected_id; "Save current view" + "Apply saved view" buttons in a "VIEW" section of the details panel; 6 unit tests; serde round-trip)
+- [ ] Saved views that remember focused node, depth, search/filter state, color mode, and selected report mode
+- Deferred: persistence types remain for compatibility, but no production UI exposes saved-view actions.
 - [ ] Deep-link style local references to reopen a saved root, snapshot, focused node, and view mode
 - [ ] Configurable color palettes for directory depth, extension mode, and category mode
-- [x] Headless CLI entry point for scan and export jobs using the same scanner, exclude rules, and report formats as the GUI (Implemented in: a6d9cb0; `diskmap-cli scan <path> [-f text|json|csv] [-e <pattern>] [--max-depth N] [--include-hidden] [--follow-symlinks] [--sort-by path|size] [-o FILE]`; hand-rolled arg parser, no new deps; 14 unit tests for parser + format + sort)
+- [x] Headless CLI entry point for scan and export jobs using the production scanner (the `--follow-symlinks` flag is rejected because traversal is disabled)
 
 ### Phase 15: Reliability and Distribution
 - [ ] Crash-safe local state writes for preferences, history, snapshots, and cleanup audit logs
   - Partial: preferences plus compact user state (profiles, saved views, filter presets, and rulesets) use `SafeStorage` with write-to-temp + fsync + rename. Full history, snapshots, and cleanup audit logs are not persisted through this path yet.
-- [x] Large-tree benchmark suite with fixed fixtures and regression thresholds (Implemented in: e47c6ac; baselines file at benches/baselines/large_tree.txt — 10k/100k numbers are TBD pending a full bench run)
+- [x] Large-tree benchmark suite with fixed fixtures and directional baselines (fixtures now contain the requested 1k/10k/100k entry counts; layout baselines remain intentionally TBD)
 - [ ] UI smoke tests for scan, navigation, search, export, watch, cache, and trash confirmation flows
   - Partial: app-driver smoke coverage exercises scan, navigation, search, JSON export action, watch startup, SQLite cache path, and trash confirmation. Rendered UI smoke coverage remains deferred.
 - [x] Diagnostics bundle export with app version, platform, scan options, perf counters, recent errors, and redacted local paths where requested (Implemented in: 0091b27)
@@ -346,8 +346,10 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - [ ] Background work throttling so scheduled scans never compete aggressively with active interactive scans
 
 ### Phase 18: Extensibility and Rule Management
-- [x] User-editable rule sets for categories, anomaly hints, cleanup candidates, and protected paths (Implemented in: e5f4799, ecde3e8; default ruleset + UI sidebar; adding new rules from the UI is deferred — for now, edit via JSON import)
-- [x] Import/export rule bundles with validation and preview before applying changes (Implemented in: `src/rules.rs` + `src/app/rule_actions.rs`; JSON import validates version/fields/duplicate ids, sidebar preview shows added/removed/changed/unchanged counts, and apply/cancel is required before replacing the live ruleset)
+- [ ] User-editable rule sets in the GUI
+- Deferred: the rule engine and JSON validation remain library/test code; no production sidebar action is shipped.
+- [ ] Import/export rule bundles from the GUI
+- Deferred until a real production entry point is restored.
 - [ ] Per-root option profiles for exclude rules, safe scan options, watch/cache settings, and report defaults
   - Partial: per-root profiles are persisted through `SafeStorage` and applied before scan startup. Report defaults remain deferred.
 - [x] Rule test fixtures that let users validate matching behavior against example paths before enabling a rule set (Implemented in: 2c12a36; integration tests in tests/rules_fixtures.rs)

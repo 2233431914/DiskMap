@@ -5,13 +5,15 @@ use crate::export::ExportFormat;
 use crate::format::format_bytes;
 use crate::insights::InsightReport;
 use crate::scanner::{
-    parse_exclude_patterns, scan_path_to_tree, CacheMode, PerfStats, ProgressSnapshot, ScanBatch,
-    ScanMessage, ScanOptions,
+    parse_exclude_patterns, CacheMode, PerfStats, ProgressSnapshot, ScanBatch, ScanMessage,
+    ScanOptions,
 };
 #[cfg(test)]
 use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot};
 use crate::storage::{app_data_dir, LocalState, Preferences, SafeStorage};
-use crate::tree::{node_id_from_index, NodeId, NodeKind, TreeStore};
+#[cfg(test)]
+use crate::tree::node_id_from_index;
+use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{LayoutScratch, VisualKind, VisualNode};
 use crate::watcher::{WatchPoll, WatchSession};
 
@@ -89,13 +91,6 @@ pub(super) struct Palette {
 struct StateMessage {
     title: &'static str,
     detail: String,
-}
-
-#[derive(Debug)]
-struct IncrementalScanResult {
-    target_id: NodeId,
-    path: PathBuf,
-    result: anyhow::Result<TreeStore>,
 }
 
 const DARK_PALETTE: Palette = Palette {
@@ -330,12 +325,10 @@ pub struct DiskMapApp {
     pub(super) realtime_watch_enabled: bool,
     sqlite_cache_enabled: bool,
     watcher: Option<WatchSession>,
+    watch_rescan_pending: bool,
     initial_scan_pending: bool,
     tx: Sender<ScanMessage>,
     rx: Receiver<ScanMessage>,
-    incremental_tx: Sender<IncrementalScanResult>,
-    incremental_rx: Receiver<IncrementalScanResult>,
-    incremental_scan_active: bool,
     pub(super) tree: TreeStore,
     pub(super) navigation: NavigationState,
     pub(super) search: SearchController,
@@ -353,6 +346,7 @@ pub struct DiskMapApp {
     pub(super) hovered_id: Option<NodeId>,
     pub(super) context_menu_target_id: Option<NodeId>,
     pub(super) trash_confirm_target_id: Option<NodeId>,
+    pub(super) trash_confirm_path: Option<PathBuf>,
     pub(super) cleanup_queue: CleanupQueue,
     pub(super) hovered_visual_kind: Option<VisualKind>,
     pub(super) max_depth: usize,
@@ -371,12 +365,10 @@ pub struct DiskMapApp {
     /// Bounded ring of recent error/status messages for diagnostics export.
     /// Capped at 64 entries; oldest dropped on overflow.
     recent_errors: VecDeque<String>,
-    /// Read-only rule engine state. Initialized from `default_ruleset`
-    /// on first launch; mutations happen only through the rules section
-    /// UI (toggle enabled flag).
+    /// Read-only rule engine state. Initialized from `default_ruleset` on
+    /// first launch; production UI actions are currently deferred.
     pub(super) rules: crate::rules::RuleSet,
-    /// Most recent result from `evaluate_current_rules`, if any.
-    /// Surfaced in the rules section as a small summary.
+    /// Most recent result from the test-only `evaluate_current_rules` helper.
     #[cfg(test)]
     pub(super) last_rule_hits: Option<Vec<crate::rules::RuleHit>>,
     /// Sticky text field for the rules import path. Self-clears after
@@ -394,14 +386,9 @@ pub struct DiskMapApp {
     /// Settings window open state. The window owns the scan root path
     /// and scan option controls.
     pub(super) settings_open: bool,
-    /// Per-root saved view state. One entry per scan root. Captured
-    /// via the "Save current view" sidebar button.
+    /// Legacy per-root saved view state retained for local-state compatibility.
     pub(super) views: crate::views::ViewStore,
-    /// Discriminator for the last-opened report panel. Used by
-    /// "Apply saved view" to re-open the same panel the user had
-    /// when they saved. One of: "none" | "duplicates" | "insights"
-    /// | "snapshot" | "rules". String rather than enum so future
-    /// panels don't require a code change.
+    /// Legacy report discriminator retained for saved-view compatibility.
     #[cfg(test)]
     pub(super) last_report_mode: String,
     /// Saved filter presets (named bundles of search query +
@@ -416,7 +403,6 @@ pub struct DiskMapApp {
 impl Default for DiskMapApp {
     fn default() -> Self {
         let (tx, rx) = unbounded();
-        let (incremental_tx, incremental_rx) = unbounded();
         Self {
             path_input: dirs_home_fallback(),
             exclude_input: String::new(),
@@ -427,12 +413,10 @@ impl Default for DiskMapApp {
             realtime_watch_enabled: true,
             sqlite_cache_enabled: false,
             watcher: None,
+            watch_rescan_pending: false,
             initial_scan_pending: true,
             tx,
             rx,
-            incremental_tx,
-            incremental_rx,
-            incremental_scan_active: false,
             tree: TreeStore::new(),
             navigation: NavigationState::default(),
             search: SearchController::default(),
@@ -450,6 +434,7 @@ impl Default for DiskMapApp {
             hovered_id: None,
             context_menu_target_id: None,
             trash_confirm_target_id: None,
+            trash_confirm_path: None,
             cleanup_queue: CleanupQueue::default(),
             hovered_visual_kind: None,
             max_depth: 1,
@@ -531,12 +516,8 @@ impl DiskMapApp {
             self.include_hidden = include_hidden;
         }
 
-        if let Some(follow_symlinks) = prefs
-            .get(STORAGE_FOLLOW_SYMLINKS)
-            .and_then(parse_storage_bool)
-        {
-            self.follow_symlinks = follow_symlinks;
-        }
+        // Symlink traversal is intentionally disabled; migrate old settings.
+        self.follow_symlinks = false;
 
         if let Some(stay_on_filesystem) = prefs
             .get(STORAGE_STAY_ON_FILESYSTEM)
@@ -592,7 +573,7 @@ impl DiskMapApp {
         prefs.set(STORAGE_EXCLUDE_INPUT, self.exclude_input.clone());
         prefs.set(STORAGE_PROTECTED_PATHS, self.protected_paths_input.clone());
         prefs.set(STORAGE_INCLUDE_HIDDEN, self.include_hidden.to_string());
-        prefs.set(STORAGE_FOLLOW_SYMLINKS, self.follow_symlinks.to_string());
+        prefs.set(STORAGE_FOLLOW_SYMLINKS, false.to_string());
         prefs.set(
             STORAGE_STAY_ON_FILESYSTEM,
             self.stay_on_filesystem.to_string(),
@@ -651,7 +632,7 @@ impl DiskMapApp {
             cache_mode: CacheMode::Disabled,
             cache_path: None,
             include_hidden: self.include_hidden,
-            follow_symlinks: self.follow_symlinks,
+            follow_symlinks: false,
             stay_on_filesystem: self.stay_on_filesystem,
             ..ScanOptions::default()
         }
@@ -666,7 +647,6 @@ impl eframe::App for DiskMapApp {
         }
         self.handle_keyboard(ctx);
         self.handle_scan_messages();
-        self.handle_incremental_scan_results();
         self.handle_watch_events();
         self.maybe_refresh_search(ctx);
         self.maybe_request_deferred_repaint(ctx);
@@ -869,6 +849,53 @@ impl DiskMapApp {
 
     fn empty_root_state_message(&self, root_id: NodeId) -> Option<StateMessage> {
         let root = self.tree.node(root_id);
+        match root.kind {
+            NodeKind::File => {
+                return Some(StateMessage {
+                    title: "File scanned",
+                    detail: format!("{} uses {}.", root.name, format_bytes(root.size)),
+                });
+            }
+            NodeKind::Symlink => {
+                return Some(StateMessage {
+                    title: "Symbolic link",
+                    detail: format!("{} was recorded without following its target.", root.name),
+                });
+            }
+            NodeKind::Error => {
+                return Some(StateMessage {
+                    title: "Unable to read item",
+                    detail: root
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("{} could not be read.", root.name)),
+                });
+            }
+            NodeKind::Aggregate => {
+                return Some(StateMessage {
+                    title: "Grouped files",
+                    detail: format!("This group uses {}.", format_bytes(root.size)),
+                });
+            }
+            NodeKind::Dir => {}
+        }
+
+        if root.size == 0 && !root.children.is_empty() {
+            let item_count = root.children.len() as u64;
+            return Some(StateMessage {
+                title: if self.scan.is_scanning() {
+                    "Scanning folder"
+                } else {
+                    "No disk space used"
+                },
+                detail: format!(
+                    "{} contains {}; the visible items currently use 0 B.",
+                    root.name,
+                    pluralize(item_count, "item", "items")
+                ),
+            });
+        }
+
         if !root.children.is_empty() {
             return None;
         }
@@ -979,10 +1006,54 @@ impl DiskMapApp {
             });
     }
 
+    pub(super) fn show_small_files_hover_tooltip(
+        &mut self,
+        ui: &egui::Ui,
+        parent_id: NodeId,
+        count: u32,
+        size: u64,
+        pos: Pos2,
+    ) {
+        let p = palette(ui.ctx());
+        let parent_name = self.tree.node(parent_id).name.clone();
+        egui::Area::new(egui::Id::new("small_files_hover_tooltip"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + egui::vec2(16.0, 16.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::default()
+                    .fill(p.panel_elevated)
+                    .stroke(Stroke::new(1.0, p.stroke_subtle))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(10))
+                    .shadow(ui.visuals().popup_shadow)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("Other Files ({count})"))
+                                .strong()
+                                .color(p.text),
+                        );
+                        ui.label(
+                            RichText::new(format_bytes(size))
+                                .monospace()
+                                .color(p.accent),
+                        );
+                        ui.label(
+                            RichText::new(format!("Grouped from {}", parent_name))
+                                .small()
+                                .color(p.text_muted),
+                        );
+                        ui.label(
+                            RichText::new("Select the directory to inspect individual files")
+                                .small()
+                                .color(p.text_faint),
+                        );
+                    });
+            });
+    }
+
     fn paint_visual(&self, ui: &egui::Ui, painter: &egui::Painter, visual: &VisualNode) {
         let palette = palette(ui.ctx());
-        let is_hovered =
-            matches!(visual.kind, VisualKind::Node(node_id) if self.hovered_id == Some(node_id));
+        let is_hovered = self.hovered_visual_kind == Some(visual.kind);
         let is_selected = matches!(visual.kind, VisualKind::Node(node_id) if self.navigation.selected_id() == Some(node_id));
         let extension_color = self.extension_color_for_visual(visual);
         let fill = fill_color_for_visual(visual, is_hovered, is_selected, palette, extension_color);
@@ -1015,7 +1086,9 @@ impl DiskMapApp {
         if !self.color_by_extension || visual.is_dir {
             return None;
         }
-        let VisualKind::Node(node_id) = visual.kind;
+        let VisualKind::Node(node_id) = visual.kind else {
+            return None;
+        };
         let node = self.tree.node(node_id);
         if !matches!(
             node.kind,
@@ -1083,6 +1156,7 @@ impl DiskMapApp {
                     path, root_node, ..
                 } => {
                     self.scan.mark_started();
+                    self.scan.observe_node(&root_node);
                     self.status = format!("Scanning {}", path.display());
                     self.record_recent_root(&path);
                     self.tree.clear();
@@ -1111,7 +1185,17 @@ impl DiskMapApp {
                     self.status = self.finished_status(total_bytes);
                     #[cfg(test)]
                     self.update_snapshot_comparison();
-                    self.update_watch_state();
+                    let watch_rescan_pending = std::mem::take(&mut self.watch_rescan_pending);
+                    let rescan_after_watch = self.realtime_watch_enabled && watch_rescan_pending;
+                    if rescan_after_watch {
+                        if let Some(path) = self.scan_root_rescan_path() {
+                            self.start_scan_path(path);
+                        } else {
+                            self.update_watch_state();
+                        }
+                    } else {
+                        self.update_watch_state();
+                    }
                     self.pending_repaint = true;
                     eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
                 }
@@ -1460,7 +1544,7 @@ impl DiskMapApp {
         let scan_root = scan_root.map(|p| p.display().to_string());
         let scan_options: Vec<(String, String)> = vec![
             ("include_hidden".into(), self.include_hidden.to_string()),
-            ("follow_symlinks".into(), self.follow_symlinks.to_string()),
+            ("follow_symlinks".into(), "false".into()),
             (
                 "stay_on_filesystem".into(),
                 self.stay_on_filesystem.to_string(),
@@ -1513,7 +1597,8 @@ impl DiskMapApp {
             }
             WatchPoll::Ready(change) => {
                 let change_count = change.paths.len();
-                if self.scan.is_scanning() || self.incremental_scan_active {
+                if self.scan.is_scanning() {
+                    self.watch_rescan_pending = true;
                     self.status = format!(
                         "Watch noticed {} while scan is running",
                         pluralize(change_count as u64, "change", "changes")
@@ -1521,10 +1606,11 @@ impl DiskMapApp {
                     self.pending_repaint = true;
                     return;
                 }
-                if let Some((target_id, path)) = self.incremental_rescan_target(&change.paths) {
-                    self.start_incremental_scan(target_id, path, change_count);
-                } else if let Some(path) = self.scan_root_rescan_path() {
-                    self.status = "Watch fallback rescan after unresolved change".to_string();
+                if let Some(path) = self.scan_root_rescan_path() {
+                    self.status = format!(
+                        "Rescanning after {}",
+                        pluralize(change_count as u64, "change", "changes")
+                    );
                     self.start_scan_path(path);
                 }
             }
@@ -1536,126 +1622,20 @@ impl DiskMapApp {
         }
     }
 
-    fn handle_incremental_scan_results(&mut self) {
-        while let Ok(result) = self.incremental_rx.try_recv() {
-            self.incremental_scan_active = false;
-            match result.result {
-                Ok(source_tree) => {
-                    let Some(new_ids) = self
-                        .tree
-                        .replace_children_from(result.target_id, &source_tree)
-                    else {
-                        self.status = format!(
-                            "Incremental rescan skipped: target changed {}",
-                            result.path.display()
-                        );
-                        self.pending_repaint = true;
-                        continue;
-                    };
-                    let mut dirty_nodes = new_ids;
-                    dirty_nodes.push(result.target_id);
-                    dirty_nodes.extend(self.tree.ancestors(result.target_id));
-                    dirty_nodes.sort_unstable();
-                    dirty_nodes.dedup();
-                    self.tree.repair_sorted_children(&dirty_nodes);
-                    self.navigation.prune_invalid(&self.tree);
-                    self.navigation.rebuild_breadcrumb_cache(&self.tree);
-                    self.refresh_search_matches();
-                    self.layout_dirty = true;
-                    self.status = format!("Updated {}", result.path.display());
-                    self.pending_repaint = true;
-                }
-                Err(error) => {
-                    self.status = format!(
-                        "Incremental rescan failed for {}: {error}",
-                        result.path.display()
-                    );
-                    self.pending_repaint = true;
-                }
-            }
-        }
-    }
-
-    fn start_incremental_scan(&mut self, target_id: NodeId, path: PathBuf, change_count: usize) {
-        self.incremental_scan_active = true;
-        self.status = format!(
-            "Updating {} after {}",
-            path.display(),
-            pluralize(change_count as u64, "change", "changes")
-        );
-        let options = self.scan_options();
-        let tx = self.incremental_tx.clone();
-        std::thread::spawn(move || {
-            let result = scan_path_to_tree(path.clone(), options);
-            let _ = tx.send(IncrementalScanResult {
-                target_id,
-                path,
-                result,
-            });
-        });
-        self.pending_repaint = true;
-    }
-
-    fn incremental_rescan_target(
-        &mut self,
-        changed_paths: &[PathBuf],
-    ) -> Option<(NodeId, PathBuf)> {
-        let mut best: Option<(NodeId, PathBuf, usize)> = None;
-        for changed_path in changed_paths {
-            let Some((node_id, node_path)) = self.closest_known_directory(changed_path) else {
-                continue;
-            };
-            let depth = node_path.components().count();
-            if best
-                .as_ref()
-                .is_none_or(|(_, _, best_depth)| depth > *best_depth)
-            {
-                best = Some((node_id, node_path, depth));
-            }
-        }
-        best.map(|(node_id, path, _)| (node_id, path))
-    }
-
-    fn closest_known_directory(&mut self, changed_path: &Path) -> Option<(NodeId, PathBuf)> {
-        let root = self.tree.root?;
-        let mut best: Option<(NodeId, PathBuf, usize)> = None;
-        for index in 0..self.tree.len() {
-            let node_id = node_id_from_index(index);
-            if !matches!(self.tree.node(node_id).kind, NodeKind::Dir) {
-                continue;
-            }
-            if !self.tree.is_descendant_or_same(node_id, root) {
-                continue;
-            }
-            let path = self.tree.node_real_path(node_id)?;
-            if !changed_path.starts_with(&path) {
-                continue;
-            }
-            if Some(node_id) != self.tree.root
-                && changed_path == path
-                && !path.try_exists().unwrap_or(true)
-            {
-                continue;
-            }
-            let depth = path.components().count();
-            if best
-                .as_ref()
-                .is_none_or(|(_, _, best_depth)| depth > *best_depth)
-            {
-                best = Some((node_id, path, depth));
-            }
-        }
-        best.map(|(node_id, path, _)| (node_id, path))
-    }
-
     fn start_scan(&mut self) {
         let path = std::path::PathBuf::from(self.path_input.trim());
         self.start_scan_path(path);
     }
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
-        self.stop_watching();
-        self.incremental_scan_active = false;
+        if self
+            .watcher
+            .as_ref()
+            .is_none_or(|watcher| watcher.root_path() != &path)
+        {
+            self.stop_watching();
+        }
+        self.watch_rescan_pending = false;
         self.scan
             .start(path.clone(), self.scan_options(), self.tx.clone());
 
@@ -1664,6 +1644,7 @@ impl DiskMapApp {
         self.hovered_id = None;
         self.context_menu_target_id = None;
         self.trash_confirm_target_id = None;
+        self.trash_confirm_path = None;
         self.cleanup_queue.clear();
         self.hovered_visual_kind = None;
         #[cfg(test)]
@@ -1682,6 +1663,7 @@ impl DiskMapApp {
 
     fn update_watch_state(&mut self) {
         if !self.realtime_watch_enabled {
+            self.watch_rescan_pending = false;
             self.stop_watching();
             return;
         }
@@ -1717,47 +1699,9 @@ impl DiskMapApp {
         self.watcher = None;
     }
 
-    #[cfg(test)]
-    fn can_rescan_scan_root(&mut self) -> bool {
-        !self.scan.is_scanning() && self.scan_root_rescan_path().is_some()
-    }
-
-    #[cfg(test)]
-    fn can_rescan_focused_subtree(&mut self) -> bool {
-        !self.scan.is_scanning() && self.focused_subtree_rescan_path().is_some()
-    }
-
-    pub(super) fn rescan_scan_root(&mut self) {
-        let Some(path) = self.scan_root_rescan_path() else {
-            self.status = "Rescan unavailable: no scan root".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-        self.start_scan_path(path);
-    }
-
-    pub(super) fn rescan_focused_subtree(&mut self) {
-        let Some(path) = self.focused_subtree_rescan_path() else {
-            self.status = "Rescan unavailable: no focused directory".to_string();
-            self.pending_repaint = true;
-            return;
-        };
-        self.start_scan_path(path);
-    }
-
     fn scan_root_rescan_path(&mut self) -> Option<std::path::PathBuf> {
         self.tree
             .root
-            .and_then(|root_id| self.tree.node_real_path(root_id))
-    }
-
-    fn focused_subtree_rescan_path(&mut self) -> Option<std::path::PathBuf> {
-        self.navigation
-            .focused_root()
-            .filter(|&root_id| {
-                self.tree.contains_id(root_id)
-                    && matches!(self.tree.node(root_id).kind, NodeKind::Dir)
-            })
             .and_then(|root_id| self.tree.node_real_path(root_id))
     }
 
@@ -1920,6 +1864,7 @@ impl DiskMapApp {
             ScanMessage::Started {
                 path, root_node, ..
             } => {
+                self.scan.observe_node(&root_node);
                 self.tree.clear();
                 self.tree.push_node(None, root_node);
                 self.tree.set_root_path(path.clone());
@@ -2519,6 +2464,49 @@ mod tests {
     }
 
     #[test]
+    fn treemap_render_does_not_clear_details_panel_trash_confirmation() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![DiscoveredNode {
+                    node_id: 1,
+                    parent_id: 0,
+                    node: NodeRecord {
+                        name: "file.bin".into(),
+                        kind: NodeKind::File,
+                        size: 1,
+                        modified_secs: None,
+                        scanned: true,
+                        error: None,
+                    },
+                }],
+                size_deltas: vec![(0, 1)],
+                scanned_nodes: vec![1],
+                progress: None,
+            },
+        });
+        app.trash_confirm_target_id = Some(1);
+        app.trash_confirm_path = Some(PathBuf::from("/root/file.bin"));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            },
+            |ui| panels::treemap_view::show(ui, &mut app),
+        );
+
+        assert_eq!(app.trash_confirm_target_id, Some(1));
+        assert_eq!(
+            app.trash_confirm_path,
+            Some(PathBuf::from("/root/file.bin"))
+        );
+    }
+
+    #[test]
     fn cjk_font_install_adds_fallback_to_ui_font_families() {
         let mut fonts = egui::FontDefinitions::default();
 
@@ -2643,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_messages_build_tree_correctly() {
+    fn scan_messages_build_tree_correctly() {
         let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started(1));
         app.apply_scan_message_for_test(ScanMessage::Batch {
@@ -2670,6 +2658,25 @@ mod tests {
         assert_eq!(app.tree.len(), 2);
         assert_eq!(app.tree.node(0).size, 5);
         assert!(app.tree.node(1).scanned);
+    }
+
+    #[test]
+    fn scan_root_symlink_is_counted_in_issue_summary() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(ScanMessage::Started {
+            scan_id: 1,
+            path: "/root-link".into(),
+            root_node: NodeRecord {
+                name: "root-link".into(),
+                kind: NodeKind::Symlink,
+                size: 0,
+                modified_secs: None,
+                scanned: true,
+                error: None,
+            },
+        });
+
+        assert_eq!(app.scan.issue_summary().symlinks, 1);
     }
 
     #[test]
@@ -2780,7 +2787,7 @@ mod tests {
         );
         assert_eq!(prefs.get(STORAGE_PROTECTED_PATHS), Some("/keep\n/safe"));
         assert_eq!(prefs.get(STORAGE_INCLUDE_HIDDEN), Some("false"));
-        assert_eq!(prefs.get(STORAGE_FOLLOW_SYMLINKS), Some("true"));
+        assert_eq!(prefs.get(STORAGE_FOLLOW_SYMLINKS), Some("false"));
         assert_eq!(prefs.get(STORAGE_STAY_ON_FILESYSTEM), Some("true"));
         assert_eq!(prefs.get(STORAGE_SQLITE_CACHE), Some("false"));
         assert_eq!(prefs.get(STORAGE_SEARCH_FILTER), Some("true"));
@@ -2822,7 +2829,7 @@ mod tests {
         assert_eq!(app.exclude_input, ".git,target");
         assert_eq!(app.protected_paths_input, "/keep,/safe");
         assert!(!app.include_hidden);
-        assert!(app.follow_symlinks);
+        assert!(!app.follow_symlinks);
         assert!(app.stay_on_filesystem);
         assert!(!app.realtime_watch_enabled);
         assert!(!app.sqlite_cache_enabled);
@@ -2896,7 +2903,7 @@ mod tests {
             .expect("profile should restore from local state");
         assert_eq!(profile.exclude_patterns, vec!["target", ".git"]);
         assert!(!profile.include_hidden);
-        assert!(profile.follow_symlinks);
+        assert!(!profile.follow_symlinks);
         assert!(profile.stay_on_filesystem);
         assert!(!profile.sqlite_cache_enabled);
         assert!(!profile.realtime_watch_enabled);
@@ -3374,7 +3381,7 @@ mod tests {
         assert!(metadata.search_filter_enabled);
         assert_eq!(metadata.color_mode, "extension");
         assert!(!metadata.include_hidden);
-        assert!(metadata.follow_symlinks);
+        assert!(!metadata.follow_symlinks);
         assert!(metadata.stay_on_filesystem);
         assert!(metadata.sqlite_cache_enabled);
         assert!(metadata.realtime_watch_enabled);
@@ -3478,6 +3485,8 @@ mod tests {
         app.navigation.set_selected_id(Some(2));
         let active_scan_id = app.scan.active_id();
 
+        app.move_node_to_trash(2);
+        assert!(file.exists(), "first click should only arm confirmation");
         app.move_node_to_trash(2);
 
         assert!(!file.exists());
@@ -3607,82 +3616,16 @@ mod tests {
         let options = app.scan_options();
 
         assert!(!options.include_hidden);
-        assert!(options.follow_symlinks);
+        assert!(!options.follow_symlinks);
         assert!(options.stay_on_filesystem);
     }
 
     #[test]
-    fn rescan_paths_target_scan_root_and_focused_directory() {
+    fn watch_rescan_path_tracks_scan_root() {
         let mut app = app_with_search_matches();
         app.tree.set_root_path("/root".into());
 
         assert_eq!(app.scan_root_rescan_path(), Some(PathBuf::from("/root")));
-        app.enter_root(1, true);
-
-        assert_eq!(
-            app.focused_subtree_rescan_path(),
-            Some(PathBuf::from("/root/match-dir"))
-        );
-        assert!(app.can_rescan_scan_root());
-        assert!(app.can_rescan_focused_subtree());
-    }
-
-    #[test]
-    fn focused_rescan_uses_parent_directory_after_file_search_match() {
-        let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
-
-        app.navigate_search_match(SearchDirection::Next);
-        app.navigate_search_match(SearchDirection::Next);
-
-        assert_eq!(app.navigation.selected_id(), Some(2));
-        assert_eq!(app.navigation.focused_root(), Some(1));
-        assert_eq!(
-            app.focused_subtree_rescan_path(),
-            Some(PathBuf::from("/root/match-dir"))
-        );
-    }
-
-    #[test]
-    fn rescan_is_unavailable_without_loaded_scan_root() {
-        let mut app = DiskMapApp::default();
-
-        assert!(!app.can_rescan_scan_root());
-        assert!(!app.can_rescan_focused_subtree());
-    }
-
-    #[test]
-    fn incremental_rescan_target_uses_deepest_known_directory() {
-        let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
-
-        let target =
-            app.incremental_rescan_target(&[PathBuf::from("/root/match-dir/nested/file.txt")]);
-
-        assert_eq!(target, Some((1, PathBuf::from("/root/match-dir"))));
-    }
-
-    #[test]
-    fn incremental_rescan_target_falls_back_to_scan_root_for_unknown_child() {
-        let mut app = app_with_search_matches();
-        app.tree.set_root_path("/root".into());
-
-        let target = app.incremental_rescan_target(&[PathBuf::from("/root/new-dir/file.txt")]);
-
-        assert_eq!(target, Some((0, PathBuf::from("/root"))));
-    }
-
-    #[test]
-    fn incremental_rescan_target_uses_parent_when_known_directory_was_deleted() {
-        let mut app = app_with_search_matches();
-        let root = unique_temp_path("disk-map-incremental-deleted-dir");
-        std::fs::create_dir_all(&root).expect("incremental rescan test root should be created");
-        app.tree.set_root_path(root.clone());
-
-        let target = app.incremental_rescan_target(&[root.join("match-dir")]);
-
-        assert_eq!(target, Some((0, root.clone())));
-        std::fs::remove_dir_all(root).expect("incremental rescan test root should be removed");
     }
 
     #[test]
@@ -3816,6 +3759,77 @@ mod tests {
 
         assert_eq!(finished_message.title, "Empty folder");
         assert!(finished_message.detail.contains("root"));
+    }
+
+    #[test]
+    fn zero_byte_only_directory_has_an_explicit_finished_state() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![DiscoveredNode {
+                    node_id: 1,
+                    parent_id: 0,
+                    node: NodeRecord {
+                        name: "empty.txt".into(),
+                        kind: NodeKind::File,
+                        size: 0,
+                        modified_secs: None,
+                        scanned: true,
+                        error: None,
+                    },
+                }],
+                size_deltas: vec![],
+                scanned_nodes: vec![1],
+                progress: None,
+            },
+        });
+
+        let message = app
+            .empty_root_state_message(0)
+            .expect("zero-byte directory state");
+
+        assert_eq!(message.title, "No disk space used");
+        assert!(message.detail.contains("1 item"));
+    }
+
+    #[test]
+    fn regular_file_root_has_a_file_state_instead_of_empty_folder() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(ScanMessage::Started {
+            scan_id: 1,
+            path: "/root/file.bin".into(),
+            root_node: NodeRecord {
+                name: "file.bin".into(),
+                kind: NodeKind::File,
+                size: 4096,
+                modified_secs: None,
+                scanned: true,
+                error: None,
+            },
+        });
+
+        let message = app
+            .empty_root_state_message(0)
+            .expect("single-file root state");
+
+        assert_eq!(message.title, "File scanned");
+        assert!(message.detail.contains("file.bin"));
+        assert!(message.detail.contains(&format_bytes(4096)));
+    }
+
+    #[test]
+    fn disabling_watch_clears_a_pending_follow_up_scan() {
+        let mut app = DiskMapApp {
+            realtime_watch_enabled: false,
+            watch_rescan_pending: true,
+            ..Default::default()
+        };
+
+        app.update_watch_state();
+
+        assert!(!app.watch_rescan_pending);
     }
 
     #[test]

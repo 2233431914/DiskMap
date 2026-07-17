@@ -8,6 +8,8 @@ const MAX_VISUAL_NODES: usize = 12_000;
 const MIN_DRAW_SIDE: f32 = 2.0;
 const INNER_PADDING: f32 = 1.0;
 const STRIP_ASPECT_WARNING: f32 = 10.0;
+const SMALL_FILE_VISUAL_THRESHOLD_BYTES: u64 = 16 * 1024;
+const MIN_SMALL_FILE_AGGREGATE_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelMode {
@@ -19,6 +21,11 @@ pub enum LabelMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisualKind {
     Node(NodeId),
+    SmallFiles {
+        parent_id: NodeId,
+        count: u32,
+        size: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -45,8 +52,18 @@ pub struct SearchState {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum LayoutItemKind {
+    Node(NodeId),
+    SmallFiles {
+        parent_id: NodeId,
+        count: u32,
+        size: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
 struct LayoutItem {
-    node_id: NodeId,
+    kind: LayoutItemKind,
     area: f32,
 }
 
@@ -276,16 +293,57 @@ fn layout_node_squarified(
     if items.capacity() < children.len() {
         items.reserve(children.len() - items.capacity());
     }
+    let aggregate_small_files = !context.search_state.has_query();
+    let mut small_file_size = 0_u64;
+    let mut small_file_count = 0_usize;
+    let mut small_file_ids = SmallVec::<[NodeId; 8]>::new();
+
     for &node_id in children {
         if context.filter_to_search && !context.search_state.visible_in_filter(node_id) {
             continue;
         }
-        let size = context.tree.node(node_id).size;
+        let node = context.tree.node(node_id);
+        let size = node.size;
         if size > 0 {
-            items.push(LayoutItem {
+            if aggregate_small_files
+                && matches!(node.kind, crate::tree::NodeKind::File)
+                && size <= SMALL_FILE_VISUAL_THRESHOLD_BYTES
+            {
+                small_file_size = small_file_size.saturating_add(size);
+                small_file_count += 1;
+                if small_file_ids.len() < MIN_SMALL_FILE_AGGREGATE_COUNT {
+                    small_file_ids.push(node_id);
+                }
+                continue;
+            }
+
+            items.push(layout_item_for_node(
                 node_id,
-                area: (size as f32 / total_child_size as f32) * parent_area,
-            });
+                size,
+                total_child_size,
+                parent_area,
+            ));
+        }
+    }
+
+    if small_file_count >= MIN_SMALL_FILE_AGGREGATE_COUNT {
+        items.push(LayoutItem {
+            kind: LayoutItemKind::SmallFiles {
+                parent_id,
+                count: u32::try_from(small_file_count).unwrap_or(u32::MAX),
+                size: small_file_size,
+            },
+            area: (small_file_size as f32 / total_child_size as f32) * parent_area,
+        });
+    } else {
+        for node_id in small_file_ids {
+            let size = context.tree.node(node_id).size;
+            items.push(layout_item_for_node(
+                node_id,
+                size,
+                total_child_size,
+                parent_area,
+            ));
         }
     }
     if items.is_empty() {
@@ -297,6 +355,18 @@ fn layout_node_squarified(
     context.scratch.items = items;
 
     emit_debug_warnings(depth, &debug_stats);
+}
+
+fn layout_item_for_node(
+    node_id: NodeId,
+    size: u64,
+    total_child_size: u64,
+    parent_area: f32,
+) -> LayoutItem {
+    LayoutItem {
+        kind: LayoutItemKind::Node(node_id),
+        area: (size as f32 / total_child_size as f32) * parent_area,
+    }
 }
 
 fn squarify_items(
@@ -440,7 +510,7 @@ fn layout_horizontal_row(
             pos2((x + width).min(row_rect.right()), row_rect.bottom()),
         );
         x = item_rect.right();
-        emit_visual_and_recurse(context, item.node_id, item_rect, depth, debug_stats);
+        emit_visual_and_recurse(context, item.kind, item_rect, depth, debug_stats);
     }
 
     Rect::from_min_max(
@@ -483,7 +553,7 @@ fn layout_vertical_column(
             pos2(column_rect.right(), (y + height).min(column_rect.bottom())),
         );
         y = item_rect.bottom();
-        emit_visual_and_recurse(context, item.node_id, item_rect, depth, debug_stats);
+        emit_visual_and_recurse(context, item.kind, item_rect, depth, debug_stats);
     }
 
     Rect::from_min_max(
@@ -494,7 +564,7 @@ fn layout_vertical_column(
 
 fn emit_visual_and_recurse(
     context: &mut LayoutContext<'_>,
-    node_id: NodeId,
+    kind: LayoutItemKind,
     raw_rect: Rect,
     depth: usize,
     debug_stats: &mut LayoutDebugStats,
@@ -517,14 +587,27 @@ fn emit_visual_and_recurse(
         return;
     }
 
-    context.out.push(make_visual_node(
-        context.tree,
-        node_id,
-        draw_rect,
-        depth,
-        context.root_id,
-        context.search_state,
-    ));
+    match kind {
+        LayoutItemKind::Node(node_id) => context.out.push(make_visual_node(
+            context.tree,
+            node_id,
+            draw_rect,
+            depth,
+            context.root_id,
+            context.search_state,
+        )),
+        LayoutItemKind::SmallFiles {
+            parent_id,
+            count,
+            size,
+        } => context.out.push(make_small_files_visual(
+            parent_id, count, size, draw_rect, depth,
+        )),
+    }
+
+    let LayoutItemKind::Node(node_id) = kind else {
+        return;
+    };
 
     if depth + 1 >= context.max_depth {
         return;
@@ -543,6 +626,37 @@ fn emit_visual_and_recurse(
     layout_node_squarified(context, node_id, inner_rect, depth + 1);
 }
 
+fn make_small_files_visual(
+    parent_id: NodeId,
+    count: u32,
+    size: u64,
+    rect: Rect,
+    depth: usize,
+) -> VisualNode {
+    let label_mode = label_mode_for_rect(rect);
+    VisualNode {
+        kind: VisualKind::SmallFiles {
+            parent_id,
+            count,
+            size,
+        },
+        rect,
+        depth,
+        is_dir: false,
+        size,
+        label_mode,
+        matched: false,
+        ancestor_of_match: false,
+        hidden_by_search: false,
+        label_text: match label_mode {
+            LabelMode::Hidden => None,
+            LabelMode::Full | LabelMode::Compact => {
+                Some(format!("Other Files ({count})\n{}", format_bytes(size)))
+            }
+        },
+    }
+}
+
 fn inset_rect(rect: Rect, padding: f32) -> Rect {
     rect.shrink2(Vec2::new(
         padding.min(rect.width() * 0.5),
@@ -559,7 +673,7 @@ pub fn rect_aspect_ratio(rect: Rect) -> f32 {
 
 #[cfg(debug_assertions)]
 fn emit_debug_warnings(depth: usize, stats: &LayoutDebugStats) {
-    if stats.row_count > 0 && stats.single_item_rows == stats.row_count {
+    if stats.row_count > 1 && stats.single_item_rows == stats.row_count {
         eprintln!(
             "warning: squarify grouping failed at depth {depth}: every row had exactly one item"
         );
@@ -761,8 +875,9 @@ mod tests {
 
         let emitted_ids: Vec<NodeId> = visuals
             .iter()
-            .map(|visual| match visual.kind {
-                VisualKind::Node(node_id) => node_id,
+            .filter_map(|visual| match visual.kind {
+                VisualKind::Node(node_id) => Some(node_id),
+                VisualKind::SmallFiles { .. } => None,
             })
             .collect();
         assert!(emitted_ids.contains(&dir));
@@ -853,8 +968,51 @@ mod tests {
     }
 
     #[test]
+    fn layout_aggregates_many_small_files_without_changing_tree_data() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
+        tree.set_root_path("/root".into());
+        for index in 0..8 {
+            tree.add_node(
+                Some(root),
+                format!("small-{index}.txt"),
+                NodeKind::File,
+                100,
+            );
+        }
+        tree.apply_direct_size_delta(root, 800);
+        tree.repair_sorted_children(&[root]);
+        let original_len = tree.len();
+        let mut visuals = Vec::new();
+        let mut scratch = LayoutScratch::default();
+
+        layout_treemap(
+            &mut tree,
+            TreemapLayoutParams {
+                root,
+                canvas_rect: Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 500.0)),
+                max_depth: 1,
+                search_state: &SearchState::default(),
+                filter_to_search: false,
+                out: &mut visuals,
+                scratch: &mut scratch,
+            },
+        );
+
+        assert_eq!(tree.len(), original_len);
+        assert!(visuals.iter().any(|visual| matches!(
+            visual.kind,
+            VisualKind::SmallFiles {
+                parent_id: id,
+                count: 8,
+                size: 800
+            } if id == root
+        )));
+    }
+
+    #[test]
     fn squarified_algorithm_forms_multi_item_groups_and_avoids_full_width_strips() {
-        let sizes = [1405_u64, 475, 339, 127, 99, 64, 51, 32, 7, 6, 5, 4];
+        let sizes = [1405_u64, 475, 339, 127, 99, 64, 51, 32, 7, 6, 5, 4].map(|size| size * 1024);
         let (mut tree, root) = sample_tree(&sizes);
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 600.0));
         let mut visuals = Vec::new();

@@ -1,6 +1,6 @@
 use crate::platform::{self, PlatformProtectedPathReason};
 use crate::tree::{NodeId, NodeKind};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupCandidate {
@@ -113,14 +113,34 @@ pub fn protected_path_reason_with_deny_list(
     path: &Path,
     user_deny_list: &[PathBuf],
 ) -> Option<ProtectedPathReason> {
+    let path_candidates = cleanup_path_candidates(path);
+    let deny_candidates: Vec<PathBuf> = user_deny_list
+        .iter()
+        .flat_map(|denied| cleanup_path_candidates(denied).into_iter())
+        .collect();
+
+    path_candidates
+        .iter()
+        .find_map(|candidate| protected_path_reason_for_candidate(candidate, &deny_candidates))
+}
+
+fn protected_path_reason_for_candidate(
+    path: &Path,
+    user_deny_list: &[PathBuf],
+) -> Option<ProtectedPathReason> {
     if path == Path::new("/") {
         return Some(ProtectedPathReason::FilesystemRoot);
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        if path == home {
-            return Some(ProtectedPathReason::HomeRoot);
-        }
+    if std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .is_some_and(|home| {
+            cleanup_path_candidates(&home)
+                .iter()
+                .any(|home| path == home)
+        })
+    {
+        return Some(ProtectedPathReason::HomeRoot);
     }
 
     if let Some(reason) = platform::protected_path_reason(path) {
@@ -149,6 +169,7 @@ pub fn parse_protected_paths(input: &str) -> Vec<PathBuf> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+        .map(|path| normalize_cleanup_path(&path))
     {
         if !paths.iter().any(|existing| existing == &path) {
             paths.push(path);
@@ -158,15 +179,79 @@ pub fn parse_protected_paths(input: &str) -> Vec<PathBuf> {
 }
 
 pub fn validate_cleanup_target(path: &Path, user_deny_list: &[PathBuf]) -> CleanupTargetStatus {
-    if let Some(reason) = protected_path_reason_with_deny_list(path, user_deny_list) {
+    let path = normalize_cleanup_path(path);
+    if let Some(reason) = protected_path_reason_with_deny_list(&path, user_deny_list) {
         return CleanupTargetStatus::Protected(reason);
     }
 
-    match path.try_exists() {
-        Ok(true) => CleanupTargetStatus::Ready,
-        Ok(false) => CleanupTargetStatus::Missing,
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => CleanupTargetStatus::Ready,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CleanupTargetStatus::Missing,
         Err(error) => CleanupTargetStatus::Inaccessible(error.to_string()),
     }
+}
+
+/// Makes a cleanup operation path absolute without changing how the OS resolves
+/// symlinks and parent components when the action is executed.
+pub fn normalize_cleanup_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn cleanup_path_candidates(path: &Path) -> Vec<PathBuf> {
+    let operation_path = normalize_cleanup_path(path);
+    let mut candidates = vec![operation_path.clone()];
+
+    let lexical_path = normalize_path_components(&operation_path);
+    if !candidates.contains(&lexical_path) {
+        candidates.push(lexical_path);
+    }
+
+    if let Some(resolved_path) = resolve_cleanup_path(&operation_path) {
+        if !candidates.contains(&resolved_path) {
+            candidates.push(resolved_path);
+        }
+    }
+
+    candidates
+}
+
+fn resolve_cleanup_path(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().or_else(|| {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_symlink() {
+            return None;
+        }
+        let file_name = path.file_name()?;
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.join(file_name))
+    })
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -256,15 +341,102 @@ mod tests {
     }
 
     #[test]
-    fn parse_protected_paths_splits_and_deduplicates() {
+    fn protected_paths_cannot_be_bypassed_with_parent_components() {
         assert_eq!(
-            parse_protected_paths("/a, /b; /a\n/c"),
-            vec![
-                PathBuf::from("/a"),
-                PathBuf::from("/b"),
-                PathBuf::from("/c")
-            ]
+            protected_path_reason(Path::new("/tmp/../")),
+            Some(ProtectedPathReason::FilesystemRoot)
         );
+
+        let denied = vec![PathBuf::from("/Users/me/keep")];
+        assert_eq!(
+            protected_path_reason_with_deny_list(
+                Path::new("/Users/me/other/../keep/cache"),
+                &denied
+            ),
+            Some(ProtectedPathReason::UserDenyList)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_protected_target_is_blocked_without_rewriting_operation_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::current_dir()
+            .expect("test current dir should be available")
+            .join("target/test-temp/cleanup-symlink");
+        std::fs::create_dir_all(&root).expect("cleanup symlink fixture should be created");
+        let link = root.join("root-link");
+        symlink(Path::new("/"), &link).expect("cleanup symlink should be created");
+
+        assert_eq!(
+            protected_path_reason(&link),
+            Some(ProtectedPathReason::FilesystemRoot)
+        );
+        assert_eq!(normalize_cleanup_path(&link), link);
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_path_preserves_symlink_aware_parent_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::current_dir()
+            .expect("test current dir should be available")
+            .join(format!(
+                "target/test-temp/cleanup-parent-symlink-{}",
+                std::process::id()
+            ));
+        let actual_parent = root.join("actual");
+        let child = actual_parent.join("child");
+        let link = root.join("link");
+        let victim = actual_parent.join("victim");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&child).expect("cleanup fixture should be created");
+        std::fs::write(&victim, b"keep").expect("protected fixture should be created");
+        symlink(&child, &link).expect("cleanup symlink should be created");
+        let operation_path = link.join("..").join("victim");
+
+        assert_eq!(normalize_cleanup_path(&operation_path), operation_path);
+        assert_eq!(
+            validate_cleanup_target(&operation_path, std::slice::from_ref(&actual_parent)),
+            CleanupTargetStatus::Protected(ProtectedPathReason::UserDenyList)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_cleanup_target_accepts_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::current_dir()
+            .expect("test current dir should be available")
+            .join("target/test-temp/cleanup-dangling-symlink");
+        std::fs::create_dir_all(&root).expect("cleanup symlink fixture should be created");
+        let link = root.join("missing-link");
+        symlink(root.join("does-not-exist"), &link).expect("dangling symlink should be created");
+
+        assert_eq!(
+            validate_cleanup_target(&link, &[]),
+            CleanupTargetStatus::Ready
+        );
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[test]
+    fn parse_protected_paths_splits_and_deduplicates() {
+        let parsed = parse_protected_paths("/a, /b; /a\n/c");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], normalize_cleanup_path(Path::new("/a")));
+        assert_eq!(parsed[1], normalize_cleanup_path(Path::new("/b")));
+        assert_eq!(parsed[2], normalize_cleanup_path(Path::new("/c")));
     }
 
     #[test]

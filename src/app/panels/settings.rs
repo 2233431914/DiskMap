@@ -63,14 +63,8 @@ pub fn show_settings_window(ctx: &egui::Context, app: &mut DiskMapApp) {
                 "Excluded names or path fragments; comma, semicolon, or newline separated",
             );
 
-            ui.columns(2, |cols| {
-                cols[0]
-                    .checkbox(&mut app.include_hidden, "Hidden")
-                    .on_hover_text("Include hidden files and folders");
-                cols[1]
-                    .checkbox(&mut app.follow_symlinks, "Links")
-                    .on_hover_text("Follow symlinked directories during scan");
-            });
+            ui.checkbox(&mut app.include_hidden, "Hidden")
+                .on_hover_text("Include hidden files and folders");
             ui.columns(2, |cols| {
                 cols[0]
                     .checkbox(&mut app.stay_on_filesystem, "Same FS")

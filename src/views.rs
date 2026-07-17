@@ -1,21 +1,8 @@
-//! Saved views: per-root capture of UI view state (depth, search
-//! query, focused node, selected node, color mode, last report
-//! panel). `ViewStore` and `FilterStore` are persisted as part of the
-//! app's crash-safe local state.
+//! Legacy per-root view and filter state kept in crash-safe local storage.
+//! Production UI actions for these records are currently deferred.
 //!
-//! Design notes:
-//!  - One entry per scan root. No "list all views in the sidebar"
-//!    — the spec said "saved views" plural but in practice a
-//!    self-use tool with one canonical view per root covers 95% of
-//!    the use case. A flat list would be more UI surface than value.
-//!  - "Save current view" captures the current state and stores it
-//!    under the current root. Last-write-wins.
-//!  - "Apply view" applies a saved view's state to the live UI
-//!    fields. It does not re-trigger a scan — the user does that
-//!    explicitly. This matches `apply_profile_to_ui` semantics.
-//!  - `last_report_mode` is a static string discriminator
-//!    ("none" | "duplicates" | "insights" | "rules" | "snapshot")
-//!    so we don't take a dependency on a particular panel's enum.
+//! The records remain serializable so older local state can be read without
+//! migration churn when the corresponding UI workflows return.
 
 use crate::tree::NodeId;
 use serde::{Deserialize, Serialize};
@@ -178,11 +165,9 @@ mod tests {
 
 // --- Saved filter presets --------------------------------------------------
 //
-// A filter preset is a named bundle of (search query, filter enabled).
-// We keep it separate from `ViewState` (which captures depth, color mode,
-// report panel) because filter presets are small enough to surface as
-// one-click rows in the sidebar, and they're a common daily workflow:
-// "I always want to look for *.log files" or "stuff > 100MB".
+// A filter preset is a named bundle of (search query, filter enabled). It is
+// retained as a compact persisted record while the production preset UI is
+// deferred.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterPreset {

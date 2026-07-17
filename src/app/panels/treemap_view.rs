@@ -81,10 +81,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
 
     app.hovered_visual_kind =
         find_hovered_visual(&app.cached_visuals, response.hover_pos()).map(|visual| visual.kind);
-    app.hovered_id = app.hovered_visual_kind.map(|kind| match kind {
-        VisualKind::Node(node_id) => node_id,
+    app.hovered_id = app.hovered_visual_kind.and_then(|kind| match kind {
+        VisualKind::Node(node_id) => Some(node_id),
+        VisualKind::SmallFiles { .. } => None,
     });
-
     if response.secondary_clicked() {
         app.context_menu_target_id = app.hovered_id;
     }
@@ -93,20 +93,26 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         app.paint_visual(ui, &painter, visual);
     }
     if response.double_clicked() {
-        if let Some(node_id) = app.hovered_id {
-            if !app.tree.node(node_id).children.is_empty() {
-                app.enter_root(node_id, true);
-            } else {
-                app.navigation.set_selected_id(Some(node_id));
+        match app.hovered_visual_kind {
+            Some(VisualKind::Node(node_id)) => {
+                if !app.tree.node(node_id).children.is_empty() {
+                    app.enter_root(node_id, true);
+                } else {
+                    app.navigation.set_selected_id(Some(node_id));
+                }
             }
-        } else {
-            app.navigation.set_selected_id(None);
+            Some(VisualKind::SmallFiles { parent_id, .. }) => {
+                app.navigation.set_selected_id(Some(parent_id));
+            }
+            None => app.navigation.set_selected_id(None),
         }
     } else if response.clicked() {
-        if let Some(node_id) = app.hovered_id {
-            app.navigation.set_selected_id(Some(node_id));
-        } else {
-            app.navigation.set_selected_id(None);
+        match app.hovered_visual_kind {
+            Some(VisualKind::Node(node_id)) => app.navigation.set_selected_id(Some(node_id)),
+            Some(VisualKind::SmallFiles { parent_id, .. }) => {
+                app.navigation.set_selected_id(Some(parent_id));
+            }
+            None => app.navigation.set_selected_id(None),
         }
     }
 
@@ -173,15 +179,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                     ui.close();
                 }
                 ui.separator();
+                let trash_label = if app.trash_confirm_target_id == Some(node_id) {
+                    "Confirm Move to Trash"
+                } else {
+                    "Move to Trash"
+                };
                 let trash_response = ui.add_enabled(
                     node_path.is_some(),
-                    egui::Button::new("Move to Trash")
-                        .min_size(Vec2::new(ui.available_width(), 24.0)),
+                    egui::Button::new(trash_label).min_size(Vec2::new(ui.available_width(), 24.0)),
                 );
                 let trash_response = if node_path.is_none() {
                     trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
                 } else {
-                    trash_response.on_hover_text("Move this item to Trash")
+                    trash_response.on_hover_text("Move this item to Trash; click again to confirm")
                 };
                 if trash_response.clicked() {
                     app.move_node_to_trash(node_id);
@@ -198,9 +208,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     }
 
     if !context_menu_open {
-        if let Some(node_id) = app.hovered_id {
+        if let Some(kind) = app.hovered_visual_kind {
             if let Some(pos) = response.hover_pos() {
-                app.show_hover_tooltip(ui, node_id, pos);
+                match kind {
+                    VisualKind::Node(node_id) => app.show_hover_tooltip(ui, node_id, pos),
+                    VisualKind::SmallFiles {
+                        parent_id,
+                        count,
+                        size,
+                    } => app.show_small_files_hover_tooltip(ui, parent_id, count, size, pos),
+                }
             }
         }
     }

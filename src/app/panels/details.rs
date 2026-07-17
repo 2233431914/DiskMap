@@ -44,6 +44,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         app.show_scan_issue_section(ui, p);
         return;
     };
+    if app
+        .trash_confirm_target_id
+        .is_some_and(|confirmed_id| confirmed_id != node_id)
+    {
+        app.clear_trash_confirmation();
+    }
 
     let node_path = app.tree.node_real_path(node_id);
     let (node_name, node_size, node_kind, child_count, node_scanned, node_error, node_parent) = {
@@ -185,14 +191,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     }
     ui.add_space(4.0);
     let trash_width = ui.available_width();
+    let trash_label = if app.trash_confirm_target_id == Some(node_id) {
+        "Confirm Move to Trash"
+    } else {
+        "Move to Trash"
+    };
     let trash_response = ui.add_enabled(
         path_available,
-        egui::Button::new("Move to Trash").min_size(Vec2::new(trash_width, 28.0)),
+        egui::Button::new(trash_label).min_size(Vec2::new(trash_width, 28.0)),
     );
     let trash_response = if !path_available {
         trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
     } else {
-        trash_response.on_hover_text("Move this item to Trash")
+        trash_response.on_hover_text("Move this item to Trash; click again to confirm")
     };
     if trash_response.clicked() {
         app.move_node_to_trash(node_id);

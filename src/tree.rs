@@ -221,39 +221,6 @@ impl TreeStore {
         self.nodes[node_index(node_id)].scanned = true;
     }
 
-    pub fn replace_children_from(
-        &mut self,
-        target_id: NodeId,
-        source: &TreeStore,
-    ) -> Option<Vec<NodeId>> {
-        let target_index = node_index(target_id);
-        if target_index >= self.nodes.len()
-            || !matches!(self.nodes[target_index].kind, NodeKind::Dir)
-        {
-            return None;
-        }
-
-        let source_root = source.root?;
-        let source_root_node = source.node(source_root);
-        let old_size = self.nodes[target_index].size;
-        let new_size = source_root_node.size;
-
-        self.nodes[target_index].children.clear();
-        self.nodes[target_index].size = new_size;
-        self.nodes[target_index].scanned = source_root_node.scanned;
-        self.nodes[target_index].error = source_root_node.error.clone();
-        self.nodes[target_index].sort_dirty = true;
-
-        let mut appended_ids = Vec::new();
-        for source_child in source_root_node.children.clone() {
-            self.append_subtree_from(source, source_child, target_id, &mut appended_ids);
-        }
-
-        self.adjust_ancestor_sizes(target_id, old_size, new_size);
-        self.path_cache.clear();
-        Some(appended_ids)
-    }
-
     pub fn detach_subtree(&mut self, node_id: NodeId) -> Option<DetachedSubtree> {
         let target_index = node_index(node_id);
         if target_index >= self.nodes.len() {
@@ -332,44 +299,6 @@ impl TreeStore {
         });
         self.nodes[index].children = children;
         self.nodes[index].sort_dirty = false;
-    }
-
-    fn append_subtree_from(
-        &mut self,
-        source: &TreeStore,
-        source_id: NodeId,
-        parent_id: NodeId,
-        appended_ids: &mut Vec<NodeId>,
-    ) {
-        let source_node = source.node(source_id);
-        let record = NodeRecord {
-            name: source_node.name.clone(),
-            kind: source_node.kind,
-            size: source_node.size,
-            modified_secs: source_node.modified_secs,
-            scanned: source_node.scanned,
-            error: source_node.error.clone(),
-        };
-        let new_id = self.push_node(Some(parent_id), record);
-        appended_ids.push(new_id);
-
-        for child_id in source_node.children.clone() {
-            self.append_subtree_from(source, child_id, new_id, appended_ids);
-        }
-    }
-
-    fn adjust_ancestor_sizes(&mut self, node_id: NodeId, old_size: u64, new_size: u64) {
-        let mut current = self.nodes[node_index(node_id)].parent;
-        while let Some(id) = current {
-            let index = node_index(id);
-            if new_size >= old_size {
-                self.nodes[index].size = self.nodes[index].size.saturating_add(new_size - old_size);
-            } else {
-                self.nodes[index].size = self.nodes[index].size.saturating_sub(old_size - new_size);
-            }
-            self.nodes[index].sort_dirty = true;
-            current = self.nodes[index].parent;
-        }
     }
 
     pub fn set_root_path(&mut self, path: PathBuf) {
@@ -516,46 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn replace_children_from_keeps_target_id_and_updates_ancestor_sizes() {
-        let mut tree = TreeStore::new();
-        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 30);
-        tree.set_root_path("/root".into());
-        let target = tree.add_node(Some(root), "target".into(), NodeKind::Dir, 10);
-        let old_file = tree.add_node(Some(target), "old.txt".into(), NodeKind::File, 10);
-        let sibling = tree.add_node(Some(root), "sibling.txt".into(), NodeKind::File, 20);
-
-        let mut replacement = TreeStore::new();
-        let replacement_root = replacement.add_node(None, "target".into(), NodeKind::Dir, 5);
-        replacement.set_root_path("/replacement".into());
-        replacement.add_node(Some(replacement_root), "new.txt".into(), NodeKind::File, 5);
-
-        let appended = tree
-            .replace_children_from(target, &replacement)
-            .expect("replacement");
-
-        assert_eq!(tree.root, Some(root));
-        assert_eq!(tree.node(root).size, 25);
-        assert_eq!(tree.node(target).size, 5);
-        assert_eq!(tree.node(target).children, appended);
-        assert_eq!(tree.node(appended[0]).name, "new.txt");
-        assert_eq!(tree.node(appended[0]).parent, Some(target));
-        assert_eq!(tree.node(old_file).parent, Some(target));
-        assert!(!tree.node(target).children.contains(&old_file));
-        assert!(tree.node(root).children.contains(&sibling));
-    }
-
-    #[test]
-    fn replace_children_from_rejects_non_directory_targets() {
-        let mut tree = TreeStore::new();
-        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 1);
-        let file = tree.add_node(Some(root), "file.txt".into(), NodeKind::File, 1);
-        let mut replacement = TreeStore::new();
-        replacement.add_node(None, "file.txt".into(), NodeKind::Dir, 0);
-
-        assert!(tree.replace_children_from(file, &replacement).is_none());
-    }
-
-    #[test]
     fn detach_subtree_removes_child_and_updates_ancestor_sizes() {
         let mut tree = TreeStore::new();
         let root = tree.add_node(None, "root".into(), NodeKind::Dir, 30);
@@ -590,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn node_records_preserve_modified_time_through_insert_and_replacement() {
+    fn node_records_preserve_modified_time_through_insert() {
         let mut tree = TreeStore::new();
         let root = tree.add_node(None, "root".into(), NodeKind::Dir, 0);
         let file = tree.add_node_with_modified(
@@ -603,20 +492,6 @@ mod tests {
 
         assert_eq!(tree.node(file).modified_secs, Some(123));
 
-        let mut replacement = TreeStore::new();
-        let replacement_root = replacement.add_node(None, "root".into(), NodeKind::Dir, 0);
-        replacement.add_node_with_modified(
-            Some(replacement_root),
-            "new.txt".into(),
-            NodeKind::File,
-            5,
-            Some(456),
-        );
-
-        let appended = tree
-            .replace_children_from(root, &replacement)
-            .expect("replacement");
-
-        assert_eq!(tree.node(appended[0]).modified_secs, Some(456));
+        assert_eq!(tree.node(file).modified_secs, Some(123));
     }
 }

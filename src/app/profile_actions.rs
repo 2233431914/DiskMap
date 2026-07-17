@@ -15,7 +15,7 @@ impl DiskMapApp {
         };
         self.exclude_input = profile.exclude_patterns.join(",");
         self.include_hidden = profile.include_hidden;
-        self.follow_symlinks = profile.follow_symlinks;
+        self.follow_symlinks = false;
         self.stay_on_filesystem = profile.stay_on_filesystem;
         self.sqlite_cache_enabled = false;
         self.search_filter_enabled = profile.search_filter_enabled;
@@ -32,7 +32,7 @@ impl DiskMapApp {
         let profile = ScanProfile {
             exclude_patterns: parse_exclude_patterns(&self.exclude_input),
             include_hidden: self.include_hidden,
-            follow_symlinks: self.follow_symlinks,
+            follow_symlinks: false,
             stay_on_filesystem: self.stay_on_filesystem,
             sqlite_cache_enabled: false,
             search_filter_enabled: self.search_filter_enabled,

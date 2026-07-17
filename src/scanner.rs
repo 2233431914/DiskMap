@@ -29,6 +29,8 @@ pub struct ScanOptions {
     pub cache_path: Option<PathBuf>,
     pub exclude_patterns: Vec<String>,
     pub include_hidden: bool,
+    /// Legacy compatibility field. Traversal is disabled for safety; callers
+    /// requesting `true` receive the same non-following scan semantics.
     pub follow_symlinks: bool,
     pub stay_on_filesystem: bool,
 }
@@ -219,8 +221,6 @@ const PREFETCH_MEDIUM_DIR_TIME_BUDGET: Duration = Duration::from_millis(45);
 const PREFETCH_LARGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(110);
 const PREFETCH_HUGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(260);
 const PREFETCH_GIANT_DIR_TIME_BUDGET: Duration = Duration::from_millis(380);
-const AGGREGATE_SMALL_FILE_THRESHOLD_BYTES: u64 = 16 * 1024;
-const AGGREGATE_LABEL: &str = "Other Files";
 
 fn prefetch_budget_for_dir(file_count: usize) -> PrefetchBudget {
     if file_count == 0 {
@@ -272,12 +272,6 @@ struct BatchAccumulator {
     progress: Option<ProgressSnapshot>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct AggregateBucket {
-    total_size: u64,
-    file_count: u64,
-}
-
 #[derive(Debug, Clone)]
 struct ScanCounters {
     files_scanned: u64,
@@ -307,11 +301,6 @@ impl ScanCounters {
             current_path: self.current_path.clone(),
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct AggregateState {
-    buckets: FxHashMap<NodeId, AggregateBucket>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,11 +361,6 @@ impl ScanIndex {
 
     fn total_bytes(&self) -> u64 {
         self.total_bytes
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.parents.len()
     }
 }
 
@@ -472,18 +456,6 @@ fn metadata_is_on_device(metadata: &Metadata, device_id: u64) -> bool {
 #[cfg(not(unix))]
 fn metadata_is_on_device(_metadata: &Metadata, _device_id: u64) -> bool {
     true
-}
-
-impl AggregateState {
-    fn add_file(&mut self, parent_id: NodeId, size: u64) {
-        let bucket = self.buckets.entry(parent_id).or_default();
-        bucket.total_size += size;
-        bucket.file_count += 1;
-    }
-
-    fn take_bucket(&mut self, parent_id: NodeId) -> Option<AggregateBucket> {
-        self.buckets.remove(&parent_id)
-    }
 }
 
 impl BatchAccumulator {
@@ -619,9 +591,29 @@ fn run_scan(
     tx: Sender<ScanMessage>,
     cancel: Arc<AtomicBool>,
 ) {
+    let requested_path = path;
+    let had_trailing_separator = requested_path
+        .as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| *byte == std::path::MAIN_SEPARATOR as u8);
+    let path: PathBuf = requested_path.components().collect();
     let mut perf_stats = PerfStats::default();
 
-    if !path.exists() {
+    let root_metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            perf_stats.messages_sent += 1;
+            let _ = tx.send(ScanMessage::Error {
+                scan_id,
+                message: format!("Cannot inspect {}: {error}", path.display()),
+                perf_stats,
+            });
+            return;
+        }
+    };
+
+    if !path.exists() && !root_metadata.file_type().is_symlink() {
         perf_stats.messages_sent += 1;
         let _ = tx.send(ScanMessage::Error {
             scan_id,
@@ -636,13 +628,70 @@ fn run_scan(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
-    let root_node = TreeStore::root_record(root_name);
+    let root_file_type = root_metadata.file_type();
+    if had_trailing_separator && root_file_type.is_symlink() {
+        perf_stats.messages_sent += 1;
+        let _ = tx.send(ScanMessage::Error {
+            scan_id,
+            message: format!(
+                "Refusing to scan symbolic link root with a trailing separator: {}",
+                requested_path.display()
+            ),
+            perf_stats,
+        });
+        return;
+    }
+
+    let root_node = if root_file_type.is_dir() {
+        TreeStore::root_record(root_name)
+    } else if root_file_type.is_file() {
+        NodeRecord {
+            name: root_name,
+            kind: NodeKind::File,
+            size: size_on_disk_bytes(&root_metadata),
+            modified_secs: modified_secs_for_metadata(&root_metadata),
+            scanned: true,
+            error: None,
+        }
+    } else if root_file_type.is_symlink() {
+        NodeRecord {
+            name: root_name,
+            kind: NodeKind::Symlink,
+            size: 0,
+            modified_secs: None,
+            scanned: true,
+            error: None,
+        }
+    } else {
+        perf_stats.messages_sent += 1;
+        let _ = tx.send(ScanMessage::Error {
+            scan_id,
+            message: format!("Unsupported file type: {}", path.display()),
+            perf_stats,
+        });
+        return;
+    };
+    let root_size = root_node.size;
     perf_stats.messages_sent += 1;
     let _ = tx.send(ScanMessage::Started {
         scan_id,
         path: path.clone(),
         root_node,
     });
+
+    if !root_file_type.is_dir() {
+        perf_stats.entries_seen = 1;
+        perf_stats.nodes_discovered = 1;
+        perf_stats.files_scanned = u64::from(root_file_type.is_file());
+        perf_stats.scan_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        perf_stats.messages_sent += 1;
+        let _ = tx.send(ScanMessage::Finished {
+            scan_id,
+            total_bytes: root_size,
+            perf_stats,
+        });
+        return;
+    }
 
     let root_id = node_id_from_index(0);
     let mut scan_index = ScanIndex::new(root_id);
@@ -655,7 +704,6 @@ fn run_scan(
     };
     let mut counters = ScanCounters::new(path.clone(), None);
     let mut batch = BatchAccumulator::new(&options);
-    let mut aggregate_state = AggregateState::default();
     let mut last_flush = Instant::now();
 
     let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
@@ -668,7 +716,9 @@ fn run_scan(
         None
     };
     let include_hidden = options.include_hidden;
-    let follow_symlinks = options.follow_symlinks;
+    // Keep links visible without traversal until link-cycle and path semantics
+    // are explicitly defined.
+    let follow_symlinks = false;
     let walker = WalkDirGeneric::<ScanWalkState>::new(&path)
         .skip_hidden(!include_hidden)
         .follow_links(follow_symlinks)
@@ -739,10 +789,9 @@ fn run_scan(
                 }));
             }
         })
-        .into_iter()
-        .filter_map(|e| e.ok());
+        .into_iter();
 
-    for entry in walker {
+    for entry_result in walker {
         if cancel.load(Ordering::Relaxed) {
             perf_stats.scan_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             flush_batch(
@@ -761,6 +810,53 @@ fn run_scan(
             return;
         }
 
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                perf_stats.entries_seen += 1;
+                let error_path = error.path().unwrap_or(&path).to_path_buf();
+                let parent_path = error_path.parent().unwrap_or(&path);
+                let parent_id = parent_lookup.parent_id_for(
+                    error.depth(),
+                    parent_path,
+                    &error_path,
+                    &mut perf_stats,
+                );
+                let name = error_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Scan error".to_string());
+                let node = NodeRecord {
+                    name,
+                    kind: NodeKind::Error,
+                    size: 0,
+                    modified_secs: None,
+                    scanned: true,
+                    error: Some(error.to_string()),
+                };
+                let node_id = scan_index.alloc_node(parent_id, node.kind);
+                perf_stats.nodes_discovered += 1;
+                batch.discovered_nodes.push(DiscoveredNode {
+                    node_id,
+                    parent_id,
+                    node,
+                });
+                batch.scanned_nodes.push(node_id);
+                counters.current_path = error_path;
+                if batch.should_flush(&options, last_flush) {
+                    flush_batch(
+                        &tx,
+                        scan_id,
+                        &mut batch,
+                        &mut perf_stats,
+                        &mut last_flush,
+                        &counters,
+                    );
+                }
+                continue;
+            }
+        };
+
         perf_stats.entries_seen += 1;
         let entry_path = entry.path();
         if entry_path == path {
@@ -777,7 +873,7 @@ fn run_scan(
         );
 
         let file_type = entry.file_type();
-        let mut node_error = None;
+        let mut node_error = entry.read_children_error.as_ref().map(ToString::to_string);
         let mut modified_secs = None;
         let kind = if entry.path_is_symlink() || file_type.is_symlink() {
             NodeKind::Symlink
@@ -874,6 +970,7 @@ fn run_scan(
         };
 
         if kind == NodeKind::Dir {
+            let is_terminal_error = node_error.is_some();
             let node = NodeRecord {
                 name,
                 kind: if node_error.is_some() {
@@ -883,7 +980,43 @@ fn run_scan(
                 },
                 size,
                 modified_secs: None,
-                scanned: false,
+                scanned: is_terminal_error,
+                error: node_error,
+            };
+            let is_directory_node = node.kind == NodeKind::Dir;
+            let node_id = scan_index.alloc_node(parent_id, node.kind);
+            perf_stats.nodes_discovered += 1;
+            batch.discovered_nodes.push(DiscoveredNode {
+                node_id,
+                parent_id,
+                node,
+            });
+            if is_directory_node {
+                parent_lookup.record_directory(
+                    entry_depth,
+                    entry.read_children_path.as_deref(),
+                    &entry_path,
+                    node_id,
+                );
+            } else {
+                batch.scanned_nodes.push(node_id);
+            }
+            counters.dirs_scanned += 1;
+        } else if kind == NodeKind::File {
+            counters.files_scanned += 1;
+            counters.bytes_seen += size;
+            scan_index.add_file_size(parent_id, size, &mut batch, &mut perf_stats);
+
+            let node = NodeRecord {
+                name,
+                kind: if node_error.is_some() {
+                    NodeKind::Error
+                } else {
+                    kind
+                },
+                size,
+                modified_secs,
+                scanned: true,
                 error: node_error,
             };
             let node_id = scan_index.alloc_node(parent_id, node.kind);
@@ -893,42 +1026,7 @@ fn run_scan(
                 parent_id,
                 node,
             });
-            parent_lookup.record_directory(
-                entry_depth,
-                entry.read_children_path.as_deref(),
-                &entry_path,
-                node_id,
-            );
-            counters.dirs_scanned += 1;
-        } else if kind == NodeKind::File {
-            counters.files_scanned += 1;
-            counters.bytes_seen += size;
-            scan_index.add_file_size(parent_id, size, &mut batch, &mut perf_stats);
-
-            if node_error.is_none() && size <= AGGREGATE_SMALL_FILE_THRESHOLD_BYTES {
-                aggregate_state.add_file(parent_id, size);
-            } else {
-                let node = NodeRecord {
-                    name,
-                    kind: if node_error.is_some() {
-                        NodeKind::Error
-                    } else {
-                        kind
-                    },
-                    size,
-                    modified_secs,
-                    scanned: true,
-                    error: node_error,
-                };
-                let node_id = scan_index.alloc_node(parent_id, node.kind);
-                perf_stats.nodes_discovered += 1;
-                batch.discovered_nodes.push(DiscoveredNode {
-                    node_id,
-                    parent_id,
-                    node,
-                });
-                batch.scanned_nodes.push(node_id);
-            }
+            batch.scanned_nodes.push(node_id);
         } else {
             let node = NodeRecord {
                 name,
@@ -966,13 +1064,6 @@ fn run_scan(
         }
     }
 
-    emit_aggregate_nodes(
-        &mut scan_index,
-        &mut aggregate_state,
-        &mut batch,
-        &mut perf_stats,
-    );
-
     for &node_id in scan_index.dir_node_ids() {
         batch.scanned_nodes.push(node_id);
     }
@@ -1001,7 +1092,9 @@ fn run_scan(
     perf_stats.size_measure_total_ms +=
         prefetch_perf.size_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     perf_stats.scan_elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    eprintln!("Scan {scan_id} completed in {:?}", elapsed);
+    if std::env::var_os("DISKMAP_SCAN_TRACE").is_some() {
+        eprintln!("Scan {scan_id} completed in {:?}", elapsed);
+    }
 
     let total_bytes = scan_index.total_bytes();
     perf_stats.messages_sent += 1;
@@ -1108,40 +1201,6 @@ fn flush_batch(
     *last_flush = Instant::now();
 }
 
-fn emit_aggregate_nodes(
-    scan_index: &mut ScanIndex,
-    aggregate_state: &mut AggregateState,
-    batch: &mut BatchAccumulator,
-    perf_stats: &mut PerfStats,
-) {
-    let parent_ids: Vec<NodeId> = aggregate_state.buckets.keys().copied().collect();
-    for parent_id in parent_ids {
-        let Some(bucket) = aggregate_state.take_bucket(parent_id) else {
-            continue;
-        };
-        if bucket.file_count == 0 || bucket.total_size == 0 {
-            continue;
-        }
-
-        let node = NodeRecord {
-            name: format!("{AGGREGATE_LABEL} ({})", bucket.file_count),
-            kind: NodeKind::Aggregate,
-            size: bucket.total_size,
-            modified_secs: None,
-            scanned: true,
-            error: None,
-        };
-        let node_id = scan_index.alloc_node(parent_id, node.kind);
-        perf_stats.nodes_discovered += 1;
-        batch.discovered_nodes.push(DiscoveredNode {
-            node_id,
-            parent_id,
-            node,
-        });
-        batch.scanned_nodes.push(node_id);
-    }
-}
-
 fn measured_size_for_file(
     path: &Path,
     _metadata: &Metadata,
@@ -1224,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn started_to_finished_messages_describe_incremental_tree() {
+    fn started_to_finished_messages_describe_batched_tree() {
         let root = TreeStore::root_record("root".into());
         let messages = [
             ScanMessage::Started {
@@ -1342,6 +1401,133 @@ mod tests {
     }
 
     #[test]
+    fn scan_path_to_tree_returns_file_as_root() {
+        let file_path = temp_path("single-file-root");
+        write(&file_path, b"disk-map").unwrap();
+        let expected_size = size_on_disk_bytes(&std::fs::metadata(&file_path).unwrap());
+
+        let mut tree = scan_path_to_tree(file_path.clone(), ScanOptions::default()).unwrap();
+        let root = tree.root.expect("file scan should create a root");
+
+        assert_eq!(tree.node(root).kind, NodeKind::File);
+        assert_eq!(tree.node(root).size, expected_size);
+        assert_eq!(tree.node_real_path(root), Some(file_path.clone()));
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn scan_path_to_tree_keeps_small_files_as_real_nodes() {
+        let dir = temp_path("small-files-lossless");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(dir.join("alpha.txt"), b"a").unwrap();
+        write(dir.join("beta.txt"), b"b").unwrap();
+
+        let tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
+
+        assert!(tree.nodes.iter().any(|node| node.name == "alpha.txt"));
+        assert!(tree.nodes.iter().any(|node| node.name == "beta.txt"));
+        assert!(!tree
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, NodeKind::Aggregate)));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_symlinks_even_when_legacy_option_is_true() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink-root");
+        let target = temp_path("symlink-target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write(target.join("payload.bin"), b"payload").unwrap();
+        symlink(&target, root.join("link")).unwrap();
+        let options = ScanOptions {
+            follow_symlinks: true,
+            ..ScanOptions::default()
+        };
+
+        let tree = scan_path_to_tree(root.clone(), options).unwrap();
+
+        assert!(tree
+            .nodes
+            .iter()
+            .any(|node| node.name == "link" && node.kind == NodeKind::Symlink));
+        assert!(!tree.nodes.iter().any(|node| node.name == "payload.bin"));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_symlink_root_with_trailing_slash() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("trailing-slash-symlink-root");
+        let target = temp_path("trailing-slash-symlink-target");
+        std::fs::create_dir_all(&target).unwrap();
+        write(target.join("payload.bin"), b"payload").unwrap();
+        symlink(&target, &root).unwrap();
+        let path_with_slash = PathBuf::from(format!("{}/", root.display()));
+
+        let error = scan_path_to_tree(path_with_slash, ScanOptions::default())
+            .expect_err("trailing-slash symlink roots should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("symbolic link root with a trailing separator"));
+
+        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_unsupported_special_file_root() {
+        let error = scan_path_to_tree(PathBuf::from("/dev/null"), ScanOptions::default())
+            .expect_err("device roots should not be reported as symlinks");
+
+        assert!(error.to_string().contains("Unsupported file type"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_reports_directory_read_errors_when_permissions_allow_testing_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_path("permission-error");
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        write(blocked.join("hidden.txt"), b"hidden").unwrap();
+        let original_mode = std::fs::metadata(&blocked).unwrap().permissions().mode();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        if std::fs::read_dir(&blocked).is_ok() {
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        let tree = scan_path_to_tree(root.clone(), ScanOptions::default()).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(original_mode)).unwrap();
+
+        assert!(tree.nodes.iter().any(|node| {
+            node.name == "blocked"
+                && node.kind == NodeKind::Error
+                && node.error.is_some()
+                && node.scanned
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn scan_progress_does_not_precount_total_files() {
         let dir = temp_path("no-precount-total-files");
         let nested = dir.join("nested");
@@ -1396,11 +1582,7 @@ mod tests {
     fn scan_path_to_tree_records_file_modified_time_when_available() {
         let dir = temp_path("sync-mtime");
         std::fs::create_dir_all(&dir).unwrap();
-        write(
-            dir.join("large.bin"),
-            vec![1_u8; (AGGREGATE_SMALL_FILE_THRESHOLD_BYTES + 1) as usize],
-        )
-        .unwrap();
+        write(dir.join("large.bin"), vec![1_u8; 16 * 1024 + 1]).unwrap();
 
         let tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
         let file = tree
@@ -1418,11 +1600,7 @@ mod tests {
     fn scan_path_to_tree_uses_explicit_sqlite_cache_path() {
         let dir = temp_path("sync-cache-root");
         std::fs::create_dir_all(&dir).unwrap();
-        write(
-            dir.join("large.bin"),
-            vec![1_u8; (AGGREGATE_SMALL_FILE_THRESHOLD_BYTES + 1) as usize],
-        )
-        .unwrap();
+        write(dir.join("large.bin"), vec![1_u8; 16 * 1024 + 1]).unwrap();
         let cache_root = temp_path("sync-cache-dir");
         let cache_path = cache_root.join("nested").join("disk-map-cache.db");
 
@@ -1579,31 +1757,5 @@ mod tests {
                 max_time: PREFETCH_GIANT_DIR_TIME_BUDGET,
             }
         );
-    }
-
-    #[test]
-    fn aggregate_small_files_emits_single_virtual_node() {
-        let root = node_id_from_index(0);
-        let mut scan_index = ScanIndex::new(root);
-        let mut aggregate_state = AggregateState::default();
-        let mut batch = BatchAccumulator::default();
-        let mut stats = PerfStats::default();
-
-        aggregate_state.add_file(root, 10);
-        aggregate_state.add_file(root, 20);
-        emit_aggregate_nodes(
-            &mut scan_index,
-            &mut aggregate_state,
-            &mut batch,
-            &mut stats,
-        );
-
-        assert_eq!(scan_index.len(), 2);
-        assert_eq!(stats.nodes_discovered, 1);
-        assert_eq!(batch.discovered_nodes.len(), 1);
-        let aggregate = &batch.discovered_nodes[0].node;
-        assert_eq!(aggregate.kind, NodeKind::Aggregate);
-        assert_eq!(aggregate.size, 30);
-        assert!(aggregate.name.starts_with(AGGREGATE_LABEL));
     }
 }
