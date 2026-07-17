@@ -1,4 +1,4 @@
-use super::{current_unix_secs, DiskMapApp};
+use super::{current_unix_secs, DiskMapApp, StatusLevel, StatusSource};
 use crate::export::{export_subtree, ExportFormat, FocusedReportMetadata};
 use crate::scanner::{parse_exclude_patterns, size_basis_label};
 use crate::tree::NodeId;
@@ -7,17 +7,29 @@ use std::path::PathBuf;
 impl DiskMapApp {
     pub(super) fn export_focused_subtree(&mut self, format: ExportFormat) {
         let Some(root_id) = self.navigation.focused_root() else {
-            self.status = "Export unavailable: no focused directory".to_string();
+            self.set_status(
+                StatusSource::Export,
+                StatusLevel::Warning,
+                "Export unavailable: no focused directory",
+            );
             self.pending_repaint = true;
             return;
         };
 
         match self.write_focused_export(root_id, format) {
             Ok(path) => {
-                self.status = format!("Exported {} to {}", format.label(), path.display());
+                self.set_status(
+                    StatusSource::Export,
+                    StatusLevel::Success,
+                    format!("Exported {} to {}", format.label(), path.display()),
+                );
             }
             Err(error) => {
-                self.status = format!("Export failed: {error}");
+                self.set_status(
+                    StatusSource::Export,
+                    StatusLevel::Error,
+                    format!("Export failed: {error}"),
+                );
             }
         }
         self.pending_repaint = true;
@@ -72,7 +84,7 @@ impl DiskMapApp {
             follow_symlinks: false,
             stay_on_filesystem: self.stay_on_filesystem,
             sqlite_cache_enabled: self.sqlite_cache_enabled,
-            realtime_watch_enabled: self.realtime_watch_enabled,
+            realtime_watch_enabled: self.realtime_watch_enabled(),
             exclude_patterns: parse_exclude_patterns(&self.exclude_input),
         })
     }

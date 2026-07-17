@@ -4,18 +4,16 @@ use crate::duplicates::DuplicateReport;
 use crate::export::ExportFormat;
 use crate::format::format_bytes;
 use crate::insights::InsightReport;
-use crate::scanner::{
-    parse_exclude_patterns, CacheMode, PerfStats, ProgressSnapshot, ScanBatch, ScanMessage,
-    ScanOptions,
-};
+#[cfg(test)]
+use crate::scanner::ScanMessage;
+use crate::scanner::{parse_exclude_patterns, CacheMode, PerfStats, ScanBatch, ScanOptions};
 #[cfg(test)]
 use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot};
 use crate::storage::{app_data_dir, LocalState, Preferences, SafeStorage};
 #[cfg(test)]
 use crate::tree::node_id_from_index;
 use crate::tree::{NodeId, NodeKind, TreeStore};
-use crate::treemap::{LayoutScratch, VisualKind, VisualNode};
-use crate::watcher::{WatchPoll, WatchSession};
+use crate::treemap::{VisualKind, VisualNode};
 
 #[cfg(test)]
 mod analysis_actions;
@@ -30,12 +28,15 @@ mod profile_actions;
 mod rule_actions;
 mod scan_session;
 mod search_nav;
+mod status;
+mod treemap_state;
 
 use navigation::{NavigationOutcome, NavigationState};
-use scan_session::ScanSession;
+use scan_session::{ScanPhase, ScanSession, ScanSessionEvent, WatchAction};
 use search_nav::{SearchController, SearchDirection, SEARCH_REFRESH_INTERVAL};
+use status::{AppStatus, StatusLevel, StatusSource};
+use treemap_state::TreemapViewState;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use egui::{
     Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Theme, Vec2,
@@ -322,13 +323,8 @@ pub struct DiskMapApp {
     include_hidden: bool,
     follow_symlinks: bool,
     stay_on_filesystem: bool,
-    pub(super) realtime_watch_enabled: bool,
     sqlite_cache_enabled: bool,
-    watcher: Option<WatchSession>,
-    watch_rescan_pending: bool,
     initial_scan_pending: bool,
-    tx: Sender<ScanMessage>,
-    rx: Receiver<ScanMessage>,
     pub(super) tree: TreeStore,
     pub(super) navigation: NavigationState,
     pub(super) search: SearchController,
@@ -351,17 +347,10 @@ pub struct DiskMapApp {
     pub(super) hovered_visual_kind: Option<VisualKind>,
     pub(super) max_depth: usize,
     theme_preference: Option<Theme>,
-    pub(super) status: String,
-    pub(super) cached_visuals: Vec<VisualNode>,
-    pub(super) layout_scratch: LayoutScratch,
-    pub(super) last_canvas_rect: Option<Rect>,
-    pub(super) layout_dirty: bool,
-    pub(super) last_layout_refresh: Instant,
+    pub(in crate::app) status: AppStatus,
+    pub(in crate::app) treemap: TreemapViewState,
     pub(super) pending_repaint: bool,
     safe_storage: SafeStorage,
-    /// Most recent scan perf stats, captured at ScanMessage::Finished.
-    /// Cleared at ScanMessage::Started. Used by the diagnostics export.
-    last_perf_stats: Option<PerfStats>,
     /// Bounded ring of recent error/status messages for diagnostics export.
     /// Capped at 64 entries; oldest dropped on overflow.
     recent_errors: VecDeque<String>,
@@ -402,7 +391,6 @@ pub struct DiskMapApp {
 
 impl Default for DiskMapApp {
     fn default() -> Self {
-        let (tx, rx) = unbounded();
         Self {
             path_input: dirs_home_fallback(),
             exclude_input: String::new(),
@@ -410,13 +398,8 @@ impl Default for DiskMapApp {
             include_hidden: ScanOptions::default().include_hidden,
             follow_symlinks: ScanOptions::default().follow_symlinks,
             stay_on_filesystem: ScanOptions::default().stay_on_filesystem,
-            realtime_watch_enabled: true,
             sqlite_cache_enabled: false,
-            watcher: None,
-            watch_rescan_pending: false,
             initial_scan_pending: true,
-            tx,
-            rx,
             tree: TreeStore::new(),
             navigation: NavigationState::default(),
             search: SearchController::default(),
@@ -439,15 +422,10 @@ impl Default for DiskMapApp {
             hovered_visual_kind: None,
             max_depth: 1,
             theme_preference: None,
-            status: "Ready".to_string(),
-            cached_visuals: Vec::new(),
-            layout_scratch: LayoutScratch::default(),
-            last_canvas_rect: None,
-            layout_dirty: true,
-            last_layout_refresh: Instant::now(),
+            status: AppStatus::default(),
+            treemap: TreemapViewState::default(),
             pending_repaint: false,
             safe_storage: SafeStorage::new(&app_data_dir("disk-map")),
-            last_perf_stats: None,
             recent_errors: VecDeque::new(),
             rules: crate::rules::default_ruleset(),
             #[cfg(test)]
@@ -546,7 +524,7 @@ impl DiskMapApp {
             .get(STORAGE_REALTIME_WATCH)
             .and_then(parse_storage_bool)
         {
-            self.realtime_watch_enabled = realtime_watch_enabled;
+            let _ = self.scan.set_watch_enabled(realtime_watch_enabled);
         }
 
         if let Some(recent_roots) = prefs.get(STORAGE_RECENT_ROOTS) {
@@ -589,7 +567,7 @@ impl DiskMapApp {
         );
         prefs.set(
             STORAGE_REALTIME_WATCH,
-            self.realtime_watch_enabled.to_string(),
+            self.scan.watch_enabled().to_string(),
         );
         prefs.set(STORAGE_RECENT_ROOTS, serialize_paths(&self.recent_roots));
         prefs.set(STORAGE_PINNED_ROOTS, serialize_paths(&self.pinned_roots));
@@ -621,7 +599,11 @@ impl DiskMapApp {
     pub(super) fn persist_local_state(&mut self) {
         if let Err(error) = self.safe_storage.write_state(&self.collect_local_state()) {
             self.record_error(format!("local state save failed: {error}"));
-            self.status = format!("Local state save failed: {error}");
+            self.set_status(
+                StatusSource::Persistence,
+                StatusLevel::Error,
+                format!("Local state save failed: {error}"),
+            );
         }
         self.pending_repaint = true;
     }
@@ -816,34 +798,23 @@ impl DiskMapApp {
     }
 
     fn no_root_state_message(&self) -> StateMessage {
-        if self.scan.is_scanning() {
-            return StateMessage {
+        match self.scan.phase() {
+            ScanPhase::Running => StateMessage {
                 title: "Starting scan",
                 detail: format!("Waiting for scan results from {}.", self.path_input.trim()),
-            };
-        }
-
-        if self.status.starts_with("Error") {
-            return StateMessage {
+            },
+            ScanPhase::Failed(message) => StateMessage {
                 title: "Unable to scan path",
-                detail: self
-                    .status
-                    .strip_prefix("Error: ")
-                    .unwrap_or(&self.status)
-                    .to_string(),
-            };
-        }
-
-        if self.status.starts_with("Scan cancelled") {
-            return StateMessage {
+                detail: message.clone(),
+            },
+            ScanPhase::Cancelled => StateMessage {
                 title: "Scan cancelled",
                 detail: "Start another scan to populate the treemap.".to_string(),
-            };
-        }
-
-        StateMessage {
-            title: "No scan loaded",
-            detail: "Choose a path and start a scan to populate the treemap.".to_string(),
+            },
+            ScanPhase::Idle | ScanPhase::Finished => StateMessage {
+                title: "No scan loaded",
+                detail: "Choose a path and start a scan to populate the treemap.".to_string(),
+            },
         }
     }
 
@@ -1144,124 +1115,90 @@ impl DiskMapApp {
     }
 
     fn handle_scan_messages(&mut self) {
-        let mut saw_batch = false;
-
-        while let Ok(message) = self.rx.try_recv() {
-            if !self.scan.accepts(&message) {
-                continue;
-            }
-
-            match message {
-                ScanMessage::Started {
-                    path, root_node, ..
-                } => {
-                    self.scan.mark_started();
-                    self.scan.observe_node(&root_node);
-                    self.status = format!("Scanning {}", path.display());
-                    self.record_recent_root(&path);
-                    self.tree.clear();
-                    self.tree.push_node(None, root_node);
-                    self.tree.set_root_path(path);
-                    self.navigation.set_scan_root(self.tree.root);
-                    self.layout_dirty = true;
-                    self.mark_search_dirty();
-                    self.navigation.rebuild_breadcrumb_cache(&self.tree);
-                    self.last_perf_stats = None;
-                }
-                ScanMessage::Batch { batch, .. } => {
-                    self.apply_scan_batch(batch);
-                    saw_batch = true;
-                }
-                ScanMessage::Finished {
-                    total_bytes,
-                    perf_stats,
-                    ..
-                } => {
-                    self.last_perf_stats = Some(perf_stats.clone());
-                    self.scan.mark_finished(perf_stats);
-                    self.prune_invalid_selection();
-                    self.refresh_search_matches();
-                    self.layout_dirty = true;
-                    self.status = self.finished_status(total_bytes);
-                    #[cfg(test)]
-                    self.update_snapshot_comparison();
-                    let watch_rescan_pending = std::mem::take(&mut self.watch_rescan_pending);
-                    let rescan_after_watch = self.realtime_watch_enabled && watch_rescan_pending;
-                    if rescan_after_watch {
-                        if let Some(path) = self.scan_root_rescan_path() {
-                            self.start_scan_path(path);
-                        } else {
-                            self.update_watch_state();
-                        }
-                    } else {
-                        self.update_watch_state();
-                    }
-                    self.pending_repaint = true;
-                    eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
-                }
-                ScanMessage::Cancelled { perf_stats, .. } => {
-                    self.last_perf_stats = Some(perf_stats.clone());
-                    self.scan.mark_cancelled(perf_stats);
-                    self.status = "Scan cancelled".to_string();
-                    self.pending_repaint = true;
-                    eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
-                }
-                ScanMessage::Error {
-                    message,
-                    perf_stats,
-                    ..
-                } => {
-                    self.last_perf_stats = Some(perf_stats.clone());
-                    self.scan.mark_error(perf_stats);
-                    self.record_error(format!("scan error: {message}"));
-                    self.status = format!("Error: {message}");
-                    self.pending_repaint = true;
-                    eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
-                }
-            }
+        while let Some(event) = self.scan.try_next_event() {
+            self.apply_scan_event(event);
         }
+    }
 
-        if saw_batch {
-            self.pending_repaint = true;
+    fn apply_scan_event(&mut self, event: ScanSessionEvent) {
+        match event {
+            ScanSessionEvent::Started { path, root_node } => {
+                self.set_status(
+                    StatusSource::Scan,
+                    StatusLevel::Progress,
+                    format!("Scanning {}", path.display()),
+                );
+                self.record_recent_root(&path);
+                self.tree.clear();
+                self.tree.push_node(None, root_node);
+                self.tree.set_root_path(path);
+                self.navigation.set_scan_root(self.tree.root);
+                self.treemap.invalidate();
+                self.mark_search_dirty();
+                self.navigation.rebuild_breadcrumb_cache(&self.tree);
+            }
+            ScanSessionEvent::Batch(batch) => {
+                self.apply_scan_batch(batch);
+                self.pending_repaint = true;
+            }
+            ScanSessionEvent::Finished {
+                total_bytes,
+                follow_up_rescan,
+                watch_error,
+            } => {
+                self.prune_invalid_selection();
+                self.refresh_search_matches();
+                self.treemap.invalidate();
+                self.set_status(
+                    StatusSource::Scan,
+                    StatusLevel::Success,
+                    self.finished_status(total_bytes),
+                );
+                #[cfg(test)]
+                self.update_snapshot_comparison();
+                if let Some(error) = watch_error {
+                    self.record_error(format!("watch failed: {error}"));
+                    self.status.set_watch_failure(error);
+                } else if self.scan.watch_active() {
+                    self.status.clear_watch_failure();
+                }
+                if let Some(path) = follow_up_rescan {
+                    self.start_scan_path(path);
+                }
+                self.pending_repaint = true;
+                eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
+            }
+            ScanSessionEvent::Cancelled { watch_paused } => {
+                let text = if watch_paused {
+                    "Scan cancelled · Watch paused until the next successful scan".to_string()
+                } else {
+                    "Scan cancelled".to_string()
+                };
+                self.set_status(StatusSource::Scan, StatusLevel::Warning, text);
+                self.pending_repaint = true;
+                eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
+            }
+            ScanSessionEvent::Error {
+                message,
+                watch_paused,
+            } => {
+                self.record_error(format!("scan error: {message}"));
+                let text = if watch_paused {
+                    format!("Error: {message} · Watch paused until the next successful scan")
+                } else {
+                    format!("Error: {message}")
+                };
+                self.set_status(StatusSource::Scan, StatusLevel::Error, text);
+                self.pending_repaint = true;
+                eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
+            }
         }
     }
 
     fn apply_scan_batch(&mut self, batch: ScanBatch) {
-        let mut dirty_nodes = Vec::with_capacity(
-            batch.discovered_nodes.len().saturating_mul(2)
-                + batch.size_deltas.len()
-                + batch.scanned_nodes.len(),
-        );
-        let mut discovered_node_ids = Vec::with_capacity(batch.discovered_nodes.len());
-
-        for discovered in batch.discovered_nodes {
-            let node_id = discovered.node_id;
-            let parent_id = discovered.parent_id;
-            self.scan.observe_node(&discovered.node);
-            self.tree
-                .insert_node(node_id, Some(parent_id), discovered.node);
-            discovered_node_ids.push(node_id);
-            dirty_nodes.push(parent_id);
-            dirty_nodes.push(node_id);
-        }
-
-        for (node_id, delta) in batch.size_deltas {
-            if self.tree.contains_id(node_id) {
-                self.tree.apply_direct_size_delta(node_id, delta);
-                dirty_nodes.push(node_id);
-            }
-        }
-
-        for node_id in batch.scanned_nodes {
-            if self.tree.contains_id(node_id) {
-                self.tree.mark_scanned(node_id);
-                dirty_nodes.push(node_id);
-            }
-        }
-
-        dirty_nodes.sort_unstable();
-        dirty_nodes.dedup();
-        let visible_dirty_nodes: Vec<NodeId> = dirty_nodes
+        let application = batch.apply_to_tree(&mut self.tree);
+        let visible_dirty_nodes: Vec<NodeId> = application
+            .dirty_node_ids
             .iter()
             .copied()
             .filter(|&node_id| self.batch_touches_visible_subtree(node_id))
@@ -1269,29 +1206,26 @@ impl DiskMapApp {
         if !visible_dirty_nodes.is_empty() {
             self.tree.repair_sorted_children(&visible_dirty_nodes);
         }
-        let touched_visible_subtree = dirty_nodes
+        let touched_visible_subtree = application
+            .dirty_node_ids
             .iter()
             .copied()
             .any(|node_id| self.batch_touches_visible_subtree(node_id));
-        if let Some(progress) = batch.progress {
-            self.apply_progress(progress);
+        if application.had_progress {
+            self.set_status(StatusSource::Scan, StatusLevel::Progress, "Scanning...");
         }
 
-        if !discovered_node_ids.is_empty() && !self.search.query().is_empty() {
-            let updates =
-                self.search
-                    .ingest_new_nodes(&mut self.tree, &discovered_node_ids) as u64;
+        if !application.discovered_node_ids.is_empty() && !self.search.query().is_empty() {
+            let updates = self
+                .search
+                .ingest_new_nodes(&mut self.tree, &application.discovered_node_ids)
+                as u64;
             self.scan.record_search_incremental_updates(updates);
         }
 
         if touched_visible_subtree {
-            self.layout_dirty = true;
+            self.treemap.invalidate();
         }
-    }
-
-    fn apply_progress(&mut self, progress: ProgressSnapshot) {
-        self.scan.apply_progress(progress);
-        self.status = "Scanning...".to_string();
     }
 
     fn current_root_candidate(&mut self) -> Option<String> {
@@ -1311,10 +1245,18 @@ impl DiskMapApp {
             .position(|existing| existing == path)
         {
             self.pinned_roots.remove(index);
-            self.status = format!("Unpinned {}", truncate_middle(path, 48));
+            self.set_status(
+                StatusSource::Roots,
+                StatusLevel::Info,
+                format!("Unpinned {}", truncate_middle(path, 48)),
+            );
         } else {
             push_unique_front(&mut self.pinned_roots, path.to_string(), MAX_PINNED_ROOTS);
-            self.status = format!("Pinned {}", truncate_middle(path, 48));
+            self.set_status(
+                StatusSource::Roots,
+                StatusLevel::Info,
+                format!("Pinned {}", truncate_middle(path, 48)),
+            );
         }
         self.pending_repaint = true;
     }
@@ -1362,15 +1304,28 @@ impl DiskMapApp {
 
     pub(super) fn clear_search(&mut self) {
         self.search.clear(self.tree.len());
-        self.layout_dirty = true;
+        self.treemap.invalidate();
     }
 
     fn apply_platform_result(&mut self, action: &str, result: anyhow::Result<()>) {
         if let Err(error) = result {
             self.record_error(format!("{action} failed: {error}"));
-            self.status = format!("{action} failed: {error}");
+            self.set_status(
+                StatusSource::Platform,
+                StatusLevel::Error,
+                format!("{action} failed: {error}"),
+            );
             self.pending_repaint = true;
         }
+    }
+
+    pub(in crate::app) fn set_status(
+        &mut self,
+        source: StatusSource,
+        level: StatusLevel,
+        text: impl Into<String>,
+    ) {
+        self.status.set_primary(source, level, text);
     }
 
     /// Record an error or notable status change for the diagnostics
@@ -1394,7 +1349,11 @@ impl DiskMapApp {
             Some(id) => id,
             None => {
                 self.last_rule_hits = Some(Vec::new());
-                self.status = "No scan loaded — apply rules to current view".to_string();
+                self.set_status(
+                    StatusSource::Rules,
+                    StatusLevel::Warning,
+                    "No scan loaded — apply rules to current view",
+                );
                 self.pending_repaint = true;
                 return 0;
             }
@@ -1414,9 +1373,13 @@ impl DiskMapApp {
         );
         let count = hits.len();
         self.last_rule_hits = Some(hits);
-        self.status = format!(
-            "Applied {} rules, found {count} hits",
-            self.rules.enabled_count()
+        self.set_status(
+            StatusSource::Rules,
+            StatusLevel::Success,
+            format!(
+                "Applied {} rules, found {count} hits",
+                self.rules.enabled_count()
+            ),
         );
         self.pending_repaint = true;
         count
@@ -1438,7 +1401,11 @@ impl DiskMapApp {
             selected_id: self.navigation.selected_id(),
         };
         self.views.set(root, state);
-        self.status = format!("Saved view for {} ({} stored)", root, self.views.len());
+        self.set_status(
+            StatusSource::View,
+            StatusLevel::Success,
+            format!("Saved view for {} ({} stored)", root, self.views.len()),
+        );
         self.persist_local_state();
     }
 
@@ -1466,9 +1433,13 @@ impl DiskMapApp {
                 self.navigation.set_selected_id(Some(selected));
             }
         }
-        self.layout_dirty = true;
+        self.treemap.invalidate();
         self.mark_search_dirty();
-        self.status = format!("Applied saved view for {}", root);
+        self.set_status(
+            StatusSource::View,
+            StatusLevel::Success,
+            format!("Applied saved view for {}", root),
+        );
         self.pending_repaint = true;
     }
 
@@ -1481,7 +1452,11 @@ impl DiskMapApp {
         use crate::views::FilterPreset;
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            self.status = "Filter preset name cannot be empty".to_string();
+            self.set_status(
+                StatusSource::View,
+                StatusLevel::Warning,
+                "Filter preset name cannot be empty",
+            );
             self.pending_repaint = true;
             return false;
         }
@@ -1491,16 +1466,24 @@ impl DiskMapApp {
             filter_enabled: self.search_filter_enabled,
         };
         if self.filter_presets.add(preset) {
-            self.status = format!(
-                "Saved filter preset '{}' ({} total)",
-                trimmed,
-                self.filter_presets.len()
+            self.set_status(
+                StatusSource::View,
+                StatusLevel::Success,
+                format!(
+                    "Saved filter preset '{}' ({} total)",
+                    trimmed,
+                    self.filter_presets.len()
+                ),
             );
             self.filter_preset_name.clear();
             self.persist_local_state();
             true
         } else {
-            self.status = format!("Filter preset '{}' already exists", trimmed);
+            self.set_status(
+                StatusSource::View,
+                StatusLevel::Warning,
+                format!("Filter preset '{}' already exists", trimmed),
+            );
             self.pending_repaint = true;
             false
         }
@@ -1517,8 +1500,12 @@ impl DiskMapApp {
         *self.search.input_mut() = preset.query.clone();
         self.search_filter_enabled = preset.filter_enabled;
         self.mark_search_dirty();
-        self.layout_dirty = true;
-        self.status = format!("Applied filter preset '{}'", name);
+        self.treemap.invalidate();
+        self.set_status(
+            StatusSource::View,
+            StatusLevel::Success,
+            format!("Applied filter preset '{}'", name),
+        );
         self.pending_repaint = true;
     }
 
@@ -1526,7 +1513,11 @@ impl DiskMapApp {
     #[cfg(test)]
     pub fn remove_filter_preset(&mut self, name: &str) -> bool {
         if self.filter_presets.remove(name).is_some() {
-            self.status = format!("Removed filter preset '{}'", name);
+            self.set_status(
+                StatusSource::View,
+                StatusLevel::Success,
+                format!("Removed filter preset '{}'", name),
+            );
             self.persist_local_state();
             true
         } else {
@@ -1555,7 +1546,7 @@ impl DiskMapApp {
             ),
             (
                 "realtime_watch_enabled".into(),
-                self.realtime_watch_enabled.to_string(),
+                self.scan.watch_enabled().to_string(),
             ),
             (
                 "search_filter_enabled".into(),
@@ -1575,9 +1566,9 @@ impl DiskMapApp {
             arch: std::env::consts::ARCH,
             generated_at_unix_secs: crate::diagnostics::current_unix_secs(),
             scan_root,
-            status: self.status.clone(),
+            status: self.status.display_text().into_owned(),
             scan_options,
-            perf_stats: self.last_perf_stats.clone(),
+            perf_stats: self.scan.terminal_perf_stats().cloned(),
             recent_errors: self.recent_errors.iter().cloned().collect(),
         };
         bundle
@@ -1586,37 +1577,36 @@ impl DiskMapApp {
     }
 
     fn handle_watch_events(&mut self) {
-        let Some(watcher) = &mut self.watcher else {
-            return;
-        };
-
-        match watcher.poll(Instant::now()) {
-            WatchPoll::Noop => {}
-            WatchPoll::Pending => {
+        match self.scan.poll_watch(Instant::now()) {
+            WatchAction::Noop => {}
+            WatchAction::Pending => {
                 self.pending_repaint = true;
             }
-            WatchPoll::Ready(change) => {
-                let change_count = change.paths.len();
-                if self.scan.is_scanning() {
-                    self.watch_rescan_pending = true;
-                    self.status = format!(
+            WatchAction::Deferred { change_count } => {
+                self.set_status(
+                    StatusSource::Watch,
+                    StatusLevel::Progress,
+                    format!(
                         "Watch noticed {} while scan is running",
                         pluralize(change_count as u64, "change", "changes")
-                    );
-                    self.pending_repaint = true;
-                    return;
-                }
-                if let Some(path) = self.scan_root_rescan_path() {
-                    self.status = format!(
+                    ),
+                );
+                self.pending_repaint = true;
+            }
+            WatchAction::Rescan { path, change_count } => {
+                self.set_status(
+                    StatusSource::Watch,
+                    StatusLevel::Progress,
+                    format!(
                         "Rescanning after {}",
                         pluralize(change_count as u64, "change", "changes")
-                    );
-                    self.start_scan_path(path);
-                }
+                    ),
+                );
+                self.start_scan_path(path);
             }
-            WatchPoll::Error(error) => {
-                self.status = format!("Watch failed: {error}");
-                self.watcher = None;
+            WatchAction::Failed(error) => {
+                self.record_error(format!("watch failed: {error}"));
+                self.status.set_watch_failure(error);
                 self.pending_repaint = true;
             }
         }
@@ -1628,16 +1618,7 @@ impl DiskMapApp {
     }
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
-        if self
-            .watcher
-            .as_ref()
-            .is_none_or(|watcher| watcher.root_path() != &path)
-        {
-            self.stop_watching();
-        }
-        self.watch_rescan_pending = false;
-        self.scan
-            .start(path.clone(), self.scan_options(), self.tx.clone());
+        self.scan.start(path.clone(), self.scan_options());
 
         self.tree.clear();
         self.navigation.clear_for_new_scan();
@@ -1654,49 +1635,40 @@ impl DiskMapApp {
         self.duplicate_report = None;
         self.insight_report = None;
         self.search.clear(0);
-        self.cached_visuals.clear();
-        self.refresh_treemap_layout();
+        self.treemap.clear();
         self.path_input = path.display().to_string();
-        self.status = format!("Scanning {}", path.display());
+        self.set_status(
+            StatusSource::Scan,
+            StatusLevel::Progress,
+            format!("Scanning {}", path.display()),
+        );
         self.pending_repaint = true;
     }
 
-    fn update_watch_state(&mut self) {
-        if !self.realtime_watch_enabled {
-            self.watch_rescan_pending = false;
-            self.stop_watching();
-            return;
-        }
-
-        let Some(root_path) = self.scan_root_rescan_path() else {
-            self.stop_watching();
-            return;
-        };
-
-        if self
-            .watcher
-            .as_ref()
-            .is_some_and(|watcher| watcher.root_path() == &root_path)
-        {
-            return;
-        }
-
-        match WatchSession::start(root_path.clone()) {
-            Ok(watcher) => {
-                self.watcher = Some(watcher);
-                self.status = format!("Watching {}", root_path.display());
-                self.pending_repaint = true;
+    pub(super) fn set_realtime_watch_enabled(&mut self, enabled: bool) {
+        match self.scan.set_watch_enabled(enabled) {
+            Ok(()) if enabled && self.scan.watch_active() => {
+                self.status.clear_watch_failure();
             }
             Err(error) => {
-                self.watcher = None;
-                self.status = format!("Watch failed: {error}");
-                self.pending_repaint = true;
+                self.record_error(format!("watch failed: {error}"));
+                self.status.set_watch_failure(error);
             }
+            Ok(()) => {}
         }
+        if !enabled {
+            self.status.clear_watch_failure();
+        }
+        self.pending_repaint = true;
+    }
+
+    pub(super) fn realtime_watch_enabled(&self) -> bool {
+        self.scan.watch_enabled()
     }
 
     fn stop_watching(&mut self) {
-        self.watcher = None;
+        self.scan.pause_watching();
+        self.status.clear_watch_failure();
     }
 
     fn scan_root_rescan_path(&mut self) -> Option<std::path::PathBuf> {
@@ -1707,7 +1679,11 @@ impl DiskMapApp {
 
     fn cancel_scan(&mut self) {
         if self.scan.cancel() {
-            self.status = "Cancelling scan...".to_string();
+            self.set_status(
+                StatusSource::Scan,
+                StatusLevel::Progress,
+                "Cancelling scan...",
+            );
             self.pending_repaint = true;
         }
     }
@@ -1737,10 +1713,7 @@ impl DiskMapApp {
     }
 
     fn mark_layout_dirty_now(&mut self) {
-        self.layout_dirty = true;
-        self.last_layout_refresh = Instant::now()
-            .checked_sub(LAYOUT_REFRESH_INTERVAL)
-            .unwrap_or_else(Instant::now);
+        self.treemap.invalidate_now();
     }
 
     fn apply_navigation_outcome(&mut self, outcome: NavigationOutcome) {
@@ -1766,7 +1739,7 @@ impl DiskMapApp {
     fn maybe_refresh_search(&mut self, ctx: &egui::Context) {
         if self.search.maybe_refresh_due(self.scan.is_scanning()) {
             self.refresh_search_matches();
-            self.layout_dirty = true;
+            self.treemap.invalidate();
             self.pending_repaint = true;
             ctx.request_repaint();
         }
@@ -1847,7 +1820,7 @@ impl DiskMapApp {
         if self.scan.is_scanning() {
             // Keep the UI alive while scan batches arrive, even when there is no user input.
             ctx.request_repaint_after(LAYOUT_REFRESH_INTERVAL);
-        } else if self.watcher.is_some() {
+        } else if self.scan.watch_active() {
             ctx.request_repaint_after(LAYOUT_REFRESH_INTERVAL);
         } else if self.search.is_dirty() {
             ctx.request_repaint_after(SEARCH_REFRESH_INTERVAL);
@@ -1856,26 +1829,10 @@ impl DiskMapApp {
 
     #[cfg(test)]
     fn apply_scan_message_for_test(&mut self, message: ScanMessage) {
-        if !self.scan.accepts(&message) {
+        let Some(event) = self.scan.process_message_for_test(message) else {
             return;
-        }
-
-        match message {
-            ScanMessage::Started {
-                path, root_node, ..
-            } => {
-                self.scan.observe_node(&root_node);
-                self.tree.clear();
-                self.tree.push_node(None, root_node);
-                self.tree.set_root_path(path.clone());
-                self.record_recent_root(&path);
-                self.navigation.set_scan_root(self.tree.root);
-                self.navigation.rebuild_breadcrumb_cache(&self.tree);
-            }
-            ScanMessage::Batch { batch, .. } => self.apply_scan_batch(batch),
-            ScanMessage::Finished { .. } => self.update_snapshot_comparison(),
-            ScanMessage::Cancelled { .. } | ScanMessage::Error { .. } => {}
-        }
+        };
+        self.apply_scan_event(event);
     }
 
     #[cfg(test)]
@@ -2612,17 +2569,18 @@ mod tests {
     fn drain_scan_for_test(app: &mut DiskMapApp) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            let Ok(message) = app.rx.recv_timeout(Duration::from_millis(100)) else {
+            let Some(event) = app.scan.try_next_event() else {
+                std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            let finished = matches!(message, ScanMessage::Finished { .. });
+            let finished = matches!(&event, ScanSessionEvent::Finished { .. });
             let terminal = matches!(
-                message,
-                ScanMessage::Finished { .. }
-                    | ScanMessage::Cancelled { .. }
-                    | ScanMessage::Error { .. }
+                &event,
+                ScanSessionEvent::Finished { .. }
+                    | ScanSessionEvent::Cancelled { .. }
+                    | ScanSessionEvent::Error { .. }
             );
-            app.apply_scan_message_for_test(message);
+            app.apply_scan_event(event);
             if terminal {
                 return finished;
             }
@@ -2749,8 +2707,8 @@ mod tests {
     fn realtime_watch_defaults_to_enabled() {
         let app = DiskMapApp::default();
 
-        assert!(app.realtime_watch_enabled);
-        assert!(app.watcher.is_none());
+        assert!(app.realtime_watch_enabled());
+        assert!(!app.scan.watch_active());
     }
 
     #[test]
@@ -2758,7 +2716,7 @@ mod tests {
         let dir = unique_temp_dir();
         let store = SafeStorage::new(&dir);
 
-        let app = DiskMapApp {
+        let mut app = DiskMapApp {
             path_input: "/next".into(),
             exclude_input: "node_modules;target".into(),
             protected_paths_input: "/keep\n/safe".into(),
@@ -2768,7 +2726,6 @@ mod tests {
             sqlite_cache_enabled: true,
             search_filter_enabled: true,
             color_by_extension: true,
-            realtime_watch_enabled: false,
             recent_roots: vec!["/recent".into(), "/older".into()],
             pinned_roots: vec!["/pinned".into()],
             max_depth: 4,
@@ -2776,6 +2733,7 @@ mod tests {
             safe_storage: SafeStorage::new(&dir),
             ..Default::default()
         };
+        app.set_realtime_watch_enabled(false);
 
         app.save_preferences();
         let prefs = store.read();
@@ -2831,7 +2789,7 @@ mod tests {
         assert!(!app.include_hidden);
         assert!(!app.follow_symlinks);
         assert!(app.stay_on_filesystem);
-        assert!(!app.realtime_watch_enabled);
+        assert!(!app.realtime_watch_enabled());
         assert!(!app.sqlite_cache_enabled);
         assert!(app.search_filter_enabled);
         assert!(app.color_by_extension);
@@ -2844,11 +2802,11 @@ mod tests {
     #[test]
     fn realtime_watch_preference_round_trips_through_safe_storage() {
         let dir = unique_temp_dir();
-        let app = DiskMapApp {
-            realtime_watch_enabled: false,
+        let mut app = DiskMapApp {
             safe_storage: SafeStorage::new(&dir),
             ..Default::default()
         };
+        app.set_realtime_watch_enabled(false);
 
         app.save_preferences();
         let mut restored = DiskMapApp {
@@ -2858,7 +2816,7 @@ mod tests {
         restored.restore_preferences(&app.safe_storage.read());
 
         assert!(
-            !restored.realtime_watch_enabled,
+            !restored.realtime_watch_enabled(),
             "disabled Watch must survive save/restore"
         );
     }
@@ -2879,7 +2837,7 @@ mod tests {
         app.sqlite_cache_enabled = true;
         app.search_filter_enabled = true;
         app.color_by_extension = true;
-        app.realtime_watch_enabled = false;
+        app.set_realtime_watch_enabled(false);
         app.save_current_as_profile(root);
 
         app.max_depth = 5;
@@ -3014,10 +2972,8 @@ mod tests {
             .expect("profile scan skip file should be written");
 
         let root_key = root.display().to_string();
-        let mut app = DiskMapApp {
-            realtime_watch_enabled: false,
-            ..Default::default()
-        };
+        let mut app = DiskMapApp::default();
+        app.set_realtime_watch_enabled(false);
         app.exclude_input = "skip.bin".into();
         app.save_current_as_profile(&root_key);
         app.exclude_input.clear();
@@ -3049,21 +3005,20 @@ mod tests {
 
         let mut app = DiskMapApp {
             sqlite_cache_enabled: true,
-            realtime_watch_enabled: false,
             safe_storage: SafeStorage::new(&storage_dir),
             ..Default::default()
         };
+        app.set_realtime_watch_enabled(false);
 
         app.start_scan_path(root.clone());
         assert!(drain_scan_for_test(&mut app), "smoke scan should finish");
         assert_eq!(app.scan_options().cache_mode, CacheMode::Disabled);
         assert!(app.scan_options().cache_path.is_none());
-        app.realtime_watch_enabled = true;
-        app.update_watch_state();
+        app.set_realtime_watch_enabled(true);
         assert!(
-            app.watcher.is_some(),
+            app.scan.watch_active(),
             "watcher should start for scanned temp root; status: {}",
-            app.status
+            app.status.display_text()
         );
 
         let nested_id = app
@@ -3091,6 +3046,7 @@ mod tests {
         app.export_focused_subtree(ExportFormat::Json);
         let exported_path = PathBuf::from(
             app.status
+                .primary_text()
                 .rsplit_once(" to ")
                 .expect("export status should include output path")
                 .1,
@@ -3103,11 +3059,94 @@ mod tests {
         app.queue_cleanup_candidate(file_id);
         app.arm_or_confirm_queued_trash(file_id);
         assert_eq!(app.trash_confirm_target_id, Some(file_id));
-        assert!(app.status.contains(&file.display().to_string()));
+        assert!(app
+            .status
+            .display_text()
+            .contains(&file.display().to_string()));
 
         app.stop_watching();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn successful_scan_keeps_finished_status_when_watch_starts() {
+        let root = unique_temp_path("disk-map-watch-finished-status");
+        std::fs::create_dir_all(&root).expect("watch test root should be created");
+        std::fs::write(root.join("sample.bin"), vec![0_u8; 1024])
+            .expect("watch test file should be written");
+
+        let mut app = DiskMapApp::default();
+        app.start_scan_path(root.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan.is_scanning() && Instant::now() < deadline {
+            app.handle_scan_messages();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.handle_scan_messages();
+
+        assert!(
+            !app.scan.is_scanning(),
+            "scan did not finish before timeout"
+        );
+        assert!(app.scan.watch_active());
+        assert!(
+            app.status.primary_text().starts_with("Finished:"),
+            "unexpected status: {}",
+            app.status.display_text()
+        );
+
+        app.stop_watching();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_watch_restart_clears_stale_failure_status() {
+        let root = unique_temp_path("disk-map-watch-recovery-status");
+        std::fs::create_dir_all(&root).expect("watch test root should be created");
+
+        let mut app = DiskMapApp::default();
+        app.start_scan_path(root.clone());
+        assert!(
+            drain_scan_for_test(&mut app),
+            "watch test scan should finish"
+        );
+        let finished_status = app.status.primary_text().to_string();
+        app.set_realtime_watch_enabled(false);
+        std::fs::remove_dir_all(&root).expect("watch test root should be removed");
+        app.set_realtime_watch_enabled(true);
+        assert!(app.status.has_watch_failure());
+
+        std::fs::create_dir_all(&root).expect("watch test root should be restored");
+        app.set_realtime_watch_enabled(false);
+        app.set_realtime_watch_enabled(true);
+
+        assert_eq!(app.status.display_text(), finished_status);
+        app.stop_watching();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_watch_restart_preserves_finished_status() {
+        let root = unique_temp_path("disk-map-watch-finished-recovery");
+        std::fs::create_dir_all(&root).expect("watch test root should be created");
+
+        let mut app = DiskMapApp::default();
+        app.start_scan_path(root.clone());
+        assert!(
+            drain_scan_for_test(&mut app),
+            "watch test scan should finish"
+        );
+        app.set_realtime_watch_enabled(false);
+        app.set_status(StatusSource::Scan, StatusLevel::Success, "Finished: 1 KiB");
+        app.status.set_watch_failure("backend failed");
+
+        app.set_realtime_watch_enabled(true);
+
+        assert_eq!(app.status.display_text(), "Finished: 1 KiB");
+        app.stop_watching();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3277,7 +3316,7 @@ mod tests {
         assert_eq!(report.file_count, 2);
         assert_eq!(report.total_reclaimable_bytes, 5);
         assert_eq!(app.scan.active_id(), active_scan_id);
-        assert!(app.status.contains("1 candidate group"));
+        assert!(app.status.primary_text().contains("1 candidate group"));
     }
 
     #[test]
@@ -3288,7 +3327,7 @@ mod tests {
 
         assert!(app.duplicate_report.is_none());
         assert_eq!(
-            app.status,
+            app.status.primary_text(),
             "Duplicate analysis unavailable: no focused directory"
         );
     }
@@ -3332,7 +3371,7 @@ mod tests {
             },
         });
         let active_scan_id = app.scan.active_id();
-        let layout_dirty = app.layout_dirty;
+        let layout_dirty = app.treemap.is_dirty();
 
         app.analyze_file_insights();
 
@@ -3344,8 +3383,8 @@ mod tests {
             .iter()
             .any(|summary| summary.category == "Archives" && summary.extension == "zip"));
         assert_eq!(app.scan.active_id(), active_scan_id);
-        assert_eq!(app.layout_dirty, layout_dirty);
-        assert_eq!(app.status, "Insights analyzed 2 files");
+        assert_eq!(app.treemap.is_dirty(), layout_dirty);
+        assert_eq!(app.status.primary_text(), "Insights analyzed 2 files");
     }
 
     #[test]
@@ -3355,7 +3394,10 @@ mod tests {
         app.analyze_file_insights();
 
         assert!(app.insight_report.is_none());
-        assert_eq!(app.status, "Insights unavailable: no focused directory");
+        assert_eq!(
+            app.status.primary_text(),
+            "Insights unavailable: no focused directory"
+        );
     }
 
     #[test]
@@ -3366,7 +3408,7 @@ mod tests {
         app.follow_symlinks = true;
         app.stay_on_filesystem = true;
         app.sqlite_cache_enabled = true;
-        app.realtime_watch_enabled = true;
+        app.set_realtime_watch_enabled(true);
         app.search_filter_enabled = true;
         app.color_by_extension = true;
         app.max_depth = 4;
@@ -3398,12 +3440,12 @@ mod tests {
         app.toggle_pinned_root("/root");
         assert_eq!(app.pinned_roots, vec!["/root"]);
         assert_eq!(app.recent_roots, vec!["/root"]);
-        assert_eq!(app.status, "Pinned /root");
+        assert_eq!(app.status.primary_text(), "Pinned /root");
 
         app.toggle_pinned_root("/root");
         assert!(app.pinned_roots.is_empty());
         assert_eq!(app.recent_roots, vec!["/root"]);
-        assert_eq!(app.status, "Unpinned /root");
+        assert_eq!(app.status.primary_text(), "Unpinned /root");
     }
 
     #[test]
@@ -3429,7 +3471,10 @@ mod tests {
 
         assert!(app.trash_confirm_target_id.is_none());
         assert_eq!(app.cleanup_queue.len(), 1);
-        assert!(app.status.starts_with("Queued cleanup candidate: "));
+        assert!(app
+            .status
+            .primary_text()
+            .starts_with("Queued cleanup candidate: "));
     }
 
     #[test]
@@ -3449,7 +3494,10 @@ mod tests {
         assert_eq!(app.cleanup_queue.candidates()[0].item_count, 1);
         assert_eq!(app.trash_confirm_target_id, None);
         assert_eq!(app.scan.active_id(), active_scan_id);
-        assert!(app.status.starts_with("Queued cleanup candidate: "));
+        assert!(app
+            .status
+            .primary_text()
+            .starts_with("Queued cleanup candidate: "));
     }
 
     #[test]
@@ -3466,9 +3514,12 @@ mod tests {
         app.arm_or_confirm_queued_trash(2);
 
         assert_eq!(app.trash_confirm_target_id, Some(2));
-        assert!(app.status.contains(&file.display().to_string()));
-        assert!(app.status.contains("1 B"));
-        assert!(app.status.contains("1 item"));
+        assert!(app
+            .status
+            .primary_text()
+            .contains(&file.display().to_string()));
+        assert!(app.status.primary_text().contains("1 B"));
+        assert!(app.status.primary_text().contains("1 item"));
 
         std::fs::remove_dir_all(root).expect("trash confirmation test root should be removed");
     }
@@ -3495,8 +3546,8 @@ mod tests {
         assert!(app.tree.node(1).children.is_empty());
         assert_eq!(app.tree.node(2).parent, None);
         assert_eq!(app.navigation.selected_id(), Some(1));
-        assert!(app.status.contains("Moved to Trash"));
-        assert!(!app.status.contains("Rescan to refresh"));
+        assert!(app.status.primary_text().contains("Moved to Trash"));
+        assert!(!app.status.primary_text().contains("Rescan to refresh"));
 
         std::fs::remove_dir_all(root).expect("direct trash test root should be removed");
     }
@@ -3529,7 +3580,10 @@ mod tests {
         assert_eq!(app.trash_confirm_target_id, None);
         assert!(app.cleanup_queue.is_empty());
         assert_eq!(app.scan.active_id(), active_scan_id);
-        assert!(app.status.contains("target no longer exists"));
+        assert!(app
+            .status
+            .primary_text()
+            .contains("target no longer exists"));
     }
 
     #[test]
@@ -3544,7 +3598,7 @@ mod tests {
 
         assert_eq!(app.trash_confirm_target_id, None);
         assert_eq!(app.cleanup_queue.len(), 1);
-        assert!(app.status.contains("user protected path"));
+        assert!(app.status.primary_text().contains("user protected path"));
     }
 
     #[test]
@@ -3558,7 +3612,10 @@ mod tests {
 
         app.queue_cleanup_candidate(aggregate);
 
-        assert_eq!(app.status, "Cleanup queue unavailable for virtual nodes");
+        assert_eq!(
+            app.status.primary_text(),
+            "Cleanup queue unavailable for virtual nodes"
+        );
         assert!(app.trash_confirm_target_id.is_none());
         assert!(app.cleanup_queue.is_empty());
     }
@@ -3571,7 +3628,10 @@ mod tests {
 
         app.queue_cleanup_candidate(root);
 
-        assert!(app.status.starts_with("Protected path blocked: / "));
+        assert!(app
+            .status
+            .primary_text()
+            .starts_with("Protected path blocked: / "));
         assert!(app.cleanup_queue.is_empty());
     }
 
@@ -3584,11 +3644,11 @@ mod tests {
 
         app.queue_cleanup_candidate(2);
 
-        assert!(app.status.contains(&format!(
+        assert!(app.status.primary_text().contains(&format!(
             "Protected path blocked: {}",
             root.join("match-dir").join("match-file").display()
         )));
-        assert!(app.status.contains("user protected path"));
+        assert!(app.status.primary_text().contains("user protected path"));
         assert!(app.cleanup_queue.is_empty());
     }
 
@@ -3651,20 +3711,20 @@ mod tests {
     fn depth_keyboard_helpers_clamp_and_mark_layout_dirty() {
         let mut app = DiskMapApp {
             max_depth: 1,
-            layout_dirty: false,
             ..Default::default()
         };
+        app.treemap.mark_clean_for_test();
 
         assert!(!app.decrease_depth());
         assert!(app.increase_depth());
         assert_eq!(app.max_depth, 2);
-        assert!(app.layout_dirty);
+        assert!(app.treemap.is_dirty());
 
         app.max_depth = 10;
-        app.layout_dirty = false;
+        app.treemap.mark_clean_for_test();
         assert!(!app.increase_depth());
         assert_eq!(app.max_depth, 10);
-        assert!(!app.layout_dirty);
+        assert!(!app.treemap.is_dirty());
     }
 
     #[test]
@@ -3675,7 +3735,7 @@ mod tests {
 
         assert_eq!(app.scan.active_id(), 7);
         assert!(!app.scan.has_handle());
-        assert_eq!(app.status, "Open failed: boom");
+        assert_eq!(app.status.primary_text(), "Open failed: boom");
     }
 
     #[test]
@@ -3728,16 +3788,22 @@ mod tests {
 
     #[test]
     fn no_root_state_message_reflects_error_and_cancelled_states() {
-        let mut app = DiskMapApp {
-            status: "Error: Path does not exist: /missing".into(),
-            ..Default::default()
-        };
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(ScanMessage::Error {
+            scan_id: 1,
+            message: "Path does not exist: /missing".into(),
+            perf_stats: PerfStats::default(),
+        });
 
         let error_message = app.no_root_state_message();
         assert_eq!(error_message.title, "Unable to scan path");
         assert_eq!(error_message.detail, "Path does not exist: /missing");
 
-        app.status = "Scan cancelled".into();
+        let mut app = app_for_scan(2);
+        app.apply_scan_message_for_test(ScanMessage::Cancelled {
+            scan_id: 2,
+            perf_stats: PerfStats::default(),
+        });
         let cancelled_message = app.no_root_state_message();
         assert_eq!(cancelled_message.title, "Scan cancelled");
     }
@@ -3747,13 +3813,12 @@ mod tests {
         let mut app = app_for_scan(1);
         app.path_input = "/root".into();
         app.apply_scan_message_for_test(root_started(1));
-        app.scan.mark_started();
 
         let scanning_message = app.empty_root_state_message(0).expect("empty root state");
         assert_eq!(scanning_message.title, "Waiting for first results");
         assert!(scanning_message.detail.contains("/root"));
 
-        app.scan.mark_finished(PerfStats::default());
+        app.apply_scan_message_for_test(finished(1, 0));
 
         let finished_message = app.empty_root_state_message(0).expect("empty root state");
 
@@ -3785,6 +3850,7 @@ mod tests {
                 progress: None,
             },
         });
+        app.apply_scan_message_for_test(finished(1, 0));
 
         let message = app
             .empty_root_state_message(0)
@@ -3821,15 +3887,12 @@ mod tests {
 
     #[test]
     fn disabling_watch_clears_a_pending_follow_up_scan() {
-        let mut app = DiskMapApp {
-            realtime_watch_enabled: false,
-            watch_rescan_pending: true,
-            ..Default::default()
-        };
+        let mut app = DiskMapApp::default();
 
-        app.update_watch_state();
+        app.set_realtime_watch_enabled(false);
 
-        assert!(!app.watch_rescan_pending);
+        assert!(!app.realtime_watch_enabled());
+        assert!(!app.scan.watch_active());
     }
 
     #[test]
@@ -3857,7 +3920,7 @@ mod tests {
             },
         });
         app.enter_root(1, false);
-        app.layout_dirty = false;
+        app.treemap.mark_clean_for_test();
 
         app.return_to_scan_root();
 
@@ -3865,7 +3928,7 @@ mod tests {
         assert_eq!(app.navigation.selected_id(), Some(0));
         assert_eq!(app.navigation.back_history(), &[1]);
         assert!(app.navigation.forward_history().is_empty());
-        assert!(app.layout_dirty);
+        assert!(app.treemap.is_dirty());
     }
 
     #[test]
@@ -3883,14 +3946,21 @@ mod tests {
 
     #[test]
     fn apply_progress_keeps_current_scan_path() {
-        let mut app = DiskMapApp::default();
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
 
-        app.apply_progress(ProgressSnapshot {
-            files_scanned: 3,
-            total_files: Some(6),
-            dirs_scanned: 2,
-            bytes_seen: 128,
-            current_path: "/root/current/file.txt".into(),
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                progress: Some(ProgressSnapshot {
+                    files_scanned: 3,
+                    total_files: Some(6),
+                    dirs_scanned: 2,
+                    bytes_seen: 128,
+                    current_path: "/root/current/file.txt".into(),
+                }),
+                ..Default::default()
+            },
         });
 
         let progress = app.scan.progress().expect("progress summary");
@@ -3903,7 +3973,7 @@ mod tests {
             progress.current_path,
             PathBuf::from("/root/current/file.txt")
         );
-        assert_eq!(app.status, "Scanning...");
+        assert_eq!(app.status.primary_text(), "Scanning...");
     }
 
     #[test]

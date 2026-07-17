@@ -142,6 +142,54 @@ pub struct ScanBatch {
     pub progress: Option<ProgressSnapshot>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ScanBatchApplication {
+    pub discovered_node_ids: Vec<NodeId>,
+    pub dirty_node_ids: Vec<NodeId>,
+    pub had_progress: bool,
+}
+
+impl ScanBatch {
+    pub(crate) fn apply_to_tree(self, tree: &mut TreeStore) -> ScanBatchApplication {
+        let mut application = ScanBatchApplication {
+            discovered_node_ids: Vec::with_capacity(self.discovered_nodes.len()),
+            dirty_node_ids: Vec::with_capacity(
+                self.discovered_nodes.len().saturating_mul(2)
+                    + self.size_deltas.len()
+                    + self.scanned_nodes.len(),
+            ),
+            had_progress: self.progress.is_some(),
+        };
+
+        for discovered in self.discovered_nodes {
+            let node_id = discovered.node_id;
+            let parent_id = discovered.parent_id;
+            tree.insert_node(node_id, Some(parent_id), discovered.node);
+            application.discovered_node_ids.push(node_id);
+            application.dirty_node_ids.push(parent_id);
+            application.dirty_node_ids.push(node_id);
+        }
+
+        for (node_id, delta) in self.size_deltas {
+            if tree.contains_id(node_id) {
+                tree.apply_direct_size_delta(node_id, delta);
+                application.dirty_node_ids.push(node_id);
+            }
+        }
+
+        for node_id in self.scanned_nodes {
+            if tree.contains_id(node_id) {
+                tree.mark_scanned(node_id);
+                application.dirty_node_ids.push(node_id);
+            }
+        }
+
+        application.dirty_node_ids.sort_unstable();
+        application.dirty_node_ids.dedup();
+        application
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ScanMessage {
     Started {
@@ -557,23 +605,7 @@ pub fn scan_path_to_tree(path: PathBuf, options: ScanOptions) -> anyhow::Result<
                 tree.set_root_path(path);
             }
             ScanMessage::Batch { batch, .. } => {
-                for discovered in batch.discovered_nodes {
-                    tree.insert_node(
-                        discovered.node_id,
-                        Some(discovered.parent_id),
-                        discovered.node,
-                    );
-                }
-                for (node_id, delta) in batch.size_deltas {
-                    if node_index(node_id) < tree.len() {
-                        tree.apply_direct_size_delta(node_id, delta);
-                    }
-                }
-                for node_id in batch.scanned_nodes {
-                    if node_index(node_id) < tree.len() {
-                        tree.mark_scanned(node_id);
-                    }
-                }
+                batch.apply_to_tree(&mut tree);
             }
             ScanMessage::Finished { .. } => return Ok(tree),
             ScanMessage::Cancelled { .. } => anyhow::bail!("scan cancelled"),
@@ -1360,6 +1392,44 @@ mod tests {
 
         assert_eq!(deltas.get(&1), Some(&42));
         assert_eq!(deltas.get(&2), Some(&5));
+    }
+
+    #[test]
+    fn scan_batch_application_updates_tree_and_reports_ui_changes() {
+        let mut tree = TreeStore::new();
+        tree.push_node(None, TreeStore::root_record("root".into()));
+        let batch = ScanBatch {
+            discovered_nodes: vec![DiscoveredNode {
+                node_id: 1,
+                parent_id: 0,
+                node: NodeRecord {
+                    name: "file.bin".into(),
+                    kind: NodeKind::File,
+                    size: 5,
+                    modified_secs: None,
+                    scanned: false,
+                    error: None,
+                },
+            }],
+            size_deltas: vec![(0, 5), (99, 10)],
+            scanned_nodes: vec![1, 99],
+            progress: Some(ProgressSnapshot {
+                files_scanned: 1,
+                total_files: Some(1),
+                dirs_scanned: 1,
+                bytes_seen: 5,
+                current_path: "/root/file.bin".into(),
+            }),
+        };
+
+        let application = batch.apply_to_tree(&mut tree);
+
+        assert_eq!(application.discovered_node_ids, vec![1]);
+        assert_eq!(application.dirty_node_ids, vec![0, 1]);
+        assert!(application.had_progress);
+        assert_eq!(tree.node(0).size, 5);
+        assert_eq!(tree.node(1).size, 5);
+        assert!(tree.node(1).scanned);
     }
 
     #[test]

@@ -69,14 +69,12 @@ pub fn show_settings_window(ctx: &egui::Context, app: &mut DiskMapApp) {
                 cols[0]
                     .checkbox(&mut app.stay_on_filesystem, "Same FS")
                     .on_hover_text("Stay on the scan root filesystem when supported");
-                let before_watch = app.realtime_watch_enabled;
-                cols[1]
-                    .checkbox(&mut app.realtime_watch_enabled, "Watch")
-                    .on_hover_text(
-                        "Watch the scan root and rescan after debounced filesystem changes",
-                    );
-                if app.realtime_watch_enabled != before_watch {
-                    app.update_watch_state();
+                let mut watch_enabled = app.realtime_watch_enabled();
+                cols[1].checkbox(&mut watch_enabled, "Watch").on_hover_text(
+                    "Watch the scan root and rescan after debounced filesystem changes",
+                );
+                if watch_enabled != app.realtime_watch_enabled() {
+                    app.set_realtime_watch_enabled(watch_enabled);
                 }
             });
 

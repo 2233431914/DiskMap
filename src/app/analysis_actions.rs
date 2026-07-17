@@ -1,4 +1,4 @@
-use super::{current_unix_secs, pluralize, DiskMapApp};
+use super::{current_unix_secs, pluralize, DiskMapApp, StatusLevel, StatusSource};
 use crate::duplicates::find_duplicate_candidates;
 use crate::insights::analyze_insights;
 
@@ -9,7 +9,11 @@ impl DiskMapApp {
         self.last_report_mode = "duplicates".to_string();
         let Some(root_id) = self.navigation.focused_root() else {
             self.duplicate_report = None;
-            self.status = "Duplicate analysis unavailable: no focused directory".to_string();
+            self.set_status(
+                StatusSource::Analysis,
+                StatusLevel::Warning,
+                "Duplicate analysis unavailable: no focused directory",
+            );
             self.pending_repaint = true;
             return;
         };
@@ -29,11 +33,15 @@ impl DiskMapApp {
                     )
                 };
                 self.duplicate_report = Some(report);
-                self.status = status;
+                self.set_status(StatusSource::Analysis, StatusLevel::Success, status);
             }
             None => {
                 self.duplicate_report = None;
-                self.status = "Duplicate analysis unavailable for this view".to_string();
+                self.set_status(
+                    StatusSource::Analysis,
+                    StatusLevel::Warning,
+                    "Duplicate analysis unavailable for this view",
+                );
             }
         }
         self.pending_repaint = true;
@@ -43,7 +51,11 @@ impl DiskMapApp {
         self.last_report_mode = "insights".to_string();
         let Some(root_id) = self.navigation.focused_root() else {
             self.insight_report = None;
-            self.status = "Insights unavailable: no focused directory".to_string();
+            self.set_status(
+                StatusSource::Analysis,
+                StatusLevel::Warning,
+                "Insights unavailable: no focused directory",
+            );
             self.pending_repaint = true;
             return;
         };
@@ -55,15 +67,23 @@ impl DiskMapApp {
             crate::insights::INSIGHT_REPORT_LIMIT,
         ) {
             Some(report) => {
-                self.status = format!(
-                    "Insights analyzed {}",
-                    pluralize(report.file_count as u64, "file", "files")
+                self.set_status(
+                    StatusSource::Analysis,
+                    StatusLevel::Success,
+                    format!(
+                        "Insights analyzed {}",
+                        pluralize(report.file_count as u64, "file", "files")
+                    ),
                 );
                 self.insight_report = Some(report);
             }
             None => {
                 self.insight_report = None;
-                self.status = "Insights unavailable for this view".to_string();
+                self.set_status(
+                    StatusSource::Analysis,
+                    StatusLevel::Warning,
+                    "Insights unavailable for this view",
+                );
             }
         }
         self.pending_repaint = true;

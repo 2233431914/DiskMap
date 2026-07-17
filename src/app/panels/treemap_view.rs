@@ -7,24 +7,22 @@
 //! they are also reused by other code paths; this module calls them through
 //! the `app` argument.
 
+use super::super::treemap_state::TreemapLayoutRequest;
 use super::super::DiskMapApp;
 use crate::app::{
     find_hovered_visual, palette, truncate_middle, CONTEXT_MENU_MAX_TITLE_CHARS,
-    CONTEXT_MENU_MIN_WIDTH, LAYOUT_REFRESH_INTERVAL,
+    CONTEXT_MENU_MIN_WIDTH,
 };
 use crate::format::format_bytes;
 use crate::platform::{open_path, reveal_action_label, reveal_in_file_manager};
-use crate::treemap::{layout_treemap, TreemapLayoutParams, VisualKind};
+use crate::treemap::VisualKind;
 use eframe::egui::{self, RichText, Sense, Vec2};
-use std::time::Instant;
 
 pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     let p = palette(ui.ctx());
     let available = ui.max_rect().intersect(ui.clip_rect());
     if available.width() <= 0.0 || available.height() <= 0.0 {
-        app.cached_visuals.clear();
-        app.last_canvas_rect = None;
-        app.layout_dirty = true;
+        app.treemap.clear();
         return;
     }
     let response = ui.allocate_rect(available, Sense::click());
@@ -47,40 +45,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         return;
     }
 
-    let canvas_changed = app.last_canvas_rect != Some(available);
-    if canvas_changed {
-        app.last_canvas_rect = Some(available);
-        app.layout_dirty = true;
-        app.last_layout_refresh = Instant::now()
-            .checked_sub(LAYOUT_REFRESH_INTERVAL)
-            .unwrap_or_else(Instant::now);
-    }
-
-    let should_refresh_layout = app.layout_dirty
-        && (!app.scan.is_scanning()
-            || app.last_layout_refresh.elapsed() >= LAYOUT_REFRESH_INTERVAL);
-
-    if should_refresh_layout {
-        let layout_start = Instant::now();
-        layout_treemap(
-            &mut app.tree,
-            TreemapLayoutParams {
-                root: root_id,
-                canvas_rect: available,
-                max_depth: app.max_depth,
-                search_state: app.search.state(),
-                filter_to_search: app.search_filter_enabled,
-                out: &mut app.cached_visuals,
-                scratch: &mut app.layout_scratch,
-            },
-        );
-        app.layout_dirty = false;
-        app.last_layout_refresh = Instant::now();
-        app.scan.record_layout_recompute(layout_start.elapsed());
+    if let Some(elapsed) = app.treemap.layout_if_due(
+        &mut app.tree,
+        TreemapLayoutRequest {
+            root: root_id,
+            canvas_rect: available,
+            max_depth: app.max_depth,
+            search_state: app.search.state(),
+            filter_to_search: app.search_filter_enabled,
+            scanning: app.scan.is_scanning(),
+        },
+    ) {
+        app.scan.record_layout_recompute(elapsed);
     }
 
     app.hovered_visual_kind =
-        find_hovered_visual(&app.cached_visuals, response.hover_pos()).map(|visual| visual.kind);
+        find_hovered_visual(app.treemap.visuals(), response.hover_pos()).map(|visual| visual.kind);
     app.hovered_id = app.hovered_visual_kind.and_then(|kind| match kind {
         VisualKind::Node(node_id) => Some(node_id),
         VisualKind::SmallFiles { .. } => None,
@@ -89,7 +69,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         app.context_menu_target_id = app.hovered_id;
     }
 
-    for visual in &app.cached_visuals {
+    for visual in app.treemap.visuals() {
         app.paint_visual(ui, &painter, visual);
     }
     if response.double_clicked() {

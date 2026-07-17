@@ -1,6 +1,7 @@
 //! Sidebar section renderers for scan progress, scan issues, and the bottom
 //! status bar.
 
+use super::super::status::StatusLevel;
 use super::super::DiskMapApp;
 use super::super::Palette;
 use super::super::StateMessage;
@@ -102,18 +103,23 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
 
     ui.horizontal_centered(|ui| {
         ui.add_space(4.0);
-        let dot_color = if app.status.starts_with("Error") {
-            p.danger
-        } else if app.scan.is_scanning() {
-            p.accent
-        } else if app.status.starts_with("Cancel") {
-            p.text_faint
-        } else {
-            Color32::from_rgb(0x4A, 0xC4, 0x7A)
-        };
+        let dot_color =
+            if app.status.has_watch_failure() || app.status.level() == StatusLevel::Error {
+                p.danger
+            } else if app.status.level() == StatusLevel::Progress {
+                p.accent
+            } else if app.status.level() == StatusLevel::Warning {
+                p.text_faint
+            } else {
+                Color32::from_rgb(0x4A, 0xC4, 0x7A)
+            };
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-        ui.label(RichText::new(&app.status).size(11.5).color(p.text_muted));
+        ui.label(
+            RichText::new(app.status.display_text())
+                .size(11.5)
+                .color(p.text_muted),
+        );
 
         let elapsed_text = app
             .scan

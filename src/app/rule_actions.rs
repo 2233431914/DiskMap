@@ -1,4 +1,4 @@
-use super::DiskMapApp;
+use super::{DiskMapApp, StatusLevel, StatusSource};
 use crate::rules::{export_ruleset_to_dir, import_ruleset_from_path, preview_ruleset_import};
 use std::path::{Path, PathBuf};
 
@@ -25,11 +25,19 @@ impl DiskMapApp {
         let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match export_ruleset_to_dir(&self.rules, &dest) {
             Ok(path) => {
-                self.status = format!("Wrote rules: {}", path.display());
+                self.set_status(
+                    StatusSource::Rules,
+                    StatusLevel::Success,
+                    format!("Wrote rules: {}", path.display()),
+                );
             }
             Err(error) => {
                 self.record_error(format!("rules export failed: {error}"));
-                self.status = format!("Rules export failed: {error}");
+                self.set_status(
+                    StatusSource::Rules,
+                    StatusLevel::Error,
+                    format!("Rules export failed: {error}"),
+                );
             }
         }
         self.pending_repaint = true;
@@ -39,7 +47,11 @@ impl DiskMapApp {
         let raw = self.rules_import_path.trim().to_string();
         if raw.is_empty() {
             self.pending_rules_import = None;
-            self.status = "Type a path to import from".to_string();
+            self.set_status(
+                StatusSource::Rules,
+                StatusLevel::Warning,
+                "Type a path to import from",
+            );
             self.pending_repaint = true;
             return;
         }
@@ -48,19 +60,27 @@ impl DiskMapApp {
         match import_ruleset_from_path(path) {
             Ok(ruleset) => {
                 let preview = preview_ruleset_import(&self.rules, ruleset, PathBuf::from(&raw));
-                self.status = format!(
-                    "Preview rules import: {} rules, +{} / -{} / {} changed",
-                    preview.incoming_rule_count,
-                    preview.added_count,
-                    preview.removed_count,
-                    preview.changed_count
+                self.set_status(
+                    StatusSource::Rules,
+                    StatusLevel::Confirmation,
+                    format!(
+                        "Preview rules import: {} rules, +{} / -{} / {} changed",
+                        preview.incoming_rule_count,
+                        preview.added_count,
+                        preview.removed_count,
+                        preview.changed_count
+                    ),
                 );
                 self.pending_rules_import = Some(preview);
             }
             Err(error) => {
                 self.pending_rules_import = None;
                 self.record_error(format!("rules import failed: {error}"));
-                self.status = format!("Rules import failed: {error}");
+                self.set_status(
+                    StatusSource::Rules,
+                    StatusLevel::Error,
+                    format!("Rules import failed: {error}"),
+                );
             }
         }
         self.pending_repaint = true;
@@ -68,7 +88,11 @@ impl DiskMapApp {
 
     pub fn confirm_rules_import(&mut self) -> bool {
         let Some(preview) = self.pending_rules_import.take() else {
-            self.status = "Rules import unavailable: no preview to apply".to_string();
+            self.set_status(
+                StatusSource::Rules,
+                StatusLevel::Warning,
+                "Rules import unavailable: no preview to apply",
+            );
             self.pending_repaint = true;
             return false;
         };
@@ -76,14 +100,22 @@ impl DiskMapApp {
         self.rules = preview.ruleset;
         self.last_rule_hits = None;
         self.rules_import_path.clear();
-        self.status = format!("Imported rules from {source}");
+        self.set_status(
+            StatusSource::Rules,
+            StatusLevel::Success,
+            format!("Imported rules from {source}"),
+        );
         self.persist_local_state();
         true
     }
 
     pub fn cancel_rules_import(&mut self) {
         if self.pending_rules_import.take().is_some() {
-            self.status = "Cancelled rules import preview".to_string();
+            self.set_status(
+                StatusSource::Rules,
+                StatusLevel::Info,
+                "Cancelled rules import preview",
+            );
             self.pending_repaint = true;
         }
     }

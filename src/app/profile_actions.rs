@@ -1,4 +1,4 @@
-use super::DiskMapApp;
+use super::{DiskMapApp, StatusLevel, StatusSource};
 #[cfg(test)]
 use crate::profiles::ScanProfile;
 #[cfg(test)]
@@ -20,8 +20,12 @@ impl DiskMapApp {
         self.sqlite_cache_enabled = false;
         self.search_filter_enabled = profile.search_filter_enabled;
         self.color_by_extension = profile.color_by_extension;
-        self.realtime_watch_enabled = profile.realtime_watch_enabled;
-        self.status = format!("Applied profile for {root}");
+        self.set_realtime_watch_enabled(profile.realtime_watch_enabled);
+        self.set_status(
+            StatusSource::Profile,
+            StatusLevel::Success,
+            format!("Applied profile for {root}"),
+        );
         self.pending_repaint = true;
     }
 
@@ -37,10 +41,14 @@ impl DiskMapApp {
             sqlite_cache_enabled: false,
             search_filter_enabled: self.search_filter_enabled,
             color_by_extension: self.color_by_extension,
-            realtime_watch_enabled: self.realtime_watch_enabled,
+            realtime_watch_enabled: self.realtime_watch_enabled(),
         };
         self.profiles.set(root, profile);
-        self.status = format!("Saved profile for {root} ({} stored)", self.profiles.len());
+        self.set_status(
+            StatusSource::Profile,
+            StatusLevel::Success,
+            format!("Saved profile for {root} ({} stored)", self.profiles.len()),
+        );
         self.persist_local_state();
     }
 }
