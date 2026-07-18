@@ -165,7 +165,6 @@ impl TreeStore {
             self.root = Some(id);
             self.root_path.clear();
         }
-        self.path_cache.pop(&id);
     }
 
     pub fn node(&self, id: NodeId) -> &Node {

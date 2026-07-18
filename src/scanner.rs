@@ -2,6 +2,7 @@ use crate::db::ScanDb;
 use crate::tree::{node_id_from_index, node_index, NodeId, NodeKind, NodeRecord, TreeStore};
 
 use crossbeam_channel::{unbounded, Sender};
+use jwalk::rayon::prelude::*;
 use jwalk::{ClientState, WalkDirGeneric};
 use rustc_hash::FxHashMap;
 use std::fs::Metadata;
@@ -151,12 +152,16 @@ pub(crate) struct ScanBatchApplication {
 
 impl ScanBatch {
     pub(crate) fn apply_to_tree(self, tree: &mut TreeStore) -> ScanBatchApplication {
+        let discovered_range = self
+            .discovered_nodes
+            .first()
+            .zip(self.discovered_nodes.last())
+            .map(|(first, last)| first.node_id..=last.node_id);
+        tree.nodes.reserve(self.discovered_nodes.len());
         let mut application = ScanBatchApplication {
             discovered_node_ids: Vec::with_capacity(self.discovered_nodes.len()),
             dirty_node_ids: Vec::with_capacity(
-                self.discovered_nodes.len().saturating_mul(2)
-                    + self.size_deltas.len()
-                    + self.scanned_nodes.len(),
+                self.discovered_nodes.len() + self.size_deltas.len() + self.scanned_nodes.len(),
             ),
             had_progress: self.progress.is_some(),
         };
@@ -167,7 +172,6 @@ impl ScanBatch {
             tree.insert_node(node_id, Some(parent_id), discovered.node);
             application.discovered_node_ids.push(node_id);
             application.dirty_node_ids.push(parent_id);
-            application.dirty_node_ids.push(node_id);
         }
 
         for (node_id, delta) in self.size_deltas {
@@ -180,7 +184,12 @@ impl ScanBatch {
         for node_id in self.scanned_nodes {
             if tree.contains_id(node_id) {
                 tree.mark_scanned(node_id);
-                application.dirty_node_ids.push(node_id);
+                if !discovered_range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&node_id))
+                {
+                    application.dirty_node_ids.push(node_id);
+                }
             }
         }
 
@@ -239,7 +248,6 @@ struct EntryClientState {
 
 #[derive(Debug)]
 struct PrefetchedFileInfo {
-    metadata: Metadata,
     cached_mtime: Option<u64>,
     modified_secs: Option<u64>,
     measured_size: u64,
@@ -250,6 +258,42 @@ struct PrefetchPerfCounters {
     metadata_ns: AtomicU64,
     mtime_ns: AtomicU64,
     size_ns: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PrefetchPerfDelta {
+    metadata_ns: u64,
+    mtime_ns: u64,
+    size_ns: u64,
+}
+
+impl PrefetchPerfDelta {
+    fn add(&mut self, other: Self) {
+        self.metadata_ns = self.metadata_ns.saturating_add(other.metadata_ns);
+        self.mtime_ns = self.mtime_ns.saturating_add(other.mtime_ns);
+        self.size_ns = self.size_ns.saturating_add(other.size_ns);
+    }
+}
+
+impl PrefetchPerfCounters {
+    fn add(&self, delta: PrefetchPerfDelta) {
+        if delta.metadata_ns > 0 {
+            self.metadata_ns
+                .fetch_add(delta.metadata_ns, Ordering::Relaxed);
+        }
+        if delta.mtime_ns > 0 {
+            self.mtime_ns.fetch_add(delta.mtime_ns, Ordering::Relaxed);
+        }
+        if delta.size_ns > 0 {
+            self.size_ns.fetch_add(delta.size_ns, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrefetchOutcome {
+    result: Result<PrefetchedFileInfo, String>,
+    perf: PrefetchPerfDelta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,12 +309,18 @@ const PREFETCH_HUGE_DIR_FILE_THRESHOLD: usize = 65_536;
 const PREFETCH_MEDIUM_DIR_FILE_CAP: usize = 4_096;
 const PREFETCH_LARGE_DIR_FILE_CAP: usize = 16_384;
 const PREFETCH_HUGE_DIR_FILE_CAP: usize = 49_152;
-const PREFETCH_GIANT_DIR_FILE_CAP: usize = 65_536;
+const PREFETCH_GIANT_DIR_FILE_CAP: usize = 131_072;
 const PREFETCH_SMALL_DIR_TIME_BUDGET: Duration = Duration::from_millis(12);
 const PREFETCH_MEDIUM_DIR_TIME_BUDGET: Duration = Duration::from_millis(45);
 const PREFETCH_LARGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(110);
 const PREFETCH_HUGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(260);
 const PREFETCH_GIANT_DIR_TIME_BUDGET: Duration = Duration::from_millis(380);
+const HOT_LOOP_TIME_CHECK_INTERVAL: usize = 64;
+#[cfg(not(test))]
+const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 4_096;
+#[cfg(test)]
+const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 16;
+const PARALLEL_PREFETCH_CHUNK_SIZE: usize = 16_384;
 
 fn prefetch_budget_for_dir(file_count: usize) -> PrefetchBudget {
     if file_count == 0 {
@@ -306,6 +356,172 @@ fn prefetch_budget_for_dir(file_count: usize) -> PrefetchBudget {
             max_time: PREFETCH_GIANT_DIR_TIME_BUDGET,
         }
     }
+}
+
+fn prefetched_file_info(
+    metadata: Metadata,
+    cache_enabled: bool,
+    detailed_perf: bool,
+) -> (PrefetchedFileInfo, PrefetchPerfDelta) {
+    let mtime_start = detailed_perf.then(Instant::now);
+    let modified_secs = modified_secs_for_metadata(&metadata);
+    let mtime_ns = elapsed_ns(mtime_start);
+    let cached_mtime = cached_mtime_for_modified_secs(modified_secs, cache_enabled);
+
+    let size_start = detailed_perf.then(Instant::now);
+    let measured_size = size_on_disk_bytes(&metadata);
+    let size_ns = elapsed_ns(size_start);
+
+    (
+        PrefetchedFileInfo {
+            cached_mtime,
+            modified_secs,
+            measured_size,
+        },
+        PrefetchPerfDelta {
+            metadata_ns: 0,
+            mtime_ns,
+            size_ns,
+        },
+    )
+}
+
+fn prefetch_file_path(path: &Path, cache_enabled: bool, detailed_perf: bool) -> PrefetchOutcome {
+    let metadata_start = detailed_perf.then(Instant::now);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return PrefetchOutcome {
+                result: Err(error.to_string()),
+                perf: PrefetchPerfDelta {
+                    metadata_ns: elapsed_ns(metadata_start),
+                    ..PrefetchPerfDelta::default()
+                },
+            };
+        }
+    };
+    let metadata_ns = elapsed_ns(metadata_start);
+    let (info, mut perf) = prefetched_file_info(metadata, cache_enabled, detailed_perf);
+    perf.metadata_ns = metadata_ns;
+    PrefetchOutcome {
+        result: Ok(info),
+        perf,
+    }
+}
+
+fn prefetch_dir_entry(
+    entry: &mut ScanDirEntry,
+    cache_enabled: bool,
+    detailed_perf: bool,
+) -> PrefetchPerfDelta {
+    let outcome = prefetch_file_path(&entry.path(), cache_enabled, detailed_perf);
+    let perf = outcome.perf;
+    entry.client_state.prefetched_file = Some(outcome.result);
+    perf
+}
+
+fn prefetch_work_allowed(cancel: &AtomicBool, start: Instant, max_time: Duration) -> bool {
+    !cancel.load(Ordering::Relaxed) && start.elapsed() < max_time
+}
+
+fn prefetch_directory_files(
+    children: &mut [jwalk::Result<ScanDirEntry>],
+    file_count: usize,
+    budget: PrefetchBudget,
+    cache_enabled: bool,
+    detailed_perf: bool,
+    cancel: &AtomicBool,
+    prefetch_perf: &PrefetchPerfCounters,
+) {
+    if budget.max_files == 0 {
+        return;
+    }
+
+    let start = Instant::now();
+    let mut perf = PrefetchPerfDelta::default();
+    if file_count < PARALLEL_PREFETCH_FILE_THRESHOLD {
+        let mut prefetched_files = 0usize;
+        for child in children.iter_mut() {
+            if prefetched_files >= budget.max_files
+                || !prefetch_work_allowed(cancel, start, budget.max_time)
+            {
+                break;
+            }
+            let Ok(entry) = child.as_mut() else {
+                continue;
+            };
+            if !entry.file_type().is_file() || entry.client_state.prefetched_file.is_some() {
+                continue;
+            }
+
+            prefetched_files += 1;
+            perf.add(prefetch_dir_entry(entry, cache_enabled, detailed_perf));
+        }
+    } else {
+        let mut prefetched_files = 0usize;
+        for chunk in children.chunks_mut(PARALLEL_PREFETCH_CHUNK_SIZE) {
+            if prefetched_files >= budget.max_files
+                || !prefetch_work_allowed(cancel, start, budget.max_time)
+            {
+                break;
+            }
+
+            let remaining = budget.max_files - prefetched_files;
+            let whole_chunk_fits = chunk.len() <= remaining
+                || chunk
+                    .iter()
+                    .filter_map(|child| child.as_ref().ok())
+                    .filter(|entry| {
+                        entry.file_type().is_file() && entry.client_state.prefetched_file.is_none()
+                    })
+                    .count()
+                    <= remaining;
+            if whole_chunk_fits {
+                let (chunk_perf, chunk_count) = chunk
+                    .par_iter_mut()
+                    .filter_map(|child| child.as_mut().ok())
+                    .filter(|entry| {
+                        entry.file_type().is_file() && entry.client_state.prefetched_file.is_none()
+                    })
+                    .filter_map(|entry| {
+                        prefetch_work_allowed(cancel, start, budget.max_time).then(|| {
+                            (
+                                prefetch_dir_entry(entry, cache_enabled, detailed_perf),
+                                1usize,
+                            )
+                        })
+                    })
+                    .reduce(
+                        || (PrefetchPerfDelta::default(), 0usize),
+                        |mut left, right| {
+                            left.0.add(right.0);
+                            left.1 += right.1;
+                            left
+                        },
+                    );
+                perf.add(chunk_perf);
+                prefetched_files += chunk_count;
+            } else {
+                for child in chunk.iter_mut() {
+                    if prefetched_files >= budget.max_files
+                        || !prefetch_work_allowed(cancel, start, budget.max_time)
+                    {
+                        break;
+                    }
+                    let Ok(entry) = child.as_mut() else {
+                        continue;
+                    };
+                    if !entry.file_type().is_file() || entry.client_state.prefetched_file.is_some()
+                    {
+                        continue;
+                    }
+                    prefetched_files += 1;
+                    perf.add(prefetch_dir_entry(entry, cache_enabled, detailed_perf));
+                }
+            }
+        }
+    }
+    prefetch_perf.add(perf);
 }
 
 impl ScanHandle {
@@ -384,10 +600,11 @@ impl ScanIndex {
         size: u64,
         batch: &mut BatchAccumulator,
         perf_stats: &mut PerfStats,
+        detailed_perf: bool,
     ) {
         self.total_bytes = self.total_bytes.saturating_add(size);
 
-        let ancestor_delta_start = Instant::now();
+        let ancestor_delta_start = detailed_perf.then(Instant::now);
         let mut current = Some(parent_id);
         while let Some(ancestor_id) = current {
             let entry = batch.size_deltas.entry(ancestor_id).or_insert(0);
@@ -397,8 +614,7 @@ impl ScanIndex {
             *entry = entry.saturating_add(size);
             current = self.parent_of(ancestor_id);
         }
-        perf_stats.ancestor_size_delta_total_ms +=
-            ancestor_delta_start.elapsed().as_secs_f64() * 1000.0;
+        perf_stats.ancestor_size_delta_total_ms += elapsed_ms(ancestor_delta_start);
     }
 
     fn parent_of(&self, node_id: NodeId) -> Option<NodeId> {
@@ -510,13 +726,14 @@ fn metadata_is_on_device(_metadata: &Metadata, _device_id: u64) -> bool {
 
 impl BatchAccumulator {
     fn new(options: &ScanOptions) -> Self {
+        let node_capacity = options.max_pending_nodes.min(2_048);
         Self {
-            discovered_nodes: Vec::with_capacity(options.max_pending_nodes.min(256)),
+            discovered_nodes: Vec::with_capacity(node_capacity),
             size_deltas: FxHashMap::with_capacity_and_hasher(
-                options.max_pending_size_deltas.min(512),
+                options.max_pending_size_deltas.min(64),
                 Default::default(),
             ),
-            scanned_nodes: Vec::with_capacity(options.max_pending_nodes.min(256)),
+            scanned_nodes: Vec::with_capacity(node_capacity),
             progress: None,
         }
     }
@@ -565,12 +782,14 @@ fn retain_scan_candidates(
     exclude_matcher: &ExcludeMatcher,
     same_filesystem_device: Option<u64>,
     cache_enabled: bool,
+    detailed_perf: bool,
     prefetch_perf: &PrefetchPerfCounters,
 ) {
     if exclude_matcher.is_empty() && same_filesystem_device.is_none() {
         return;
     }
 
+    let mut perf = PrefetchPerfDelta::default();
     children.retain_mut(|child| {
         let Ok(entry) = child.as_mut() else {
             return true;
@@ -579,47 +798,27 @@ fn retain_scan_candidates(
             return false;
         }
         if let Some(device_id) = same_filesystem_device {
-            let metadata_start = Instant::now();
+            let metadata_start = detailed_perf.then(Instant::now);
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    prefetch_perf.metadata_ns.fetch_add(
-                        metadata_start.elapsed().as_nanos() as u64,
-                        Ordering::Relaxed,
-                    );
+                    perf.metadata_ns = perf.metadata_ns.saturating_add(elapsed_ns(metadata_start));
                     return true;
                 }
             };
-            prefetch_perf.metadata_ns.fetch_add(
-                metadata_start.elapsed().as_nanos() as u64,
-                Ordering::Relaxed,
-            );
+            perf.metadata_ns = perf.metadata_ns.saturating_add(elapsed_ns(metadata_start));
             if !metadata_is_on_device(&metadata, device_id) {
                 return false;
             }
             if entry.file_type().is_file() {
-                let mtime_start = Instant::now();
-                let modified_secs = modified_secs_for_metadata(&metadata);
-                prefetch_perf
-                    .mtime_ns
-                    .fetch_add(mtime_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                let cached_mtime = cached_mtime_for_modified_secs(modified_secs, cache_enabled);
-
-                let size_start = Instant::now();
-                let measured_size = size_on_disk_bytes(&metadata);
-                prefetch_perf
-                    .size_ns
-                    .fetch_add(size_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                entry.client_state.prefetched_file = Some(Ok(PrefetchedFileInfo {
-                    metadata,
-                    cached_mtime,
-                    modified_secs,
-                    measured_size,
-                }));
+                let (info, delta) = prefetched_file_info(metadata, cache_enabled, detailed_perf);
+                perf.add(delta);
+                entry.client_state.prefetched_file = Some(Ok(info));
             }
         }
         true
     });
+    prefetch_perf.add(perf);
 }
 
 pub fn scan_path_to_tree(path: PathBuf, options: ScanOptions) -> anyhow::Result<TreeStore> {
@@ -669,6 +868,8 @@ fn run_scan(
         .is_some_and(|byte| *byte == std::path::MAIN_SEPARATOR as u8);
     let path: PathBuf = requested_path.components().collect();
     let mut perf_stats = PerfStats::default();
+    // Per-file clock reads distort the scan hot path, so fine-grained timing is opt-in.
+    let detailed_perf = std::env::var_os("DISKMAP_SCAN_TRACE").is_some();
 
     let root_metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -778,6 +979,7 @@ fn run_scan(
 
     let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
     let walker_prefetch_perf = Arc::clone(&prefetch_perf);
+    let walker_cancel = Arc::clone(&cancel);
     let cache_enabled = db.is_some();
     let exclude_matcher = ExcludeMatcher::new(options.exclude_patterns.clone());
     let same_filesystem_device = if options.stay_on_filesystem {
@@ -798,6 +1000,7 @@ fn run_scan(
                 &exclude_matcher,
                 same_filesystem_device,
                 cache_enabled,
+                detailed_perf,
                 &walker_prefetch_perf,
             );
 
@@ -807,65 +1010,15 @@ fn run_scan(
                 .filter(|entry| entry.file_type().is_file())
                 .count();
             let budget = prefetch_budget_for_dir(file_count);
-            if budget.max_files == 0 {
-                return;
-            }
-
-            let dir_prefetch_start = Instant::now();
-            let mut prefetched_files = 0usize;
-            for child in children.iter_mut() {
-                if prefetched_files >= budget.max_files
-                    || dir_prefetch_start.elapsed() >= budget.max_time
-                {
-                    break;
-                }
-                let Ok(dir_entry) = child.as_mut() else {
-                    continue;
-                };
-                if !dir_entry.file_type().is_file()
-                    || dir_entry.client_state.prefetched_file.is_some()
-                {
-                    continue;
-                }
-                prefetched_files += 1;
-
-                let metadata_start = Instant::now();
-                let metadata = match dir_entry.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(err) => {
-                        walker_prefetch_perf.metadata_ns.fetch_add(
-                            metadata_start.elapsed().as_nanos() as u64,
-                            Ordering::Relaxed,
-                        );
-                        dir_entry.client_state.prefetched_file = Some(Err(err.to_string()));
-                        continue;
-                    }
-                };
-                walker_prefetch_perf.metadata_ns.fetch_add(
-                    metadata_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
-
-                let mtime_start = Instant::now();
-                let modified_secs = modified_secs_for_metadata(&metadata);
-                walker_prefetch_perf
-                    .mtime_ns
-                    .fetch_add(mtime_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                let cached_mtime = cached_mtime_for_modified_secs(modified_secs, cache_enabled);
-
-                let size_start = Instant::now();
-                let measured_size = size_on_disk_bytes(&metadata);
-                walker_prefetch_perf
-                    .size_ns
-                    .fetch_add(size_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-                dir_entry.client_state.prefetched_file = Some(Ok(PrefetchedFileInfo {
-                    metadata,
-                    cached_mtime,
-                    modified_secs,
-                    measured_size,
-                }));
-            }
+            prefetch_directory_files(
+                children,
+                file_count,
+                budget,
+                cache_enabled,
+                detailed_perf,
+                &walker_cancel,
+                &walker_prefetch_perf,
+            );
         })
         .into_iter();
 
@@ -876,6 +1029,7 @@ fn run_scan(
                 &tx,
                 scan_id,
                 &mut batch,
+                &options,
                 &mut perf_stats,
                 &mut last_flush,
                 &counters,
@@ -888,18 +1042,14 @@ fn run_scan(
             return;
         }
 
-        let entry = match entry_result {
+        let mut entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
                 perf_stats.entries_seen += 1;
                 let error_path = error.path().unwrap_or(&path).to_path_buf();
                 let parent_path = error_path.parent().unwrap_or(&path);
-                let parent_id = parent_lookup.parent_id_for(
-                    error.depth(),
-                    parent_path,
-                    &error_path,
-                    &mut perf_stats,
-                );
+                let parent_id =
+                    parent_lookup.parent_id_for(error.depth(), parent_path, &mut perf_stats);
                 let name = error_path
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
@@ -926,6 +1076,7 @@ fn run_scan(
                         &tx,
                         scan_id,
                         &mut batch,
+                        &options,
                         &mut perf_stats,
                         &mut last_flush,
                         &counters,
@@ -936,19 +1087,15 @@ fn run_scan(
         };
 
         perf_stats.entries_seen += 1;
-        let entry_path = entry.path();
-        if entry_path == path {
+        let entry_depth = entry.depth();
+        if entry_depth == 0 {
             continue;
         }
 
-        let entry_depth = entry.depth();
         let name = entry.file_name().to_string_lossy().to_string();
-        let parent_id = parent_lookup.parent_id_for(
-            entry_depth,
-            entry.parent_path(),
-            &entry_path,
-            &mut perf_stats,
-        );
+        let parent_id =
+            parent_lookup.parent_id_for(entry_depth, entry.parent_path(), &mut perf_stats);
+        let mut entry_path = None;
 
         let file_type = entry.file_type();
         let mut node_error = entry.read_children_error.as_ref().map(ToString::to_string);
@@ -964,21 +1111,25 @@ fn run_scan(
         };
 
         let size = if kind == NodeKind::File {
-            match entry.client_state.prefetched_file {
+            match entry.client_state.prefetched_file.take() {
                 Some(Ok(prefetched)) => {
                     perf_stats.prefetched_files += 1;
                     modified_secs = prefetched.modified_secs;
-                    let size_start = Instant::now();
-                    let size = measured_size_for_file(
-                        &entry_path,
-                        &prefetched.metadata,
-                        prefetched.cached_mtime,
-                        prefetched.measured_size,
-                        db.as_mut(),
-                        &mut perf_stats,
-                    );
-                    perf_stats.size_measure_total_ms += size_start.elapsed().as_secs_f64() * 1000.0;
-                    size
+                    if db.is_some() {
+                        let size_start = detailed_perf.then(Instant::now);
+                        let file_path = entry_path.get_or_insert_with(|| entry.path());
+                        let size = measured_size_for_file(
+                            file_path,
+                            prefetched.cached_mtime,
+                            prefetched.measured_size,
+                            db.as_mut(),
+                            &mut perf_stats,
+                        );
+                        perf_stats.size_measure_total_ms += elapsed_ms(size_start);
+                        size
+                    } else {
+                        prefetched.measured_size
+                    }
                 }
                 Some(Err(err)) => {
                     node_error = Some(err);
@@ -986,12 +1137,11 @@ fn run_scan(
                 }
                 None => {
                     perf_stats.metadata_fallback_files += 1;
-                    let metadata_start = Instant::now();
+                    let metadata_start = detailed_perf.then(Instant::now);
                     let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(err) => {
-                            perf_stats.metadata_total_ms +=
-                                metadata_start.elapsed().as_secs_f64() * 1000.0;
+                            perf_stats.metadata_total_ms += elapsed_ms(metadata_start);
                             node_error = Some(err.to_string());
                             counters.files_scanned += 1;
                             let node = NodeRecord {
@@ -1010,12 +1160,13 @@ fn run_scan(
                                 node,
                             });
                             batch.scanned_nodes.push(node_id);
-                            counters.current_path = entry_path;
+                            counters.current_path = entry.path();
                             if batch.should_flush(&options, last_flush) {
                                 flush_batch(
                                     &tx,
                                     scan_id,
                                     &mut batch,
+                                    &options,
                                     &mut perf_stats,
                                     &mut last_flush,
                                     &counters,
@@ -1024,23 +1175,27 @@ fn run_scan(
                             continue;
                         }
                     };
-                    perf_stats.metadata_total_ms += metadata_start.elapsed().as_secs_f64() * 1000.0;
-                    let mtime_start = Instant::now();
+                    perf_stats.metadata_total_ms += elapsed_ms(metadata_start);
+                    let mtime_start = detailed_perf.then(Instant::now);
                     modified_secs = modified_secs_for_metadata(&metadata);
-                    perf_stats.mtime_total_ms += mtime_start.elapsed().as_secs_f64() * 1000.0;
+                    perf_stats.mtime_total_ms += elapsed_ms(mtime_start);
                     let cached_mtime = cached_mtime_for_modified_secs(modified_secs, db.is_some());
                     let measured_size = size_on_disk_bytes(&metadata);
-                    let size_start = Instant::now();
-                    let size = measured_size_for_file(
-                        &entry_path,
-                        &metadata,
-                        cached_mtime,
-                        measured_size,
-                        db.as_mut(),
-                        &mut perf_stats,
-                    );
-                    perf_stats.size_measure_total_ms += size_start.elapsed().as_secs_f64() * 1000.0;
-                    size
+                    if db.is_some() {
+                        let size_start = detailed_perf.then(Instant::now);
+                        let file_path = entry_path.get_or_insert_with(|| entry.path());
+                        let size = measured_size_for_file(
+                            file_path,
+                            cached_mtime,
+                            measured_size,
+                            db.as_mut(),
+                            &mut perf_stats,
+                        );
+                        perf_stats.size_measure_total_ms += elapsed_ms(size_start);
+                        size
+                    } else {
+                        measured_size
+                    }
                 }
             }
         } else {
@@ -1070,10 +1225,11 @@ fn run_scan(
                 node,
             });
             if is_directory_node {
+                let directory_path = entry_path.get_or_insert_with(|| entry.path());
                 parent_lookup.record_directory(
                     entry_depth,
                     entry.read_children_path.as_deref(),
-                    &entry_path,
+                    directory_path,
                     node_id,
                 );
             } else {
@@ -1083,7 +1239,7 @@ fn run_scan(
         } else if kind == NodeKind::File {
             counters.files_scanned += 1;
             counters.bytes_seen += size;
-            scan_index.add_file_size(parent_id, size, &mut batch, &mut perf_stats);
+            scan_index.add_file_size(parent_id, size, &mut batch, &mut perf_stats, detailed_perf);
 
             let node = NodeRecord {
                 name,
@@ -1128,13 +1284,17 @@ fn run_scan(
             batch.scanned_nodes.push(node_id);
         }
 
-        counters.current_path = entry_path;
-
-        if batch.should_flush(&options, last_flush) {
+        let should_flush = batch.should_flush(&options, last_flush);
+        if should_flush || perf_stats.entries_seen & (HOT_LOOP_TIME_CHECK_INTERVAL as u64 - 1) == 0
+        {
+            counters.current_path = entry_path.unwrap_or_else(|| entry.path());
+        }
+        if should_flush {
             flush_batch(
                 &tx,
                 scan_id,
                 &mut batch,
+                &options,
                 &mut perf_stats,
                 &mut last_flush,
                 &counters,
@@ -1155,6 +1315,7 @@ fn run_scan(
         &tx,
         scan_id,
         &mut batch,
+        &options,
         &mut perf_stats,
         &mut last_flush,
         &counters,
@@ -1170,7 +1331,7 @@ fn run_scan(
     perf_stats.size_measure_total_ms +=
         prefetch_perf.size_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     perf_stats.scan_elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    if std::env::var_os("DISKMAP_SCAN_TRACE").is_some() {
+    if detailed_perf {
         eprintln!("Scan {scan_id} completed in {:?}", elapsed);
     }
 
@@ -1204,7 +1365,6 @@ impl ParentLookup {
         &mut self,
         depth: usize,
         parent_path: &Path,
-        entry_path: &Path,
         perf_stats: &mut PerfStats,
     ) -> NodeId {
         if depth == 0 {
@@ -1225,11 +1385,6 @@ impl ParentLookup {
         self.directory_ids
             .get(parent_path)
             .copied()
-            .or_else(|| {
-                entry_path
-                    .parent()
-                    .and_then(|parent| self.directory_ids.get(parent).copied())
-            })
             .unwrap_or(self.root_id)
     }
 
@@ -1257,6 +1412,7 @@ fn flush_batch(
     tx: &Sender<ScanMessage>,
     scan_id: u64,
     batch: &mut BatchAccumulator,
+    options: &ScanOptions,
     perf_stats: &mut PerfStats,
     last_flush: &mut Instant,
     counters: &ScanCounters,
@@ -1267,7 +1423,7 @@ fn flush_batch(
 
     let flush_start = Instant::now();
     batch.progress = Some(counters.progress_snapshot());
-    let outgoing = std::mem::take(batch).into_batch();
+    let outgoing = std::mem::replace(batch, BatchAccumulator::new(options)).into_batch();
     perf_stats.messages_sent += 1;
     perf_stats.batches_sent += 1;
     perf_stats.progress_snapshots_sent += 1;
@@ -1281,7 +1437,6 @@ fn flush_batch(
 
 fn measured_size_for_file(
     path: &Path,
-    _metadata: &Metadata,
     cached_mtime: Option<u64>,
     measured_size: u64,
     db: Option<&mut ScanDb>,
@@ -1324,6 +1479,14 @@ fn modified_secs_for_metadata(metadata: &Metadata) -> Option<u64> {
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
+}
+
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| start.elapsed().as_nanos() as u64)
+}
+
+fn elapsed_ms(start: Option<Instant>) -> f64 {
+    start.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn cached_mtime_for_modified_secs(modified_secs: Option<u64>, cache_enabled: bool) -> Option<u64> {
@@ -1441,6 +1604,64 @@ mod tests {
     }
 
     #[test]
+    fn batch_accumulator_checks_flush_interval_for_every_pending_count() {
+        let options = ScanOptions {
+            batch_flush_interval: Duration::ZERO,
+            ..ScanOptions::default()
+        };
+        let mut batch = BatchAccumulator::new(&options);
+        batch.discovered_nodes.push(DiscoveredNode {
+            node_id: 1,
+            parent_id: 0,
+            node: NodeRecord {
+                name: "file.bin".into(),
+                kind: NodeKind::File,
+                size: 1,
+                modified_secs: None,
+                scanned: true,
+                error: None,
+            },
+        });
+
+        assert!(batch.should_flush(&options, Instant::now()));
+    }
+
+    #[test]
+    fn flush_batch_restores_preallocated_capacity() {
+        let options = ScanOptions::default();
+        let expected_node_capacity = options.max_pending_nodes.min(2_048);
+        let expected_delta_capacity = options.max_pending_size_deltas.min(64);
+        let mut batch = BatchAccumulator::new(&options);
+        batch.progress = Some(ProgressSnapshot {
+            files_scanned: 0,
+            total_files: None,
+            dirs_scanned: 0,
+            bytes_seen: 0,
+            current_path: PathBuf::from("/root"),
+        });
+        let (tx, rx) = unbounded();
+        let mut perf_stats = PerfStats::default();
+        let mut last_flush = Instant::now();
+        let counters = ScanCounters::new(PathBuf::from("/root"), None);
+
+        flush_batch(
+            &tx,
+            1,
+            &mut batch,
+            &options,
+            &mut perf_stats,
+            &mut last_flush,
+            &counters,
+        );
+
+        assert!(batch.is_empty());
+        assert!(batch.discovered_nodes.capacity() >= expected_node_capacity);
+        assert!(batch.scanned_nodes.capacity() >= expected_node_capacity);
+        assert!(batch.size_deltas.capacity() >= expected_delta_capacity);
+        assert!(matches!(rx.try_recv(), Ok(ScanMessage::Batch { .. })));
+    }
+
+    #[test]
     fn scan_batch_application_updates_tree_and_reports_ui_changes() {
         let mut tree = TreeStore::new();
         tree.push_node(None, TreeStore::root_record("root".into()));
@@ -1471,7 +1692,7 @@ mod tests {
         let application = batch.apply_to_tree(&mut tree);
 
         assert_eq!(application.discovered_node_ids, vec![1]);
-        assert_eq!(application.dirty_node_ids, vec![0, 1]);
+        assert_eq!(application.dirty_node_ids, vec![0]);
         assert!(application.had_progress);
         assert_eq!(tree.node(0).size, 5);
         assert_eq!(tree.node(1).size, 5);
@@ -1512,6 +1733,35 @@ mod tests {
             dir.file_name().unwrap().to_string_lossy()
         );
         assert!(!tree.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parallel_prefetch_preserves_flat_directory_scan_results() {
+        let dir = temp_path("parallel-prefetch-flat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_count = PARALLEL_PREFETCH_FILE_THRESHOLD * 2;
+        let mut expected_size = 0u64;
+        for index in 0..file_count {
+            let file_path = dir.join(format!("file-{index}.bin"));
+            write(&file_path, vec![index as u8; index + 1]).unwrap();
+            expected_size = expected_size
+                .saturating_add(size_on_disk_bytes(&std::fs::metadata(file_path).unwrap()));
+        }
+
+        let tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
+        let root = tree.root.expect("flat scan root");
+        let files: Vec<_> = tree
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::File)
+            .collect();
+
+        assert_eq!(tree.len(), file_count + 1);
+        assert_eq!(files.len(), file_count);
+        assert_eq!(tree.node(root).size, expected_size);
+        assert!(files.iter().all(|node| node.modified_secs.is_some()));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1868,15 +2118,13 @@ mod tests {
     fn zero_allocated_size_bypasses_stale_sqlite_cache_entry() {
         let file_path = temp_path("zero-allocated-cache-file");
         write(&file_path, b"metadata source").unwrap();
-        let metadata = std::fs::metadata(&file_path).unwrap();
         let cache_path = temp_path("zero-allocated-cache-db");
         let mut db = ScanDb::new(&cache_path).unwrap();
         db.insert(&file_path, 140_737_471_598_592, 7).unwrap();
         db.flush().unwrap();
         let mut stats = PerfStats::default();
 
-        let measured =
-            measured_size_for_file(&file_path, &metadata, Some(7), 0, Some(&mut db), &mut stats);
+        let measured = measured_size_for_file(&file_path, Some(7), 0, Some(&mut db), &mut stats);
 
         assert_eq!(measured, 0);
         assert_eq!(db.get_cached(&file_path, 7), Some(0));
@@ -1915,6 +2163,43 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_skips_fine_grained_timing_by_default() {
+        let file_path = temp_path("prefetch-perf-disabled");
+        write(&file_path, b"disk-map").unwrap();
+
+        let outcome = prefetch_file_path(&file_path, false, false);
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.perf.metadata_ns, 0);
+        assert_eq!(outcome.perf.mtime_ns, 0);
+        assert_eq!(outcome.perf.size_ns, 0);
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn prefetch_gate_stops_work_after_deadline() {
+        let cancel = AtomicBool::new(false);
+
+        assert!(!prefetch_work_allowed(
+            &cancel,
+            Instant::now(),
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn prefetch_gate_stops_work_after_cancellation() {
+        let cancel = AtomicBool::new(true);
+
+        assert!(!prefetch_work_allowed(
+            &cancel,
+            Instant::now(),
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
     fn prefetch_budget_scales_up_for_large_directories() {
         let budget = prefetch_budget_for_dir(10_000);
 
@@ -1942,7 +2227,7 @@ mod tests {
 
     #[test]
     fn prefetch_budget_caps_giant_directories() {
-        let budget = prefetch_budget_for_dir(100_000);
+        let budget = prefetch_budget_for_dir(200_000);
 
         assert_eq!(
             budget,

@@ -32,17 +32,19 @@ large_tree_scan/10000
 large_tree_scan/100000
   scan:  ~93.32 ms
 
-# Targeted scan means after scanner optimization:
+# Targeted scans after bounded parallel metadata prefetch and hot-path cleanup.
+# Primary-shape values are the median of three Criterion point estimates using
+# `--measurement-time 3 --warm-up-time 2 --sample-size 20` on the same machine.
 balanced_default_100k
-  scan:  ~90.84 ms
+  scan:  ~81.60 ms (previous same-session build: ~97.38 ms)
 balanced_stay_on_filesystem_100k
-  scan:  ~92.10 ms (previously ~149.02 ms)
+  scan:  ~97.04 ms (median of three runs)
 balanced_exclude_miss_100k
-  scan:  ~97.59 ms
+  scan:  ~87.92 ms (one run)
 flat_default_100k
-  scan:  ~284.82 ms (previously ~300.24 ms)
+  scan:  ~251.71 ms (previous same-session build: ~314.91 ms)
 deep_default_10k
-  scan:  ~35.66 ms (previously ~36.69 ms)
+  scan:  ~33.24 ms (previous same-session build: ~39.75 ms)
 
 large_tree_layout/1000
   layout: TBD
