@@ -129,6 +129,8 @@ DiskMap 使用 [`GPL-3.0-or-later`](LICENSE) 授权。
 
 `or-later` 表示使用者可以选择 GPL v3，或自由软件基金会未来发布的 GPL 后续版本。GPL 是真正的 FOSS / open source 许可证；它允许商业使用和收费分发，但要求分发修改版时继续开放源码。
 
+分发时还必须保留原有的版权、许可证和无担保声明；GPL 不要求把作者姓名放在产品首页，但不能移除这些法律通知。
+
 <a id="en"></a>
 
 ## English
@@ -255,6 +257,8 @@ DiskMap is licensed under [`GPL-3.0-or-later`](LICENSE).
 You may use, study, modify, and distribute this project. If you distribute a modified or derivative version based on DiskMap's source code, you must keep it under GPL-compatible open source terms and provide the corresponding source code.
 
 `or-later` means recipients may choose GPL v3 or a later GPL version published by the Free Software Foundation. GPL is a real FOSS / open source license; it allows commercial use and paid distribution, but requires distributed modified versions to remain open source.
+
+Distributions must also preserve the original copyright, license, and warranty-disclaimer notices. GPL does not require putting the author's name on the product's home screen, but these legal notices must not be removed.
 
 ## See Also
 
