@@ -1197,15 +1197,6 @@ impl DiskMapApp {
 
     fn apply_scan_batch(&mut self, batch: ScanBatch) {
         let application = batch.apply_to_tree(&mut self.tree);
-        let visible_dirty_nodes: Vec<NodeId> = application
-            .dirty_node_ids
-            .iter()
-            .copied()
-            .filter(|&node_id| self.batch_touches_visible_subtree(node_id))
-            .collect();
-        if !visible_dirty_nodes.is_empty() {
-            self.tree.repair_sorted_children(&visible_dirty_nodes);
-        }
         let touched_visible_subtree = application
             .dirty_node_ids
             .iter()
@@ -2616,6 +2607,53 @@ mod tests {
         assert_eq!(app.tree.len(), 2);
         assert_eq!(app.tree.node(0).size, 5);
         assert!(app.tree.node(1).scanned);
+    }
+
+    #[test]
+    fn scan_batches_leave_child_sorting_lazy_until_a_reader_needs_it() {
+        let mut app = app_for_scan(1);
+        app.apply_scan_message_for_test(root_started(1));
+        app.apply_scan_message_for_test(ScanMessage::Batch {
+            scan_id: 1,
+            batch: ScanBatch {
+                discovered_nodes: vec![
+                    DiscoveredNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "small.bin".into(),
+                            kind: NodeKind::File,
+                            size: 1,
+                            modified_secs: None,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                    DiscoveredNode {
+                        node_id: 2,
+                        parent_id: 0,
+                        node: NodeRecord {
+                            name: "large.bin".into(),
+                            kind: NodeKind::File,
+                            size: 10,
+                            modified_secs: None,
+                            scanned: true,
+                            error: None,
+                        },
+                    },
+                ],
+                size_deltas: vec![(0, 11)],
+                scanned_nodes: vec![1, 2],
+                progress: None,
+            },
+        });
+
+        assert_eq!(app.tree.node(0).children, vec![1, 2]);
+        assert!(app.treemap.is_dirty());
+
+        app.tree.ensure_sorted_children(0);
+
+        assert_eq!(app.tree.sorted_children(0), &[2, 1]);
     }
 
     #[test]

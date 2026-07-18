@@ -225,6 +225,8 @@ pub struct ScanHandle {
 #[derive(Debug, Default)]
 struct ScanWalkState;
 
+type ScanDirEntry = jwalk::DirEntry<ScanWalkState>;
+
 impl ClientState for ScanWalkState {
     type ReadDirState = ();
     type DirEntryState = EntryClientState;
@@ -559,26 +561,62 @@ pub fn start_scan(
 }
 
 fn retain_scan_candidates(
-    children: &mut Vec<jwalk::Result<jwalk::DirEntry<ScanWalkState>>>,
+    children: &mut Vec<jwalk::Result<ScanDirEntry>>,
     exclude_matcher: &ExcludeMatcher,
     same_filesystem_device: Option<u64>,
+    cache_enabled: bool,
+    prefetch_perf: &PrefetchPerfCounters,
 ) {
     if exclude_matcher.is_empty() && same_filesystem_device.is_none() {
         return;
     }
 
-    children.retain(|child| {
-        let Ok(entry) = child.as_ref() else {
+    children.retain_mut(|child| {
+        let Ok(entry) = child.as_mut() else {
             return true;
         };
         if !exclude_matcher.is_empty() && exclude_matcher.matches_path(&entry.path()) {
             return false;
         }
         if let Some(device_id) = same_filesystem_device {
-            return entry
-                .metadata()
-                .map(|metadata| metadata_is_on_device(&metadata, device_id))
-                .unwrap_or(true);
+            let metadata_start = Instant::now();
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    prefetch_perf.metadata_ns.fetch_add(
+                        metadata_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    return true;
+                }
+            };
+            prefetch_perf.metadata_ns.fetch_add(
+                metadata_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            if !metadata_is_on_device(&metadata, device_id) {
+                return false;
+            }
+            if entry.file_type().is_file() {
+                let mtime_start = Instant::now();
+                let modified_secs = modified_secs_for_metadata(&metadata);
+                prefetch_perf
+                    .mtime_ns
+                    .fetch_add(mtime_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let cached_mtime = cached_mtime_for_modified_secs(modified_secs, cache_enabled);
+
+                let size_start = Instant::now();
+                let measured_size = size_on_disk_bytes(&metadata);
+                prefetch_perf
+                    .size_ns
+                    .fetch_add(size_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                entry.client_state.prefetched_file = Some(Ok(PrefetchedFileInfo {
+                    metadata,
+                    cached_mtime,
+                    modified_secs,
+                    measured_size,
+                }));
+            }
         }
         true
     });
@@ -755,7 +793,13 @@ fn run_scan(
         .skip_hidden(!include_hidden)
         .follow_links(follow_symlinks)
         .process_read_dir(move |_depth, _path, _state, children| {
-            retain_scan_candidates(children, &exclude_matcher, same_filesystem_device);
+            retain_scan_candidates(
+                children,
+                &exclude_matcher,
+                same_filesystem_device,
+                cache_enabled,
+                &walker_prefetch_perf,
+            );
 
             let file_count = children
                 .iter()
@@ -778,7 +822,9 @@ fn run_scan(
                 let Ok(dir_entry) = child.as_mut() else {
                     continue;
                 };
-                if !dir_entry.file_type().is_file() {
+                if !dir_entry.file_type().is_file()
+                    || dir_entry.client_state.prefetched_file.is_some()
+                {
                     continue;
                 }
                 prefetched_files += 1;
@@ -1471,6 +1517,40 @@ mod tests {
     }
 
     #[test]
+    fn small_batches_preserve_sizes_across_multiple_flushes() {
+        let dir = temp_path("multi-flush-sizes");
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root_file = dir.join("root.bin");
+        let child_file = nested.join("child.bin");
+        write(&root_file, vec![1_u8; 4 * 1024]).unwrap();
+        write(&child_file, vec![2_u8; 8 * 1024]).unwrap();
+        let root_file_size = size_on_disk_bytes(&std::fs::metadata(&root_file).unwrap());
+        let child_file_size = size_on_disk_bytes(&std::fs::metadata(&child_file).unwrap());
+
+        let tree = scan_path_to_tree(
+            dir.clone(),
+            ScanOptions {
+                max_pending_nodes: 1,
+                max_pending_size_deltas: 1,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+        let root = tree.root.expect("scan root");
+        let nested_node = tree
+            .nodes
+            .iter()
+            .find(|node| node.name == "nested")
+            .expect("nested directory");
+
+        assert_eq!(tree.node(root).size, root_file_size + child_file_size);
+        assert_eq!(nested_node.size, child_file_size);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn scan_path_to_tree_returns_file_as_root() {
         let file_path = temp_path("single-file-root");
         write(&file_path, b"disk-map").unwrap();
@@ -1666,6 +1746,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stay_on_filesystem_reuses_metadata_without_changing_scan_results() {
+        let dir = temp_path("same-filesystem-metadata");
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        write(dir.join("root.bin"), vec![1_u8; 8 * 1024]).unwrap();
+        write(nested.join("child.bin"), vec![2_u8; 16 * 1024]).unwrap();
+
+        let default_tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
+        let same_filesystem_tree = scan_path_to_tree(
+            dir.clone(),
+            ScanOptions {
+                stay_on_filesystem: true,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            same_filesystem_tree
+                .node(same_filesystem_tree.root.unwrap())
+                .size,
+            default_tree.node(default_tree.root.unwrap()).size
+        );
+        for expected in default_tree
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::File)
+        {
+            let actual = same_filesystem_tree
+                .nodes
+                .iter()
+                .find(|node| node.name == expected.name)
+                .expect("same-filesystem scan should retain every file");
+            assert_eq!(actual.size, expected.size);
+            assert_eq!(actual.modified_secs, expected.modified_secs);
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn scan_path_to_tree_uses_explicit_sqlite_cache_path() {
         let dir = temp_path("sync-cache-root");
@@ -1701,8 +1823,10 @@ mod tests {
         let matcher = ExcludeMatcher::new(parse_exclude_patterns(".git,Library/Caches,*.tmp"));
 
         assert!(matcher.matches_path(Path::new("/repo/.git/config")));
+        assert!(matcher.matches_path(Path::new("/repo/.GIT/config")));
         assert!(matcher.matches_path(Path::new("/Users/me/Library/Caches/app/file")));
         assert!(matcher.matches_path(Path::new("/tmp/build.tmp")));
+        assert!(!matcher.matches_path(Path::new("/tmp/build.tmp.keep")));
         assert!(!matcher.matches_path(Path::new("/repo/src/targeted/file")));
     }
 
