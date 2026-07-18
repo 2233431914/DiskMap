@@ -5,6 +5,8 @@ use crossbeam_channel::{unbounded, Sender};
 use jwalk::rayon::prelude::*;
 use jwalk::{ClientState, WalkDirGeneric};
 use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -244,6 +246,7 @@ impl ClientState for ScanWalkState {
 #[derive(Debug, Default)]
 struct EntryClientState {
     prefetched_file: Option<Result<PrefetchedFileInfo, String>>,
+    metadata_fallback_required: bool,
 }
 
 #[derive(Debug)]
@@ -296,67 +299,16 @@ struct PrefetchOutcome {
     perf: PrefetchPerfDelta,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PrefetchBudget {
-    max_files: usize,
-    max_time: Duration,
-}
-
-const PREFETCH_SMALL_DIR_FILE_THRESHOLD: usize = 512;
-const PREFETCH_MEDIUM_DIR_FILE_THRESHOLD: usize = 4_096;
-const PREFETCH_LARGE_DIR_FILE_THRESHOLD: usize = 16_384;
-const PREFETCH_HUGE_DIR_FILE_THRESHOLD: usize = 65_536;
-const PREFETCH_MEDIUM_DIR_FILE_CAP: usize = 4_096;
-const PREFETCH_LARGE_DIR_FILE_CAP: usize = 16_384;
-const PREFETCH_HUGE_DIR_FILE_CAP: usize = 49_152;
-const PREFETCH_GIANT_DIR_FILE_CAP: usize = 131_072;
-const PREFETCH_SMALL_DIR_TIME_BUDGET: Duration = Duration::from_millis(12);
-const PREFETCH_MEDIUM_DIR_TIME_BUDGET: Duration = Duration::from_millis(45);
-const PREFETCH_LARGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(110);
-const PREFETCH_HUGE_DIR_TIME_BUDGET: Duration = Duration::from_millis(260);
-const PREFETCH_GIANT_DIR_TIME_BUDGET: Duration = Duration::from_millis(380);
 const HOT_LOOP_TIME_CHECK_INTERVAL: usize = 64;
+const DIRECTORY_PREFETCH_TIME_BUDGET: Duration = Duration::from_millis(12);
 #[cfg(not(test))]
-const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 4_096;
+const METADATA_PREFETCH_CHUNK_SIZE: usize = 512;
 #[cfg(test)]
-const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 16;
-const PARALLEL_PREFETCH_CHUNK_SIZE: usize = 16_384;
-
-fn prefetch_budget_for_dir(file_count: usize) -> PrefetchBudget {
-    if file_count == 0 {
-        return PrefetchBudget {
-            max_files: 0,
-            max_time: Duration::ZERO,
-        };
-    }
-
-    if file_count <= PREFETCH_SMALL_DIR_FILE_THRESHOLD {
-        PrefetchBudget {
-            max_files: file_count,
-            max_time: PREFETCH_SMALL_DIR_TIME_BUDGET,
-        }
-    } else if file_count <= PREFETCH_MEDIUM_DIR_FILE_THRESHOLD {
-        PrefetchBudget {
-            max_files: file_count.min(PREFETCH_MEDIUM_DIR_FILE_CAP),
-            max_time: PREFETCH_MEDIUM_DIR_TIME_BUDGET,
-        }
-    } else if file_count <= PREFETCH_LARGE_DIR_FILE_THRESHOLD {
-        PrefetchBudget {
-            max_files: file_count.min(PREFETCH_LARGE_DIR_FILE_CAP),
-            max_time: PREFETCH_LARGE_DIR_TIME_BUDGET,
-        }
-    } else if file_count <= PREFETCH_HUGE_DIR_FILE_THRESHOLD {
-        PrefetchBudget {
-            max_files: file_count.min(PREFETCH_HUGE_DIR_FILE_CAP),
-            max_time: PREFETCH_HUGE_DIR_TIME_BUDGET,
-        }
-    } else {
-        PrefetchBudget {
-            max_files: file_count.min(PREFETCH_GIANT_DIR_FILE_CAP),
-            max_time: PREFETCH_GIANT_DIR_TIME_BUDGET,
-        }
-    }
-}
+const METADATA_PREFETCH_CHUNK_SIZE: usize = 16;
+#[cfg(not(test))]
+const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 128;
+#[cfg(test)]
+const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 4;
 
 fn prefetched_file_info(
     metadata: Metadata,
@@ -420,108 +372,138 @@ fn prefetch_dir_entry(
     perf
 }
 
-fn prefetch_work_allowed(cancel: &AtomicBool, start: Instant, max_time: Duration) -> bool {
-    !cancel.load(Ordering::Relaxed) && start.elapsed() < max_time
-}
-
-fn prefetch_directory_files(
-    children: &mut [jwalk::Result<ScanDirEntry>],
-    file_count: usize,
-    budget: PrefetchBudget,
+fn prefetch_entry_chunk(
+    entries: &mut [jwalk::Result<ScanDirEntry>],
     cache_enabled: bool,
     detailed_perf: bool,
     cancel: &AtomicBool,
     prefetch_perf: &PrefetchPerfCounters,
+    serial_time_budget: Option<Duration>,
 ) {
-    if budget.max_files == 0 {
+    let file_count = entries
+        .iter()
+        .filter_map(|entry| entry.as_ref().ok())
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.client_state.prefetched_file.is_none()
+                && !entry.client_state.metadata_fallback_required
+        })
+        .count();
+    if file_count == 0 || cancel.load(Ordering::Relaxed) {
         return;
     }
 
-    let start = Instant::now();
     let mut perf = PrefetchPerfDelta::default();
-    if file_count < PARALLEL_PREFETCH_FILE_THRESHOLD {
-        let mut prefetched_files = 0usize;
-        for child in children.iter_mut() {
-            if prefetched_files >= budget.max_files
-                || !prefetch_work_allowed(cancel, start, budget.max_time)
-            {
+    if let Some(time_budget) =
+        serial_time_budget.filter(|_| file_count < PARALLEL_PREFETCH_FILE_THRESHOLD)
+    {
+        let started_at = Instant::now();
+        for entry_result in entries.iter_mut() {
+            if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            let Ok(entry) = child.as_mut() else {
+            let Ok(entry) = entry_result.as_mut() else {
                 continue;
             };
-            if !entry.file_type().is_file() || entry.client_state.prefetched_file.is_some() {
+            if !entry.file_type().is_file()
+                || entry.client_state.prefetched_file.is_some()
+                || entry.client_state.metadata_fallback_required
+            {
+                continue;
+            }
+            if started_at.elapsed() >= time_budget {
+                entry.client_state.metadata_fallback_required = true;
                 continue;
             }
 
-            prefetched_files += 1;
             perf.add(prefetch_dir_entry(entry, cache_enabled, detailed_perf));
         }
     } else {
-        let mut prefetched_files = 0usize;
-        for chunk in children.chunks_mut(PARALLEL_PREFETCH_CHUNK_SIZE) {
-            if prefetched_files >= budget.max_files
-                || !prefetch_work_allowed(cancel, start, budget.max_time)
-            {
-                break;
-            }
-
-            let remaining = budget.max_files - prefetched_files;
-            let whole_chunk_fits = chunk.len() <= remaining
-                || chunk
-                    .iter()
-                    .filter_map(|child| child.as_ref().ok())
-                    .filter(|entry| {
-                        entry.file_type().is_file() && entry.client_state.prefetched_file.is_none()
-                    })
-                    .count()
-                    <= remaining;
-            if whole_chunk_fits {
-                let (chunk_perf, chunk_count) = chunk
-                    .par_iter_mut()
-                    .filter_map(|child| child.as_mut().ok())
-                    .filter(|entry| {
-                        entry.file_type().is_file() && entry.client_state.prefetched_file.is_none()
-                    })
-                    .filter_map(|entry| {
-                        prefetch_work_allowed(cancel, start, budget.max_time).then(|| {
-                            (
-                                prefetch_dir_entry(entry, cache_enabled, detailed_perf),
-                                1usize,
-                            )
-                        })
-                    })
-                    .reduce(
-                        || (PrefetchPerfDelta::default(), 0usize),
-                        |mut left, right| {
-                            left.0.add(right.0);
-                            left.1 += right.1;
-                            left
-                        },
-                    );
-                perf.add(chunk_perf);
-                prefetched_files += chunk_count;
-            } else {
-                for child in chunk.iter_mut() {
-                    if prefetched_files >= budget.max_files
-                        || !prefetch_work_allowed(cancel, start, budget.max_time)
-                    {
-                        break;
-                    }
-                    let Ok(entry) = child.as_mut() else {
-                        continue;
-                    };
-                    if !entry.file_type().is_file() || entry.client_state.prefetched_file.is_some()
-                    {
-                        continue;
-                    }
-                    prefetched_files += 1;
-                    perf.add(prefetch_dir_entry(entry, cache_enabled, detailed_perf));
-                }
-            }
-        }
+        perf = entries
+            .par_iter_mut()
+            .filter_map(|entry| entry.as_mut().ok())
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.client_state.prefetched_file.is_none()
+                    && !entry.client_state.metadata_fallback_required
+            })
+            .filter_map(|entry| {
+                (!cancel.load(Ordering::Relaxed))
+                    .then(|| prefetch_dir_entry(entry, cache_enabled, detailed_perf))
+            })
+            .reduce(PrefetchPerfDelta::default, |mut left, right| {
+                left.add(right);
+                left
+            });
     }
     prefetch_perf.add(perf);
+}
+
+struct MetadataPrefetchIter<I> {
+    source: I,
+    ready: VecDeque<jwalk::Result<ScanDirEntry>>,
+    cache_enabled: bool,
+    detailed_perf: bool,
+    cancel: Arc<AtomicBool>,
+    prefetch_perf: Arc<PrefetchPerfCounters>,
+}
+
+impl<I> MetadataPrefetchIter<I>
+where
+    I: Iterator<Item = jwalk::Result<ScanDirEntry>>,
+{
+    fn new(
+        source: I,
+        cache_enabled: bool,
+        detailed_perf: bool,
+        cancel: Arc<AtomicBool>,
+        prefetch_perf: Arc<PrefetchPerfCounters>,
+    ) -> Self {
+        Self {
+            source,
+            ready: VecDeque::with_capacity(METADATA_PREFETCH_CHUNK_SIZE),
+            cache_enabled,
+            detailed_perf,
+            cancel,
+            prefetch_perf,
+        }
+    }
+}
+
+impl<I> Iterator for MetadataPrefetchIter<I>
+where
+    I: Iterator<Item = jwalk::Result<ScanDirEntry>>,
+{
+    type Item = jwalk::Result<ScanDirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(entry) = self.ready.pop_front() {
+            return Some(entry);
+        }
+
+        while self.ready.len() < METADATA_PREFETCH_CHUNK_SIZE {
+            let Some(entry) = self.source.next() else {
+                break;
+            };
+            self.ready.push_back(entry);
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        if self.ready.is_empty() {
+            return None;
+        }
+
+        prefetch_entry_chunk(
+            self.ready.make_contiguous(),
+            self.cache_enabled,
+            self.detailed_perf,
+            &self.cancel,
+            &self.prefetch_perf,
+            None,
+        );
+        self.ready.pop_front()
+    }
 }
 
 impl ScanHandle {
@@ -632,76 +614,201 @@ impl ScanIndex {
 
 #[derive(Debug, Clone)]
 struct ExcludeMatcher {
-    patterns: Vec<String>,
+    component_patterns: Vec<CompiledExcludePattern>,
+    path_patterns: Vec<CompiledExcludePattern>,
+}
+
+#[derive(Debug, Clone)]
+enum CompiledExcludePattern {
+    Literal(String),
+    Wildcard {
+        parts: Vec<String>,
+        anchored_start: bool,
+        anchored_end: bool,
+    },
 }
 
 impl ExcludeMatcher {
     fn new(patterns: Vec<String>) -> Self {
+        let mut component_patterns = Vec::new();
+        let mut path_patterns = Vec::new();
+        for pattern in patterns {
+            let normalized = pattern.replace('\\', "/");
+            let is_path_pattern = normalized.contains('/');
+            let compiled = CompiledExcludePattern::new(normalized);
+            if is_path_pattern {
+                path_patterns.push(compiled);
+            } else {
+                component_patterns.push(compiled);
+            }
+        }
         Self {
-            patterns: patterns
-                .into_iter()
-                .map(|pattern| pattern.replace('\\', "/").to_ascii_lowercase())
-                .collect(),
+            component_patterns,
+            path_patterns,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
+        self.component_patterns.is_empty() && self.path_patterns.is_empty()
     }
 
+    #[cfg(test)]
     fn matches_path(&self, path: &Path) -> bool {
-        if self.patterns.is_empty() {
+        if self.is_empty() {
             return false;
         }
 
-        let normalized_path = path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        let components: Vec<String> = path
-            .components()
-            .filter_map(|component| component.as_os_str().to_str())
-            .map(|component| component.to_ascii_lowercase())
-            .collect();
+        if !self.component_patterns.is_empty()
+            && path
+                .components()
+                .any(|component| self.matches_component(component.as_os_str()))
+        {
+            return true;
+        }
 
-        self.patterns.iter().any(|pattern| {
-            if pattern.contains('/') || pattern.contains('\\') {
-                if pattern.contains('*') {
-                    wildcard_match(pattern, &normalized_path)
-                } else {
-                    normalized_path.contains(pattern)
-                }
-            } else {
-                components
-                    .iter()
-                    .any(|component| wildcard_match(pattern, component))
-            }
-        })
+        self.matches_full_path(path)
+    }
+
+    fn matches_entry(&self, parent_path: &Path, file_name: &OsStr) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+
+        if !self.component_patterns.is_empty()
+            && (self.matches_component(file_name)
+                || parent_path
+                    .components()
+                    .any(|component| self.matches_component(component.as_os_str())))
+        {
+            return true;
+        }
+
+        if self.path_patterns.is_empty() {
+            return false;
+        }
+
+        self.matches_full_path(&parent_path.join(file_name))
+    }
+
+    fn matches_component(&self, value: &OsStr) -> bool {
+        let Some(value) = value.to_str() else {
+            return false;
+        };
+        self.component_patterns
+            .iter()
+            .any(|pattern| pattern.matches_component(value.as_bytes()))
+    }
+
+    fn matches_full_path(&self, path: &Path) -> bool {
+        if self.path_patterns.is_empty() {
+            return false;
+        }
+
+        let path = path.to_string_lossy();
+        if path.contains('\\') {
+            let normalized = path.replace('\\', "/");
+            self.path_patterns
+                .iter()
+                .any(|pattern| pattern.matches_path(normalized.as_bytes()))
+        } else {
+            self.path_patterns
+                .iter()
+                .any(|pattern| pattern.matches_path(path.as_bytes()))
+        }
     }
 }
 
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    if !pattern.contains('*') {
-        return value == pattern;
+impl CompiledExcludePattern {
+    fn new(pattern: String) -> Self {
+        if !pattern.contains('*') {
+            return Self::Literal(pattern);
+        }
+
+        let anchored_start = !pattern.starts_with('*');
+        let anchored_end = !pattern.ends_with('*');
+        let parts = pattern
+            .split('*')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self::Wildcard {
+            parts,
+            anchored_start,
+            anchored_end,
+        }
     }
 
-    let parts: Vec<&str> = pattern.split('*').filter(|part| !part.is_empty()).collect();
+    fn matches_component(&self, value: &[u8]) -> bool {
+        match self {
+            Self::Literal(pattern) => value.eq_ignore_ascii_case(pattern.as_bytes()),
+            Self::Wildcard {
+                parts,
+                anchored_start,
+                anchored_end,
+            } => wildcard_parts_match(parts, *anchored_start, *anchored_end, value),
+        }
+    }
+
+    fn matches_path(&self, value: &[u8]) -> bool {
+        match self {
+            Self::Literal(pattern) => {
+                find_ascii_case_insensitive(value, pattern.as_bytes()).is_some()
+            }
+            Self::Wildcard {
+                parts,
+                anchored_start,
+                anchored_end,
+            } => wildcard_parts_match(parts, *anchored_start, *anchored_end, value),
+        }
+    }
+}
+
+fn wildcard_parts_match(
+    parts: &[String],
+    anchored_start: bool,
+    anchored_end: bool,
+    value: &[u8],
+) -> bool {
     if parts.is_empty() {
         return true;
     }
 
-    let mut remainder = value;
+    let mut offset = 0usize;
     for (index, part) in parts.iter().enumerate() {
-        let Some(found_at) = remainder.find(part) else {
+        let is_last = index + 1 == parts.len();
+        if is_last && anchored_end {
+            let Some(found_at) = value.len().checked_sub(part.len()) else {
+                return false;
+            };
+            if found_at < offset
+                || !value[found_at..].eq_ignore_ascii_case(part.as_bytes())
+                || (index == 0 && anchored_start && found_at != 0)
+            {
+                return false;
+            }
+            offset = value.len();
+            continue;
+        }
+
+        let Some(found_at) = find_ascii_case_insensitive(&value[offset..], part.as_bytes()) else {
             return false;
         };
-        if index == 0 && !pattern.starts_with('*') && found_at != 0 {
+        if index == 0 && anchored_start && found_at != 0 {
             return false;
         }
-        remainder = &remainder[found_at + part.len()..];
+        offset += found_at + part.len();
     }
 
-    pattern.ends_with('*') || value.ends_with(parts.last().copied().unwrap_or_default())
+    true
+}
+
+fn find_ascii_case_insensitive(value: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    value
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(unix)]
@@ -779,6 +886,7 @@ pub fn start_scan(
 
 fn retain_scan_candidates(
     children: &mut Vec<jwalk::Result<ScanDirEntry>>,
+    directory_path: &Path,
     exclude_matcher: &ExcludeMatcher,
     same_filesystem_device: Option<u64>,
     cache_enabled: bool,
@@ -794,7 +902,9 @@ fn retain_scan_candidates(
         let Ok(entry) = child.as_mut() else {
             return true;
         };
-        if !exclude_matcher.is_empty() && exclude_matcher.matches_path(&entry.path()) {
+        if !exclude_matcher.is_empty()
+            && exclude_matcher.matches_entry(directory_path, entry.file_name())
+        {
             return false;
         }
         if let Some(device_id) = same_filesystem_device {
@@ -994,9 +1104,10 @@ fn run_scan(
     let walker = WalkDirGeneric::<ScanWalkState>::new(&path)
         .skip_hidden(!include_hidden)
         .follow_links(follow_symlinks)
-        .process_read_dir(move |_depth, _path, _state, children| {
+        .process_read_dir(move |_depth, directory_path, _state, children| {
             retain_scan_candidates(
                 children,
+                directory_path,
                 &exclude_matcher,
                 same_filesystem_device,
                 cache_enabled,
@@ -1004,23 +1115,32 @@ fn run_scan(
                 &walker_prefetch_perf,
             );
 
-            let file_count = children
+            let pending_files = children
                 .iter()
-                .filter_map(|child| child.as_ref().ok())
-                .filter(|entry| entry.file_type().is_file())
+                .filter_map(|entry| entry.as_ref().ok())
+                .filter(|entry| {
+                    entry.file_type().is_file() && entry.client_state.prefetched_file.is_none()
+                })
                 .count();
-            let budget = prefetch_budget_for_dir(file_count);
-            prefetch_directory_files(
-                children,
-                file_count,
-                budget,
-                cache_enabled,
-                detailed_perf,
-                &walker_cancel,
-                &walker_prefetch_perf,
-            );
+            if pending_files < PARALLEL_PREFETCH_FILE_THRESHOLD {
+                prefetch_entry_chunk(
+                    children,
+                    cache_enabled,
+                    detailed_perf,
+                    &walker_cancel,
+                    &walker_prefetch_perf,
+                    Some(DIRECTORY_PREFETCH_TIME_BUDGET),
+                );
+            }
         })
         .into_iter();
+    let walker = MetadataPrefetchIter::new(
+        walker,
+        cache_enabled,
+        detailed_perf,
+        Arc::clone(&cancel),
+        Arc::clone(&prefetch_perf),
+    );
 
     for entry_result in walker {
         if cancel.load(Ordering::Relaxed) {
@@ -1523,6 +1643,35 @@ mod tests {
         std::env::temp_dir().join(format!("disk-map-{label}-{nanos}"))
     }
 
+    fn scan_tree_and_stats(path: PathBuf, options: ScanOptions) -> (TreeStore, PerfStats) {
+        let (tx, rx) = unbounded();
+        run_scan(
+            path.clone(),
+            0,
+            options,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let mut tree = TreeStore::new();
+        loop {
+            match rx.recv().expect("test scan channel should stay open") {
+                ScanMessage::Started {
+                    path, root_node, ..
+                } => {
+                    tree.push_node(None, root_node);
+                    tree.set_root_path(path);
+                }
+                ScanMessage::Batch { batch, .. } => {
+                    batch.apply_to_tree(&mut tree);
+                }
+                ScanMessage::Finished { perf_stats, .. } => return (tree, perf_stats),
+                ScanMessage::Cancelled { .. } => panic!("test scan was cancelled"),
+                ScanMessage::Error { message, .. } => panic!("test scan failed: {message}"),
+            }
+        }
+    }
+
     #[test]
     fn started_to_finished_messages_describe_batched_tree() {
         let root = TreeStore::root_record("root".into());
@@ -1741,7 +1890,7 @@ mod tests {
     fn parallel_prefetch_preserves_flat_directory_scan_results() {
         let dir = temp_path("parallel-prefetch-flat");
         std::fs::create_dir_all(&dir).unwrap();
-        let file_count = PARALLEL_PREFETCH_FILE_THRESHOLD * 2;
+        let file_count = METADATA_PREFETCH_CHUNK_SIZE * 2 + PARALLEL_PREFETCH_FILE_THRESHOLD;
         let mut expected_size = 0u64;
         for index in 0..file_count {
             let file_path = dir.join(format!("file-{index}.bin"));
@@ -1750,7 +1899,7 @@ mod tests {
                 .saturating_add(size_on_disk_bytes(&std::fs::metadata(file_path).unwrap()));
         }
 
-        let tree = scan_path_to_tree(dir.clone(), ScanOptions::default()).unwrap();
+        let (tree, perf_stats) = scan_tree_and_stats(dir.clone(), ScanOptions::default());
         let root = tree.root.expect("flat scan root");
         let files: Vec<_> = tree
             .nodes
@@ -1762,6 +1911,8 @@ mod tests {
         assert_eq!(files.len(), file_count);
         assert_eq!(tree.node(root).size, expected_size);
         assert!(files.iter().all(|node| node.modified_secs.is_some()));
+        assert_eq!(perf_stats.prefetched_files, file_count as u64);
+        assert_eq!(perf_stats.metadata_fallback_files, 0);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2072,12 +2223,37 @@ mod tests {
     fn exclude_matcher_matches_components_paths_and_wildcards() {
         let matcher = ExcludeMatcher::new(parse_exclude_patterns(".git,Library/Caches,*.tmp"));
 
+        assert_eq!(matcher.component_patterns.len(), 2);
+        assert_eq!(matcher.path_patterns.len(), 1);
         assert!(matcher.matches_path(Path::new("/repo/.git/config")));
         assert!(matcher.matches_path(Path::new("/repo/.GIT/config")));
         assert!(matcher.matches_path(Path::new("/Users/me/Library/Caches/app/file")));
+        assert!(matcher.matches_path(Path::new("/Users/me/library/caches/app/file")));
         assert!(matcher.matches_path(Path::new("/tmp/build.tmp")));
         assert!(!matcher.matches_path(Path::new("/tmp/build.tmp.keep")));
         assert!(!matcher.matches_path(Path::new("/repo/src/targeted/file")));
+    }
+
+    #[test]
+    fn compiled_exclude_wildcards_preserve_anchoring_and_multiple_stars() {
+        let anchored = CompiledExcludePattern::new("build**.tmp".into());
+        let suffix = CompiledExcludePattern::new("*cache*.tmp".into());
+        let match_all = CompiledExcludePattern::new("***".into());
+
+        assert!(anchored.matches_component(b"BUILD-cache.TMP"));
+        assert!(!anchored.matches_component(b"old-build-cache.tmp"));
+        assert!(!anchored.matches_component(b"build-cache.tmp.keep"));
+        assert!(suffix.matches_component(b"old-CACHE-data.tmp"));
+        assert!(!suffix.matches_component(b"old-cache-data.tmp.keep"));
+        assert!(match_all.matches_component(b"anything"));
+    }
+
+    #[test]
+    fn exclude_matcher_normalizes_backslash_path_rules_once() {
+        let matcher = ExcludeMatcher::new(vec!["Library\\Caches".into()]);
+
+        assert!(matcher.matches_path(Path::new("/Users/me/Library/Caches/app")));
+        assert!(!matcher.matches_path(Path::new("/Users/me/Library/Cache/app")));
     }
 
     #[cfg(unix)]
@@ -2150,19 +2326,6 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_budget_prefetches_all_small_directories() {
-        let budget = prefetch_budget_for_dir(128);
-
-        assert_eq!(
-            budget,
-            PrefetchBudget {
-                max_files: 128,
-                max_time: PREFETCH_SMALL_DIR_TIME_BUDGET,
-            }
-        );
-    }
-
-    #[test]
     fn prefetch_skips_fine_grained_timing_by_default() {
         let file_path = temp_path("prefetch-perf-disabled");
         write(&file_path, b"disk-map").unwrap();
@@ -2178,63 +2341,75 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_gate_stops_work_after_deadline() {
-        let cancel = AtomicBool::new(false);
-
-        assert!(!prefetch_work_allowed(
-            &cancel,
-            Instant::now(),
-            Duration::ZERO
-        ));
-    }
-
-    #[test]
-    fn prefetch_gate_stops_work_after_cancellation() {
+    fn prefetch_entry_chunk_stops_before_metadata_after_cancellation() {
+        let dir = temp_path("prefetch-cancelled");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(dir.join("file.bin"), b"disk-map").unwrap();
+        let mut entries: Vec<_> = WalkDirGeneric::<ScanWalkState>::new(&dir)
+            .into_iter()
+            .skip(1)
+            .collect();
         let cancel = AtomicBool::new(true);
+        let perf = PrefetchPerfCounters::default();
 
-        assert!(!prefetch_work_allowed(
+        prefetch_entry_chunk(&mut entries, false, false, &cancel, &perf, None);
+
+        assert!(entries.iter().all(|entry| entry
+            .as_ref()
+            .is_ok_and(|entry| entry.client_state.prefetched_file.is_none())));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prefetch_entry_chunk_records_metadata_errors() {
+        let dir = temp_path("prefetch-error");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("gone.bin");
+        write(&file_path, b"disk-map").unwrap();
+        let mut entries: Vec<_> = WalkDirGeneric::<ScanWalkState>::new(&dir)
+            .into_iter()
+            .skip(1)
+            .collect();
+        std::fs::remove_file(file_path).unwrap();
+        let cancel = AtomicBool::new(false);
+        let perf = PrefetchPerfCounters::default();
+
+        prefetch_entry_chunk(&mut entries, false, false, &cancel, &perf, None);
+
+        assert!(entries.iter().all(|entry| entry
+            .as_ref()
+            .is_ok_and(|entry| { matches!(entry.client_state.prefetched_file, Some(Err(_))) })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn elapsed_directory_prefetch_budget_preserves_metadata_fallback() {
+        let dir = temp_path("prefetch-budget");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(dir.join("file.bin"), b"disk-map").unwrap();
+        let mut entries: Vec<_> = WalkDirGeneric::<ScanWalkState>::new(&dir)
+            .into_iter()
+            .skip(1)
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let perf = PrefetchPerfCounters::default();
+
+        prefetch_entry_chunk(
+            &mut entries,
+            false,
+            false,
             &cancel,
-            Instant::now(),
-            Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn prefetch_budget_scales_up_for_large_directories() {
-        let budget = prefetch_budget_for_dir(10_000);
-
-        assert_eq!(
-            budget,
-            PrefetchBudget {
-                max_files: 10_000,
-                max_time: PREFETCH_LARGE_DIR_TIME_BUDGET,
-            }
+            &perf,
+            Some(Duration::ZERO),
         );
-    }
+        prefetch_entry_chunk(&mut entries, false, false, &cancel, &perf, None);
 
-    #[test]
-    fn prefetch_budget_expands_for_huge_directories() {
-        let budget = prefetch_budget_for_dir(40_000);
-
-        assert_eq!(
-            budget,
-            PrefetchBudget {
-                max_files: 40_000,
-                max_time: PREFETCH_HUGE_DIR_TIME_BUDGET,
-            }
-        );
-    }
-
-    #[test]
-    fn prefetch_budget_caps_giant_directories() {
-        let budget = prefetch_budget_for_dir(200_000);
-
-        assert_eq!(
-            budget,
-            PrefetchBudget {
-                max_files: PREFETCH_GIANT_DIR_FILE_CAP,
-                max_time: PREFETCH_GIANT_DIR_TIME_BUDGET,
-            }
-        );
+        assert!(entries
+            .iter()
+            .all(|entry| entry.as_ref().is_ok_and(|entry| {
+                entry.client_state.metadata_fallback_required
+                    && entry.client_state.prefetched_file.is_none()
+            })));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

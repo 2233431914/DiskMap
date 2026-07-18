@@ -32,19 +32,27 @@ large_tree_scan/10000
 large_tree_scan/100000
   scan:  ~93.32 ms
 
-# Targeted scans after bounded parallel metadata prefetch and hot-path cleanup.
-# Primary-shape values are the median of three Criterion point estimates using
-# `--measurement-time 3 --warm-up-time 2 --sample-size 20` on the same machine.
+# Targeted scans after hybrid directory-local and 512-entry metadata prefetch.
+# Re-run values use `--measurement-time 2 --warm-up-time 1 --sample-size 10`.
 balanced_default_100k
-  scan:  ~81.60 ms (previous same-session build: ~97.38 ms)
+  scan:  ~83.42 ms
 balanced_stay_on_filesystem_100k
-  scan:  ~97.04 ms (median of three runs)
+  scan:  ~97.04 ms (previous reference; not re-run)
 balanced_exclude_miss_100k
-  scan:  ~87.92 ms (one run)
+  scan:  ~87.92 ms (previous reference; not re-run)
+balanced_exclude_rules_100k
+  scan:  ~83.75 ms (previous same-session build: ~93.76 ms)
 flat_default_100k
-  scan:  ~251.71 ms (previous same-session build: ~314.91 ms)
+  scan:  ~169.50 ms (previous reference: ~251.71 ms)
 deep_default_10k
-  scan:  ~33.24 ms (previous same-session build: ~39.75 ms)
+  scan:  ~16.82 ms (previous reference: ~33.24 ms)
+
+# `DISKMAP_SCAN_PROBE=flat_default_100k RAYON_NUM_THREADS=2`
+# `DISKMAP_SCAN_TRACE=1 cargo bench --bench large_tree -- __probe_only__` slow-path probe.
+flat_default_100k_probe
+  scan:  ~432.72 ms (previous same-session build: ~832.24 ms)
+  first batch: ~53.63 ms (previous: ~670.45 ms)
+  metadata fallbacks: 0 (previous: 35,148)
 
 large_tree_layout/1000
   layout: TBD

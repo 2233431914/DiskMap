@@ -14,20 +14,27 @@
 //! and their `.complete` marker files under `target/bench-fixtures/`.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use disk_map::scanner::{scan_path_to_tree, ScanOptions};
+use crossbeam_channel::unbounded;
+use disk_map::scanner::{scan_path_to_tree, start_scan, PerfStats, ScanMessage, ScanOptions};
 use disk_map::tree::TreeStore;
 use disk_map::treemap::{layout_treemap, LayoutScratch, SearchState, TreemapLayoutParams};
 use egui::Rect;
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const FIXTURE_SIZES: &[usize] = &[1_000, 10_000, 100_000];
 const FIXTURE_VERSION: u32 = 2;
 const FLAT_FIXTURE_SIZE: usize = 100_000;
 const DEEP_FIXTURE_SIZE: usize = 10_000;
 const DEEP_FIXTURE_LEVELS: usize = 32;
+
+struct ScanProbe {
+    elapsed: Duration,
+    first_batch: Option<Duration>,
+    perf_stats: PerfStats,
+}
 
 #[derive(Clone, Copy)]
 enum FixtureShape {
@@ -130,6 +137,64 @@ fn shaped_fixture_path(shape: &str, target_count: usize) -> PathBuf {
         .join(format!("disk-map-{shape}-{target_count}"))
 }
 
+fn probe_scan(path: &Path, options: ScanOptions) -> ScanProbe {
+    let (tx, rx) = unbounded();
+    let started_at = Instant::now();
+    let _handle = start_scan(path.to_path_buf(), 1, options, tx);
+    let mut first_batch = None;
+
+    loop {
+        match rx.recv().expect("probe scan channel should stay open") {
+            ScanMessage::Started { .. } => {}
+            ScanMessage::Batch { .. } => {
+                first_batch.get_or_insert_with(|| started_at.elapsed());
+            }
+            ScanMessage::Finished { perf_stats, .. } => {
+                return ScanProbe {
+                    elapsed: started_at.elapsed(),
+                    first_batch,
+                    perf_stats,
+                };
+            }
+            ScanMessage::Cancelled { .. } => panic!("probe scan was cancelled"),
+            ScanMessage::Error { message, .. } => panic!("probe scan failed: {message}"),
+        }
+    }
+}
+
+fn maybe_print_probe(label: &str, path: &Path, options: ScanOptions) {
+    let enabled = std::env::var("DISKMAP_SCAN_PROBE")
+        .ok()
+        .is_some_and(|value| value == "all" || value == label);
+    if !enabled {
+        return;
+    }
+
+    let probe = probe_scan(path, options);
+    eprintln!(
+        "scan_probe label={label} elapsed_ms={:.3} first_batch_ms={:.3} prefetched_files={} metadata_fallback_files={}",
+        probe.elapsed.as_secs_f64() * 1000.0,
+        probe
+            .first_batch
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0),
+        probe.perf_stats.prefetched_files,
+        probe.perf_stats.metadata_fallback_files,
+    );
+}
+
+fn realistic_exclude_options() -> ScanOptions {
+    ScanOptions {
+        exclude_patterns: vec![
+            ".git".into(),
+            "node_modules".into(),
+            "build".into(),
+            "*.tmp".into(),
+            "Library/Caches".into(),
+        ],
+        ..ScanOptions::default()
+    }
+}
+
 fn scan_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_tree_scan");
     for &size in FIXTURE_SIZES {
@@ -152,6 +217,7 @@ fn scan_bench(c: &mut Criterion) {
 fn targeted_scan_bench(c: &mut Criterion) {
     let balanced = balanced_fixture_path(100_000);
     generate_tree_if_missing(100_000, &balanced, FixtureShape::Balanced);
+    maybe_print_probe("balanced_default_100k", &balanced, ScanOptions::default());
     c.bench_function("balanced_default_100k", |b| {
         b.iter(|| {
             black_box(
@@ -188,8 +254,23 @@ fn targeted_scan_bench(c: &mut Criterion) {
         })
     });
 
+    maybe_print_probe(
+        "balanced_exclude_rules_100k",
+        &balanced,
+        realistic_exclude_options(),
+    );
+    c.bench_function("balanced_exclude_rules_100k", |b| {
+        b.iter(|| {
+            black_box(
+                scan_path_to_tree(black_box(balanced.clone()), realistic_exclude_options())
+                    .expect("balanced realistic exclude scan should succeed"),
+            )
+        })
+    });
+
     let flat = shaped_fixture_path("flat", FLAT_FIXTURE_SIZE);
     generate_tree_if_missing(FLAT_FIXTURE_SIZE, &flat, FixtureShape::Flat);
+    maybe_print_probe("flat_default_100k", &flat, ScanOptions::default());
     c.bench_function("flat_default_100k", |b| {
         b.iter(|| {
             black_box(
@@ -201,6 +282,7 @@ fn targeted_scan_bench(c: &mut Criterion) {
 
     let deep = shaped_fixture_path("deep", DEEP_FIXTURE_SIZE);
     generate_tree_if_missing(DEEP_FIXTURE_SIZE, &deep, FixtureShape::Deep);
+    maybe_print_probe("deep_default_10k", &deep, ScanOptions::default());
     c.bench_function("deep_default_10k", |b| {
         b.iter(|| {
             black_box(
