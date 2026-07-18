@@ -62,7 +62,7 @@ pub fn show_state_message(ui: &mut egui::Ui, p: &Palette, message: &StateMessage
     ui.add(egui::Label::new(RichText::new(&message.detail).color(p.text_muted).small()).wrap());
 }
 
-pub fn show_scan_issue_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMapApp) {
+pub fn show_scan_issue_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMapApp) {
     let summary = app.scan.issue_summary();
     if !summary.has_findings() {
         return;
@@ -90,6 +90,24 @@ pub fn show_scan_issue_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMapApp)
                 .small()
                 .color(color),
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    if summary.permission_errors > 0 {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Permission errors can come from macOS privacy protection or ordinary POSIX/ACL permissions. Full Disk Access may help with the former; reopen DiskMap and scan again after changing access.",
+                )
+                .small()
+                .color(p.text_muted),
+            )
+            .wrap(),
+        );
+        if ui.button("Open Full Disk Access Settings").clicked() {
+            app.open_full_disk_access_settings();
+        }
     }
 }
 

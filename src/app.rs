@@ -789,7 +789,7 @@ impl DiskMapApp {
         panels::sections::show_state_message(ui, p, message);
     }
 
-    fn show_scan_issue_section(&self, ui: &mut egui::Ui, p: &Palette) {
+    fn show_scan_issue_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
         panels::sections::show_scan_issue_section(ui, p, self);
     }
 
@@ -1307,6 +1307,21 @@ impl DiskMapApp {
                 format!("{action} failed: {error}"),
             );
             self.pending_repaint = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn open_full_disk_access_settings(&mut self) {
+        match crate::platform::open_full_disk_access_settings() {
+            Ok(()) => {
+                self.set_status(
+                    StatusSource::Platform,
+                    StatusLevel::Info,
+                    "Enable DiskMap in Full Disk Access, then quit and reopen it before rescanning",
+                );
+                self.pending_repaint = true;
+            }
+            Err(error) => self.apply_platform_result("Open Full Disk Access settings", Err(error)),
         }
     }
 

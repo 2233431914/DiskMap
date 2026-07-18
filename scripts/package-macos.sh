@@ -198,6 +198,16 @@ cat >"$PLIST_PATH" <<PLIST
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
     <string>$MIN_MACOS_VERSION</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>DiskMap scans the folders you choose to visualize their disk usage.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>DiskMap scans the folders you choose to visualize their disk usage.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>DiskMap scans the folders you choose to visualize their disk usage.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>DiskMap scans network volumes you choose to visualize their disk usage.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>DiskMap scans removable volumes you choose to visualize their disk usage.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

@@ -17,6 +17,23 @@ pub struct PlatformProtectedPathRule {
 }
 
 #[cfg(target_os = "macos")]
+const FULL_DISK_ACCESS_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
+#[cfg(target_os = "macos")]
+fn full_disk_access_settings_command() -> std::process::Command {
+    let mut command = std::process::Command::new("open");
+    command.arg(FULL_DISK_ACCESS_SETTINGS_URL);
+    command
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_full_disk_access_settings() -> anyhow::Result<()> {
+    full_disk_access_settings_command().spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub fn reveal_in_file_manager(path: &Path) -> anyhow::Result<()> {
     std::process::Command::new("open")
         .arg("-R")
@@ -429,6 +446,23 @@ pub fn move_to_trash(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_disk_access_command_targets_privacy_all_files_settings() {
+        let command = full_disk_access_settings_command();
+
+        assert_eq!(
+            (
+                command.get_program(),
+                command.get_args().collect::<Vec<_>>()
+            ),
+            (
+                std::ffi::OsStr::new("open"),
+                vec![std::ffi::OsStr::new(FULL_DISK_ACCESS_SETTINGS_URL)]
+            )
+        );
+    }
 
     #[test]
     fn file_manager_name_is_platform_specific() {

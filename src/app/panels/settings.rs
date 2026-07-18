@@ -78,6 +78,32 @@ pub fn show_settings_window(ctx: &egui::Context, app: &mut DiskMapApp) {
                 }
             });
 
+            #[cfg(target_os = "macos")]
+            {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("FILE ACCESS")
+                        .size(10.0)
+                        .strong()
+                        .color(p.text_faint),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "macOS protects some folders. Full Disk Access is required for a complete system scan.",
+                        )
+                        .small()
+                        .color(p.text_muted),
+                    )
+                    .wrap(),
+                );
+                if ui.button("Open Full Disk Access Settings").clicked() {
+                    app.open_full_disk_access_settings();
+                }
+            }
+
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let scan_label = if app.scan.is_scanning() {

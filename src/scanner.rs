@@ -3,6 +3,7 @@ use crate::tree::{node_id_from_index, node_index, NodeId, NodeKind, NodeRecord, 
 
 use crossbeam_channel::{unbounded, Sender};
 use jwalk::rayon::prelude::*;
+use jwalk::rayon::{ThreadPool, ThreadPoolBuilder};
 use jwalk::{ClientState, WalkDirGeneric};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
@@ -10,7 +11,7 @@ use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -301,6 +302,8 @@ struct PrefetchOutcome {
 
 const HOT_LOOP_TIME_CHECK_INTERVAL: usize = 64;
 const DIRECTORY_PREFETCH_TIME_BUDGET: Duration = Duration::from_millis(12);
+const INITIAL_METADATA_PREFETCH_CHUNK_SIZE: usize = 16;
+const METADATA_PREFETCH_THREAD_COUNT: usize = 4;
 #[cfg(not(test))]
 const METADATA_PREFETCH_CHUNK_SIZE: usize = 512;
 #[cfg(test)]
@@ -309,6 +312,20 @@ const METADATA_PREFETCH_CHUNK_SIZE: usize = 16;
 const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 128;
 #[cfg(test)]
 const PARALLEL_PREFETCH_FILE_THRESHOLD: usize = 4;
+
+static METADATA_PREFETCH_POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
+
+fn metadata_prefetch_pool() -> Option<&'static ThreadPool> {
+    METADATA_PREFETCH_POOL
+        .get_or_init(|| {
+            ThreadPoolBuilder::new()
+                .num_threads(METADATA_PREFETCH_THREAD_COUNT)
+                .thread_name(|index| format!("disk-map-metadata-{index}"))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
 
 fn prefetched_file_info(
     metadata: Metadata,
@@ -394,9 +411,7 @@ fn prefetch_entry_chunk(
     }
 
     let mut perf = PrefetchPerfDelta::default();
-    if let Some(time_budget) =
-        serial_time_budget.filter(|_| file_count < PARALLEL_PREFETCH_FILE_THRESHOLD)
-    {
+    if let Some(time_budget) = serial_time_budget {
         let started_at = Instant::now();
         for entry_result in entries.iter_mut() {
             if cancel.load(Ordering::Relaxed) {
@@ -442,6 +457,8 @@ fn prefetch_entry_chunk(
 struct MetadataPrefetchIter<I> {
     source: I,
     ready: VecDeque<jwalk::Result<ScanDirEntry>>,
+    chunk_size: usize,
+    warming_up: bool,
     cache_enabled: bool,
     detailed_perf: bool,
     cancel: Arc<AtomicBool>,
@@ -462,6 +479,8 @@ where
         Self {
             source,
             ready: VecDeque::with_capacity(METADATA_PREFETCH_CHUNK_SIZE),
+            chunk_size: INITIAL_METADATA_PREFETCH_CHUNK_SIZE,
+            warming_up: true,
             cache_enabled,
             detailed_perf,
             cancel,
@@ -478,10 +497,14 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(entry) = self.ready.pop_front() {
+            if self.ready.is_empty() {
+                self.chunk_size = METADATA_PREFETCH_CHUNK_SIZE;
+                self.warming_up = false;
+            }
             return Some(entry);
         }
 
-        while self.ready.len() < METADATA_PREFETCH_CHUNK_SIZE {
+        while self.ready.len() < self.chunk_size {
             let Some(entry) = self.source.next() else {
                 break;
             };
@@ -494,15 +517,45 @@ where
             return None;
         }
 
-        prefetch_entry_chunk(
-            self.ready.make_contiguous(),
-            self.cache_enabled,
-            self.detailed_perf,
-            &self.cancel,
-            &self.prefetch_perf,
-            None,
-        );
-        self.ready.pop_front()
+        // jwalk occupies the shared Rayon pool, so steady-state metadata work
+        // uses a small dedicated pool instead of waiting behind traversal.
+        let entries = self.ready.make_contiguous();
+        if self.warming_up {
+            prefetch_entry_chunk(
+                entries,
+                self.cache_enabled,
+                self.detailed_perf,
+                &self.cancel,
+                &self.prefetch_perf,
+                Some(DIRECTORY_PREFETCH_TIME_BUDGET),
+            );
+        } else if let Some(pool) = metadata_prefetch_pool() {
+            pool.install(|| {
+                prefetch_entry_chunk(
+                    entries,
+                    self.cache_enabled,
+                    self.detailed_perf,
+                    &self.cancel,
+                    &self.prefetch_perf,
+                    None,
+                );
+            });
+        } else {
+            prefetch_entry_chunk(
+                entries,
+                self.cache_enabled,
+                self.detailed_perf,
+                &self.cancel,
+                &self.prefetch_perf,
+                Some(DIRECTORY_PREFETCH_TIME_BUDGET),
+            );
+        }
+        let entry = self.ready.pop_front();
+        if self.ready.is_empty() {
+            self.chunk_size = METADATA_PREFETCH_CHUNK_SIZE;
+            self.warming_up = false;
+        }
+        entry
     }
 }
 
@@ -852,8 +905,15 @@ impl BatchAccumulator {
             && self.progress.is_none()
     }
 
-    fn should_flush(&self, options: &ScanOptions, last_flush: Instant) -> bool {
-        self.discovered_nodes.len() >= options.max_pending_nodes
+    fn should_flush(
+        &self,
+        options: &ScanOptions,
+        last_flush: Instant,
+        is_initial_entry: bool,
+    ) -> bool {
+        // Stream the warmup window before steady-state prefetch can block.
+        (is_initial_entry && !self.discovered_nodes.is_empty())
+            || self.discovered_nodes.len() >= options.max_pending_nodes
             || self.size_deltas.len() >= options.max_pending_size_deltas
             || last_flush.elapsed() >= options.batch_flush_interval
     }
@@ -1191,7 +1251,11 @@ fn run_scan(
                 });
                 batch.scanned_nodes.push(node_id);
                 counters.current_path = error_path;
-                if batch.should_flush(&options, last_flush) {
+                if batch.should_flush(
+                    &options,
+                    last_flush,
+                    perf_stats.entries_seen <= INITIAL_METADATA_PREFETCH_CHUNK_SIZE as u64,
+                ) {
                     flush_batch(
                         &tx,
                         scan_id,
@@ -1281,7 +1345,12 @@ fn run_scan(
                             });
                             batch.scanned_nodes.push(node_id);
                             counters.current_path = entry.path();
-                            if batch.should_flush(&options, last_flush) {
+                            if batch.should_flush(
+                                &options,
+                                last_flush,
+                                perf_stats.entries_seen
+                                    <= INITIAL_METADATA_PREFETCH_CHUNK_SIZE as u64,
+                            ) {
                                 flush_batch(
                                     &tx,
                                     scan_id,
@@ -1404,7 +1473,11 @@ fn run_scan(
             batch.scanned_nodes.push(node_id);
         }
 
-        let should_flush = batch.should_flush(&options, last_flush);
+        let should_flush = batch.should_flush(
+            &options,
+            last_flush,
+            perf_stats.entries_seen <= INITIAL_METADATA_PREFETCH_CHUNK_SIZE as u64,
+        );
         if should_flush || perf_stats.entries_seen & (HOT_LOOP_TIME_CHECK_INTERVAL as u64 - 1) == 0
         {
             counters.current_path = entry_path.unwrap_or_else(|| entry.path());
@@ -1633,6 +1706,10 @@ mod tests {
     use std::fs::write;
     #[cfg(unix)]
     use std::fs::File;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(label: &str) -> PathBuf {
@@ -1772,7 +1849,7 @@ mod tests {
             },
         });
 
-        assert!(batch.should_flush(&options, Instant::now()));
+        assert!(batch.should_flush(&options, Instant::now(), false));
     }
 
     #[test]
@@ -1913,6 +1990,86 @@ mod tests {
         assert!(files.iter().all(|node| node.modified_secs.is_some()));
         assert_eq!(perf_stats.prefetched_files, file_count as u64);
         assert_eq!(perf_stats.metadata_fallback_files, 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metadata_prefetch_iter_starts_with_small_warmup_chunk() {
+        let dir = temp_path("prefetch-warmup");
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..(INITIAL_METADATA_PREFETCH_CHUNK_SIZE * 2) {
+            write(dir.join(format!("file-{index:02}.bin")), b"disk-map").unwrap();
+        }
+
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let observed_pulls = Arc::clone(&pulls);
+        let source = WalkDirGeneric::<ScanWalkState>::new(&dir)
+            .into_iter()
+            .skip(1)
+            .inspect(move |_| {
+                observed_pulls.fetch_add(1, Ordering::Relaxed);
+            });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prefetch_perf = Arc::new(PrefetchPerfCounters::default());
+        let mut iter = MetadataPrefetchIter::new(source, false, false, cancel, prefetch_perf);
+
+        assert!(iter.next().is_some());
+        assert_eq!(
+            pulls.load(Ordering::Relaxed),
+            INITIAL_METADATA_PREFETCH_CHUNK_SIZE
+        );
+        for _ in 1..INITIAL_METADATA_PREFETCH_CHUNK_SIZE {
+            assert!(iter.next().is_some());
+        }
+        assert!(!iter.warming_up);
+        assert_eq!(
+            metadata_prefetch_pool().map(ThreadPool::current_num_threads),
+            Some(METADATA_PREFETCH_THREAD_COUNT)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metadata_prefetch_pool_is_shared_and_bounded() {
+        let first = metadata_prefetch_pool().expect("metadata prefetch pool");
+        let second = metadata_prefetch_pool().expect("metadata prefetch pool");
+
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first.current_num_threads(), METADATA_PREFETCH_THREAD_COUNT);
+    }
+
+    #[test]
+    fn initial_entries_are_streamed_before_steady_state_prefetch() {
+        let dir = temp_path("first-batch-warmup");
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..(INITIAL_METADATA_PREFETCH_CHUNK_SIZE + 8) {
+            write(dir.join(format!("file-{index:02}.bin")), b"disk-map").unwrap();
+        }
+
+        let (tx, rx) = unbounded();
+        run_scan(
+            dir.clone(),
+            0,
+            ScanOptions {
+                batch_flush_interval: Duration::from_secs(3_600),
+                max_pending_nodes: usize::MAX,
+                max_pending_size_deltas: usize::MAX,
+                ..ScanOptions::default()
+            },
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(matches!(rx.recv().unwrap(), ScanMessage::Started { .. }));
+        for _ in 1..INITIAL_METADATA_PREFETCH_CHUNK_SIZE {
+            let message = rx.recv().expect("scan should stream the warm-up entries");
+            let ScanMessage::Batch { batch, .. } = message else {
+                panic!("expected each warm-up result to be a Batch");
+            };
+            assert_eq!(batch.discovered_nodes.len(), 1);
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }
