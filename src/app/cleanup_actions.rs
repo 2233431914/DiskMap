@@ -18,6 +18,17 @@ impl DiskMapApp {
         self.trash_confirm_path = None;
     }
 
+    pub(super) fn confirm_trash(&mut self) {
+        let Some(node_id) = self.trash_confirm_target_id else {
+            return;
+        };
+        let Some(path) = self.trash_confirm_path.clone() else {
+            self.clear_trash_confirmation();
+            return;
+        };
+        self.move_path_to_trash(node_id, path);
+    }
+
     #[cfg(test)]
     pub(super) fn queue_cleanup_candidate(&mut self, node_id: NodeId) {
         let Some(raw_path) = self.tree.node_real_path(node_id) else {
@@ -271,7 +282,7 @@ impl DiskMapApp {
         true
     }
 
-    fn cleanup_item_count(&self, node_id: NodeId) -> usize {
+    pub(super) fn cleanup_item_count(&self, node_id: NodeId) -> usize {
         if !self.tree.contains_id(node_id) {
             return 0;
         }

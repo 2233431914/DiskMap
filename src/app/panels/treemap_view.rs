@@ -14,7 +14,8 @@ use crate::app::{
     CONTEXT_MENU_MIN_WIDTH,
 };
 use crate::format::format_bytes;
-use crate::platform::{open_path, reveal_action_label, reveal_in_file_manager};
+use crate::i18n::TextKey;
+use crate::platform::{open_path, reveal_in_file_manager};
 use crate::treemap::VisualKind;
 use eframe::egui::{self, RichText, Sense, Vec2};
 
@@ -120,36 +121,48 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                 if ui
                     .add_enabled(
                         node_path.is_some(),
-                        egui::Button::new("Open").min_size(Vec2::new(ui.available_width(), 24.0)),
+                        egui::Button::new(format!(
+                            "{}  {}",
+                            egui_phosphor::regular::FOLDER_OPEN,
+                            app.text(TextKey::Open)
+                        ))
+                        .min_size(Vec2::new(ui.available_width(), 28.0)),
                     )
                     .clicked()
                 {
                     if let Some(path) = &node_path {
-                        app.apply_platform_result("Open", open_path(path));
+                        let action = app.text(TextKey::Open);
+                        app.apply_platform_result(action, open_path(path));
                     }
                     ui.close();
                 }
                 if ui
                     .add_enabled(
                         node_path.is_some(),
-                        egui::Button::new(reveal_action_label())
-                            .min_size(Vec2::new(ui.available_width(), 24.0)),
+                        egui::Button::new(format!(
+                            "{}  {}",
+                            egui_phosphor::regular::FOLDER_OPEN,
+                            app.reveal_action_text()
+                        ))
+                        .min_size(Vec2::new(ui.available_width(), 28.0)),
                     )
                     .clicked()
                 {
                     if let Some(path) = &node_path {
-                        app.apply_platform_result(
-                            reveal_action_label(),
-                            reveal_in_file_manager(path),
-                        );
+                        let action = app.reveal_action_text();
+                        app.apply_platform_result(action, reveal_in_file_manager(path));
                     }
                     ui.close();
                 }
                 if ui
                     .add_enabled(
                         node_path.is_some(),
-                        egui::Button::new("Copy Path")
-                            .min_size(Vec2::new(ui.available_width(), 24.0)),
+                        egui::Button::new(format!(
+                            "{}  {}",
+                            egui_phosphor::regular::CLIPBOARD,
+                            app.text(TextKey::CopyPath)
+                        ))
+                        .min_size(Vec2::new(ui.available_width(), 28.0)),
                     )
                     .clicked()
                 {
@@ -160,18 +173,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
                 }
                 ui.separator();
                 let trash_label = if app.trash_confirm_target_id == Some(node_id) {
-                    "Confirm Move to Trash"
+                    app.text(TextKey::ConfirmMoveToTrash)
                 } else {
-                    "Move to Trash"
+                    app.text(TextKey::MoveToTrash)
                 };
                 let trash_response = ui.add_enabled(
                     node_path.is_some(),
-                    egui::Button::new(trash_label).min_size(Vec2::new(ui.available_width(), 24.0)),
+                    egui::Button::new(format!("{}  {trash_label}", egui_phosphor::regular::TRASH))
+                        .min_size(Vec2::new(ui.available_width(), 28.0)),
                 );
                 let trash_response = if node_path.is_none() {
-                    trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
+                    trash_response.on_hover_text(app.text(TextKey::VirtualNodeNoTrash))
                 } else {
-                    trash_response.on_hover_text("Move this item to Trash; click again to confirm")
+                    trash_response.on_hover_text(app.text(TextKey::MoveToTrashHint))
                 };
                 if trash_response.clicked() {
                     app.move_node_to_trash(node_id);

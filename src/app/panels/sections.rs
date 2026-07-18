@@ -7,6 +7,7 @@ use super::super::Palette;
 use super::super::StateMessage;
 use crate::app::{palette, truncate_middle};
 use crate::format::{format_bytes, format_duration};
+use crate::i18n::{Locale, TextKey};
 use crate::scanner::{size_basis_detail, size_basis_label};
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
 
@@ -16,17 +17,21 @@ pub fn show_progress_section(ui: &mut egui::Ui, p: &Palette, app: &DiskMapApp) {
     };
     ui.add_space(12.0);
     ui.label(
-        RichText::new("SCAN")
+        RichText::new(app.text(TextKey::Scan).to_uppercase())
             .size(10.0)
             .strong()
             .color(p.text_faint),
     );
     ui.add_space(4.0);
-    let files_text = file_progress_label(progress.files_scanned, progress.total_files);
+    let files_text = file_progress_label(app.locale, progress.files_scanned, progress.total_files);
     ui.label(
-        RichText::new(format!("{files_text} · {} dirs", progress.dirs_scanned))
-            .small()
-            .color(p.text_muted),
+        RichText::new(format!(
+            "{files_text} · {} {}",
+            progress.dirs_scanned,
+            app.text(TextKey::Dirs)
+        ))
+        .small()
+        .color(p.text_muted),
     );
     ui.label(
         RichText::new(format_bytes(progress.bytes_seen))
@@ -70,23 +75,27 @@ pub fn show_scan_issue_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMap
 
     ui.add_space(12.0);
     ui.label(
-        RichText::new("SCAN ISSUES")
+        RichText::new(app.text(TextKey::ScanIssues).to_uppercase())
             .size(10.0)
             .strong()
             .color(p.text_faint),
     );
     ui.add_space(4.0);
     for (label, count, color) in [
-        ("Error entries", summary.error_entries, p.danger),
-        ("Skipped paths", summary.skipped_paths, p.text_muted),
-        ("Permission errors", summary.permission_errors, p.danger),
-        ("Symlinks", summary.symlinks, p.text_muted),
+        (TextKey::ErrorEntries, summary.error_entries, p.danger),
+        (TextKey::SkippedPaths, summary.skipped_paths, p.text_muted),
+        (
+            TextKey::PermissionErrors,
+            summary.permission_errors,
+            p.danger,
+        ),
+        (TextKey::Symlinks, summary.symlinks, p.text_muted),
     ] {
         if count == 0 {
             continue;
         }
         ui.label(
-            RichText::new(format!("{label}: {count}"))
+            RichText::new(format!("{}: {count}", app.text(label)))
                 .small()
                 .color(color),
         );
@@ -97,15 +106,13 @@ pub fn show_scan_issue_section(ui: &mut egui::Ui, p: &Palette, app: &mut DiskMap
         ui.add_space(4.0);
         ui.add(
             egui::Label::new(
-                RichText::new(
-                    "Permission errors can come from macOS privacy protection or ordinary POSIX/ACL permissions. Full Disk Access may help with the former; reopen DiskMap and scan again after changing access.",
-                )
-                .small()
-                .color(p.text_muted),
+                RichText::new(app.text(TextKey::PermissionErrorsHint))
+                    .small()
+                    .color(p.text_muted),
             )
             .wrap(),
         );
-        if ui.button("Open Full Disk Access Settings").clicked() {
+        if ui.button(app.text(TextKey::OpenFullDiskAccess)).clicked() {
             app.open_full_disk_access_settings();
         }
     }
@@ -134,15 +141,18 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.0, dot_color);
         ui.label(
-            RichText::new(app.status.display_text())
+            RichText::new(app.localized_status_text())
                 .size(11.5)
                 .color(p.text_muted),
         );
 
-        let elapsed_text = app
-            .scan
-            .elapsed()
-            .map(|elapsed| format!("Elapsed {}", format_duration(elapsed)));
+        let elapsed_text = app.scan.elapsed().map(|elapsed| {
+            format!(
+                "{} {}",
+                app.text(TextKey::Elapsed),
+                format_duration(elapsed)
+            )
+        });
         if let Some(progress) = app.scan.progress() {
             if let Some(fraction) = progress.file_progress_fraction() {
                 let available_width = ui.available_width();
@@ -180,11 +190,13 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
                 ui.add_space(10.0);
                 ui.label(RichText::new("│").size(11.0).color(p.text_faint));
                 ui.add_space(10.0);
-                let files_text = file_progress_label(progress.files_scanned, progress.total_files);
+                let files_text =
+                    file_progress_label(app.locale, progress.files_scanned, progress.total_files);
                 let text = format!(
-                    "{} · {} dirs · {}",
+                    "{} · {} {} · {}",
                     files_text,
                     progress.dirs_scanned,
+                    app.text(TextKey::Dirs),
                     format_bytes(progress.bytes_seen)
                 );
                 ui.label(RichText::new(text).size(11.5).color(p.text_muted));
@@ -206,9 +218,12 @@ pub fn show_status_bar(ui: &mut egui::Ui, app: &DiskMapApp) {
 
 // --- private helpers used only by the section renderers above ---
 
-fn file_progress_label(files_scanned: u64, total_files: Option<u64>) -> String {
+fn file_progress_label(locale: Locale, files_scanned: u64, total_files: Option<u64>) -> String {
     match total_files {
-        Some(total_files) => format!("{files_scanned}/{total_files} files"),
-        None => format!("{files_scanned} files"),
+        Some(total_files) => format!(
+            "{files_scanned}/{total_files} {}",
+            locale.text(TextKey::Files)
+        ),
+        None => format!("{files_scanned} {}", locale.text(TextKey::Files)),
     }
 }

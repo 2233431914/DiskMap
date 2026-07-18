@@ -7,6 +7,8 @@ license = "GPL-3.0-or-later"
 [dependencies]
 eframe = { version = "0.34", features = ["persistence", "glow"] }
 egui = "0.34"
+egui-phosphor = "0.12"
+sys-locale = "0.3.2"
 
 jwalk = "0.8"
 crossbeam-channel = "0.5"

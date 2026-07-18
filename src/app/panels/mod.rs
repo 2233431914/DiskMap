@@ -6,4 +6,5 @@ pub mod details;
 pub mod roots_menu;
 pub mod sections;
 pub mod settings;
+pub mod trash_confirmation;
 pub mod treemap_view;

@@ -909,6 +909,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "egui-phosphor",
  "fixedbitset",
  "jwalk",
  "lru",
@@ -919,6 +920,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "sys-locale",
  "trash",
 ]
 
@@ -1048,6 +1050,15 @@ dependencies = [
  "serde",
  "smallvec",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb4e4b18e368ff336c8dd2102992e2631b118f29a2164b0d2be9d8889dcd367e"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
@@ -3512,6 +3523,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

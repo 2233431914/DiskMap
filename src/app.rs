@@ -3,6 +3,7 @@ use crate::duplicates::DuplicateReport;
 #[cfg(test)]
 use crate::export::ExportFormat;
 use crate::format::format_bytes;
+use crate::i18n::{Locale, TextKey};
 use crate::insights::InsightReport;
 #[cfg(test)]
 use crate::scanner::ScanMessage;
@@ -66,6 +67,7 @@ const STORAGE_RECENT_ROOTS: &str = "disk_map.recent_roots";
 const STORAGE_PINNED_ROOTS: &str = "disk_map.pinned_roots";
 const STORAGE_MAX_DEPTH: &str = "disk_map.max_depth";
 const STORAGE_THEME: &str = "disk_map.theme";
+const STORAGE_LOCALE: &str = "disk_map.locale";
 const MAX_RECENT_ROOTS: usize = 10;
 const MAX_PINNED_ROOTS: usize = 12;
 #[cfg(test)]
@@ -161,7 +163,7 @@ pub(super) fn pick_label_color(bg: Color32) -> Color32 {
 }
 
 pub fn configure_theme(ctx: &egui::Context) {
-    configure_fonts(ctx);
+    configure_fonts(ctx, Locale::default());
     ctx.set_visuals_of(Theme::Light, build_visuals(&LIGHT_PALETTE, false));
     ctx.set_visuals_of(Theme::Dark, build_visuals(&DARK_PALETTE, true));
 
@@ -189,16 +191,14 @@ pub fn configure_theme(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
-fn configure_fonts(ctx: &egui::Context) {
-    let Some(font_path) = first_readable_font_path(cjk_font_candidates().iter().copied()) else {
-        return;
-    };
-    let Ok(font_bytes) = std::fs::read(font_path) else {
-        return;
-    };
-
+fn configure_fonts(ctx: &egui::Context, _locale: Locale) {
     let mut fonts = egui::FontDefinitions::default();
-    install_cjk_font_data(&mut fonts, font_bytes);
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    if let Some(font_path) = first_readable_font_path(cjk_font_candidates().iter().copied()) {
+        if let Ok(font_bytes) = std::fs::read(font_path) {
+            install_cjk_font_data(&mut fonts, font_bytes);
+        }
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -347,6 +347,8 @@ pub struct DiskMapApp {
     pub(super) hovered_visual_kind: Option<VisualKind>,
     pub(super) max_depth: usize,
     theme_preference: Option<Theme>,
+    pub(super) locale: Locale,
+    pub(super) locale_follow_system: bool,
     pub(in crate::app) status: AppStatus,
     pub(in crate::app) treemap: TreemapViewState,
     pub(super) pending_repaint: bool,
@@ -422,6 +424,8 @@ impl Default for DiskMapApp {
             hovered_visual_kind: None,
             max_depth: 1,
             theme_preference: None,
+            locale: Locale::default(),
+            locale_follow_system: true,
             status: AppStatus::default(),
             treemap: TreemapViewState::default(),
             pending_repaint: false,
@@ -451,6 +455,7 @@ impl DiskMapApp {
         let mut app = Self::default();
         let state = app.safe_storage.read_state();
         app.restore_local_state(&state);
+        configure_fonts(&cc.egui_ctx, app.locale);
         if let Some(theme) = app.theme_preference {
             apply_theme_preference(&cc.egui_ctx, theme);
         } else {
@@ -543,6 +548,16 @@ impl DiskMapApp {
         }
 
         self.theme_preference = prefs.get(STORAGE_THEME).and_then(parse_theme_preference);
+        match prefs.get(STORAGE_LOCALE) {
+            Some("system") | None => {
+                self.locale_follow_system = true;
+                self.locale = Locale::from_system();
+            }
+            Some(value) => {
+                self.locale_follow_system = false;
+                self.locale = Locale::from_storage(value).unwrap_or_else(Locale::from_system);
+            }
+        }
     }
 
     fn collect_preferences(&self) -> Preferences {
@@ -575,6 +590,14 @@ impl DiskMapApp {
         if let Some(theme) = self.theme_preference {
             prefs.set(STORAGE_THEME, theme_preference_name(theme).to_string());
         }
+        prefs.set(
+            STORAGE_LOCALE,
+            if self.locale_follow_system {
+                "system"
+            } else {
+                self.locale.storage_name()
+            },
+        );
         prefs
     }
 
@@ -593,6 +616,74 @@ impl DiskMapApp {
             rules: self.rules.clone(),
             ..LocalState::default()
         }
+    }
+
+    pub(super) fn text(&self, key: TextKey) -> &'static str {
+        self.locale.text(key)
+    }
+
+    pub(super) fn reveal_action_text(&self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            self.text(TextKey::RevealInFinder)
+        } else {
+            self.text(TextKey::OpenContainingFolder)
+        }
+    }
+
+    pub(super) fn localized_status_text(&self) -> String {
+        let raw = self.status.display_text().into_owned();
+        let (primary, watch_failure) = raw
+            .split_once(" · Watch failed: ")
+            .map_or((raw.as_str(), None), |(primary, error)| {
+                (primary, Some(error))
+            });
+        let localized = if primary == "Ready" {
+            self.text(TextKey::Ready).to_string()
+        } else if primary == "Scanning..." {
+            format!("{}...", self.text(TextKey::Scanning))
+        } else if let Some(path) = primary.strip_prefix("Scanning ") {
+            format!("{} {path}", self.text(TextKey::Scanning))
+        } else if let Some(summary) = primary.strip_prefix("Finished: ") {
+            format!("{}: {summary}", self.text(TextKey::Finished))
+        } else if let Some(summary) = primary.strip_prefix("Cancelling scan...") {
+            format!("{}{}", self.text(TextKey::CancellingScan), summary)
+        } else if let Some(summary) = primary.strip_prefix("Rescanning after ") {
+            format!("{} {summary}", self.text(TextKey::RescanningAfter))
+        } else if let Some(summary) = primary.strip_prefix("Watch noticed ") {
+            format!("{} {summary}", self.text(TextKey::WatchNoticed))
+        } else if let Some(path) = primary.strip_prefix("Moved to Trash: ") {
+            format!("{}: {path}", self.text(TextKey::MovedToTrash))
+        } else if let Some(error) = primary.strip_prefix("Move to Trash failed: ") {
+            format!("{}: {error}", self.text(TextKey::MoveToTrashFailed))
+        } else {
+            primary.to_string()
+        };
+
+        match watch_failure {
+            Some(error) => format!("{localized} · {}: {error}", self.text(TextKey::WatchFailed)),
+            None => localized,
+        }
+    }
+
+    pub(super) fn set_locale_preference(
+        &mut self,
+        ctx: &egui::Context,
+        follow_system: bool,
+        locale: Locale,
+    ) {
+        let next_locale = if follow_system {
+            Locale::from_system()
+        } else {
+            locale
+        };
+        if self.locale_follow_system == follow_system && self.locale == next_locale {
+            return;
+        }
+        self.locale_follow_system = follow_system;
+        self.locale = next_locale;
+        configure_fonts(ctx, next_locale);
+        self.save_preferences();
+        self.pending_repaint = true;
     }
 
     #[cfg(test)]
@@ -658,6 +749,8 @@ impl eframe::App for DiskMapApp {
             .show_inside(ui, |ui| {
                 self.show_treemap(ui);
             });
+
+        panels::trash_confirmation::show(ui.ctx(), self);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
@@ -672,7 +765,7 @@ impl DiskMapApp {
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if icon_button(ui, self.navigation.can_go_back(), ToolbarIcon::ArrowLeft)
-                .on_hover_text("Back")
+                .on_hover_text(self.text(TextKey::Back))
                 .clicked()
             {
                 self.navigate_back();
@@ -683,14 +776,14 @@ impl DiskMapApp {
                 self.navigation.can_go_forward(),
                 ToolbarIcon::ArrowRight,
             )
-            .on_hover_text("Forward")
+            .on_hover_text(self.text(TextKey::Forward))
             .clicked()
             {
                 self.navigate_forward();
             }
 
             if icon_button(ui, self.navigation.can_go_up(&self.tree), ToolbarIcon::Up)
-                .on_hover_text("Up to parent directory")
+                .on_hover_text(self.text(TextKey::UpToParent))
                 .clicked()
             {
                 if let Some(parent) = self.navigation.parent_of_focused_root(&self.tree) {
@@ -703,14 +796,14 @@ impl DiskMapApp {
                 self.navigation.can_return_to_scan_root(&self.tree),
                 ToolbarIcon::Home,
             )
-            .on_hover_text("Return to scan root")
+            .on_hover_text(self.text(TextKey::ReturnToRoot))
             .clicked()
             {
                 self.return_to_scan_root();
             }
 
             if icon_button(ui, true, ToolbarIcon::Refresh)
-                .on_hover_text("Refresh treemap layout")
+                .on_hover_text(self.text(TextKey::RefreshLayout))
                 .clicked()
             {
                 self.refresh_treemap_layout();
@@ -719,7 +812,7 @@ impl DiskMapApp {
             ui.add_space(4.0);
 
             if icon_button(ui, true, ToolbarIcon::Settings)
-                .on_hover_text("Settings")
+                .on_hover_text(self.text(TextKey::Settings))
                 .clicked()
             {
                 self.settings_open = true;
@@ -728,14 +821,16 @@ impl DiskMapApp {
             self.show_roots_menu(ui);
 
             let scan_label = if self.scan.is_scanning() {
-                "Cancel"
+                self.text(TextKey::Cancel)
             } else {
-                "Scan"
+                self.text(TextKey::Scan)
             };
-            if ui
-                .add_sized([72.0, 28.0], egui::Button::new(scan_label))
-                .clicked()
-            {
+            let scan_icon = if self.scan.is_scanning() {
+                egui_phosphor::regular::X
+            } else {
+                egui_phosphor::regular::FOLDER_OPEN
+            };
+            if icon_text_button(ui, true, scan_icon, scan_label, 86.0).clicked() {
                 if self.scan.is_scanning() {
                     self.cancel_scan();
                 } else {
@@ -745,7 +840,7 @@ impl DiskMapApp {
 
             ui.add_space(8.0);
             ui.label(
-                RichText::new("DEPTH")
+                RichText::new(self.text(TextKey::Depth).to_uppercase())
                     .size(10.0)
                     .color(palette(ui.ctx()).text_faint)
                     .strong(),
@@ -800,20 +895,24 @@ impl DiskMapApp {
     fn no_root_state_message(&self) -> StateMessage {
         match self.scan.phase() {
             ScanPhase::Running => StateMessage {
-                title: "Starting scan",
-                detail: format!("Waiting for scan results from {}.", self.path_input.trim()),
+                title: self.text(TextKey::StartingScan),
+                detail: format!(
+                    "{}: {}",
+                    self.text(TextKey::ScanRoot),
+                    self.path_input.trim()
+                ),
             },
             ScanPhase::Failed(message) => StateMessage {
-                title: "Unable to scan path",
+                title: self.text(TextKey::UnableToScanPath),
                 detail: message.clone(),
             },
             ScanPhase::Cancelled => StateMessage {
-                title: "Scan cancelled",
-                detail: "Start another scan to populate the treemap.".to_string(),
+                title: self.text(TextKey::ScanCancelled),
+                detail: self.text(TextKey::ChoosePathToScan).to_string(),
             },
             ScanPhase::Idle | ScanPhase::Finished => StateMessage {
-                title: "No scan loaded",
-                detail: "Choose a path and start a scan to populate the treemap.".to_string(),
+                title: self.text(TextKey::NoScanLoaded),
+                detail: self.text(TextKey::ChoosePathToScan).to_string(),
             },
         }
     }
@@ -878,8 +977,8 @@ impl DiskMapApp {
             })
         } else {
             Some(StateMessage {
-                title: "Empty folder",
-                detail: format!("{} has no visible files or child folders.", root.name),
+                title: self.text(TextKey::EmptyFolder),
+                detail: format!("{} · 0 B", root.name),
             })
         }
     }
@@ -961,7 +1060,7 @@ impl DiskMapApp {
                             );
                         } else {
                             ui.label(
-                                RichText::new("Aggregated small files")
+                                RichText::new(self.text(TextKey::AggregatedSmallFiles))
                                     .small()
                                     .color(p.text_faint),
                             );
@@ -999,7 +1098,7 @@ impl DiskMapApp {
                     .shadow(ui.visuals().popup_shadow)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("Other Files ({count})"))
+                            RichText::new(format!("{} ({count})", self.text(TextKey::OtherFiles)))
                                 .strong()
                                 .color(p.text),
                         );
@@ -1014,7 +1113,7 @@ impl DiskMapApp {
                                 .color(p.text_muted),
                         );
                         ui.label(
-                            RichText::new("Select the directory to inspect individual files")
+                            RichText::new(self.text(TextKey::SelectDirectory))
                                 .small()
                                 .color(p.text_faint),
                         );
@@ -1071,6 +1170,13 @@ impl DiskMapApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        // A modal owns keyboard input while a destructive action is pending.
+        // In particular, Escape must cancel the modal without clearing the
+        // selection/search state underneath it.
+        if self.trash_confirm_target_id.is_some() {
+            return;
+        }
+
         if !ctx.egui_wants_keyboard_input()
             && ctx.input(|input| input.key_pressed(egui::Key::Enter))
         {
@@ -1960,143 +2066,38 @@ enum ToolbarIcon {
 }
 
 fn icon_button(ui: &mut egui::Ui, enabled: bool, icon: ToolbarIcon) -> egui::Response {
-    let desired_size = Vec2::new(28.0, 28.0);
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(desired_size, sense);
-    let visuals = ui.style().interact(&response);
-    let fill = if enabled {
-        visuals.bg_fill
-    } else {
-        ui.visuals().widgets.inactive.weak_bg_fill
-    };
-    let stroke = if enabled {
-        visuals.bg_stroke
-    } else {
-        ui.visuals().widgets.inactive.bg_stroke
-    };
-    ui.painter().rect(
-        rect,
-        visuals.corner_radius,
-        fill,
-        stroke,
-        egui::StrokeKind::Inside,
-    );
-
-    let icon_color = if enabled {
-        visuals.fg_stroke.color
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    paint_toolbar_icon(ui.painter(), rect, icon, icon_color, fill);
-    response
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(icon_glyph(icon)).size(17.0)).min_size(Vec2::splat(30.0)),
+    )
 }
 
-fn paint_toolbar_icon(
-    painter: &egui::Painter,
-    rect: Rect,
-    icon: ToolbarIcon,
-    color: Color32,
-    button_fill: Color32,
-) {
-    let c = rect.center();
-    let stroke = Stroke::new(1.4, color);
+fn icon_glyph(icon: ToolbarIcon) -> &'static str {
+    use egui_phosphor::regular;
     match icon {
-        ToolbarIcon::ArrowLeft => arrow_geom(painter, c, false, stroke),
-        ToolbarIcon::ArrowRight => arrow_geom(painter, c, true, stroke),
-        ToolbarIcon::Up => {
-            let tail = Pos2::new(c.x, c.y + 5.5);
-            let tip = Pos2::new(c.x, c.y - 5.5);
-            painter.line_segment([tail, tip], stroke);
-            painter.line_segment([tip, Pos2::new(tip.x - 4.0, tip.y + 4.0)], stroke);
-            painter.line_segment([tip, Pos2::new(tip.x + 4.0, tip.y + 4.0)], stroke);
-        }
-        ToolbarIcon::Home => {
-            let roof_left = Pos2::new(c.x - 6.0, c.y - 0.5);
-            let roof_top = Pos2::new(c.x, c.y - 6.0);
-            let roof_right = Pos2::new(c.x + 6.0, c.y - 0.5);
-            painter.line_segment([roof_left, roof_top], stroke);
-            painter.line_segment([roof_top, roof_right], stroke);
-            let base_min = Pos2::new(c.x - 4.5, c.y - 0.5);
-            let base_max = Pos2::new(c.x + 4.5, c.y + 6.0);
-            painter.line_segment([base_min, Pos2::new(base_min.x, base_max.y)], stroke);
-            painter.line_segment([Pos2::new(base_min.x, base_max.y), base_max], stroke);
-            painter.line_segment([base_max, Pos2::new(base_max.x, base_min.y)], stroke);
-        }
-        ToolbarIcon::Refresh => {
-            let r = 5.5;
-            let start_angle = -0.35 * std::f32::consts::PI;
-            let end_angle = 1.4 * std::f32::consts::PI;
-            let steps = 18;
-            let mut prev: Option<Pos2> = None;
-            for i in 0..=steps {
-                let t = i as f32 / steps as f32;
-                let theta = start_angle + (end_angle - start_angle) * t;
-                let p = Pos2::new(c.x + r * theta.cos(), c.y + r * theta.sin());
-                if let Some(p0) = prev {
-                    painter.line_segment([p0, p], stroke);
-                }
-                prev = Some(p);
-            }
-            let end = Pos2::new(c.x + r * end_angle.cos(), c.y + r * end_angle.sin());
-            painter.line_segment([end, Pos2::new(end.x - 2.5, end.y - 3.5)], stroke);
-            painter.line_segment([end, Pos2::new(end.x + 3.5, end.y - 1.5)], stroke);
-        }
-        ToolbarIcon::Settings => {
-            painter.circle_stroke(c, 4.0, stroke);
-            painter.circle_filled(c, 1.35, color);
-            for i in 0..8 {
-                let theta = i as f32 * std::f32::consts::PI / 4.0;
-                let inner = Pos2::new(c.x + 5.2 * theta.cos(), c.y + 5.2 * theta.sin());
-                let outer = Pos2::new(c.x + 7.0 * theta.cos(), c.y + 7.0 * theta.sin());
-                painter.line_segment([inner, outer], stroke);
-            }
-        }
-        ToolbarIcon::ThemeLight => {
-            painter.circle_filled(c, 3.0, color);
-            for i in 0..8 {
-                let theta = i as f32 * std::f32::consts::PI / 4.0;
-                let inner = Pos2::new(c.x + 4.5 * theta.cos(), c.y + 4.5 * theta.sin());
-                let outer = Pos2::new(c.x + 6.5 * theta.cos(), c.y + 6.5 * theta.sin());
-                painter.line_segment([inner, outer], stroke);
-            }
-        }
-        ToolbarIcon::ThemeDark => {
-            let r = 6.0;
-            painter.circle_filled(c, r, color);
-            painter.circle_filled(Pos2::new(c.x + 2.6, c.y - 1.4), r - 0.5, button_fill);
-        }
+        ToolbarIcon::ArrowLeft => regular::ARROW_LEFT,
+        ToolbarIcon::ArrowRight => regular::ARROW_RIGHT,
+        ToolbarIcon::Up => regular::ARROW_UP,
+        ToolbarIcon::Home => regular::HOUSE,
+        ToolbarIcon::Refresh => regular::ARROW_CLOCKWISE,
+        ToolbarIcon::Settings => regular::GEAR,
+        ToolbarIcon::ThemeLight => regular::SUN,
+        ToolbarIcon::ThemeDark => regular::MOON,
     }
 }
 
-fn arrow_geom(painter: &egui::Painter, center: Pos2, point_right: bool, stroke: Stroke) {
-    let shaft_half = 5.5;
-    let head = 4.0;
-    let (start, end, tip_a, tip_b) = if point_right {
-        let tail = Pos2::new(center.x - shaft_half, center.y);
-        let tip = Pos2::new(center.x + shaft_half, center.y);
-        (
-            tail,
-            tip,
-            Pos2::new(tip.x - head, tip.y - head),
-            Pos2::new(tip.x - head, tip.y + head),
-        )
-    } else {
-        let tip = Pos2::new(center.x - shaft_half, center.y);
-        let tail = Pos2::new(center.x + shaft_half, center.y);
-        (
-            tail,
-            tip,
-            Pos2::new(tip.x + head, tip.y - head),
-            Pos2::new(tip.x + head, tip.y + head),
-        )
-    };
-    painter.line_segment([start, end], stroke);
-    painter.line_segment([end, tip_a], stroke);
-    painter.line_segment([end, tip_b], stroke);
+pub(super) fn icon_text_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: &'static str,
+    label: &str,
+    width: f32,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(format!("{icon}  {label}")))
+            .min_size(Vec2::new(width, 32.0)),
+    )
 }
 
 fn apply_theme_preference(ctx: &egui::Context, theme: Theme) {
@@ -2195,32 +2196,6 @@ pub(super) fn section_divider(ui: &mut egui::Ui, palette: &Palette) {
         [rect.left_center(), rect.right_center()],
         Stroke::new(1.0, palette.stroke_subtle),
     );
-}
-
-pub(super) fn accent_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    enabled: bool,
-    width: f32,
-    palette: &Palette,
-) -> egui::Response {
-    let text_color = if enabled {
-        Color32::WHITE
-    } else {
-        palette.text_faint
-    };
-    let fill = if enabled {
-        palette.accent
-    } else {
-        palette.panel_elevated
-    };
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(label).color(text_color).strong())
-            .fill(fill)
-            .stroke(Stroke::NONE)
-            .min_size(Vec2::new(width, 32.0)),
-    )
 }
 
 fn protected_path_status(reason: crate::cleanup::ProtectedPathReason, path: &Path) -> String {
@@ -2783,6 +2758,8 @@ mod tests {
             pinned_roots: vec!["/pinned".into()],
             max_depth: 4,
             theme_preference: Some(Theme::Light),
+            locale: Locale::TraditionalChinese,
+            locale_follow_system: false,
             safe_storage: SafeStorage::new(&dir),
             ..Default::default()
         };
@@ -2805,6 +2782,7 @@ mod tests {
         assert_eq!(prefs.get(STORAGE_COLOR_BY_EXTENSION), Some("true"));
         assert_eq!(prefs.get(STORAGE_REALTIME_WATCH), Some("false"));
         assert_eq!(prefs.get(STORAGE_THEME), Some("light"));
+        assert_eq!(prefs.get(STORAGE_LOCALE), Some("zh-Hant"));
         assert_eq!(prefs.get(STORAGE_RECENT_ROOTS), Some("/recent\n/older"));
         assert_eq!(prefs.get(STORAGE_PINNED_ROOTS), Some("/pinned"));
     }
@@ -2828,6 +2806,7 @@ mod tests {
         prefs.set(STORAGE_PINNED_ROOTS, "/pinned-a\n/pinned-b\n/pinned-a");
         prefs.set(STORAGE_MAX_DEPTH, "99");
         prefs.set(STORAGE_THEME, "dark");
+        prefs.set(STORAGE_LOCALE, "zh-Hans");
         store.write(&prefs).unwrap();
 
         let mut app = DiskMapApp {
@@ -2850,6 +2829,8 @@ mod tests {
         assert_eq!(app.pinned_roots, vec!["/pinned-a", "/pinned-b"]);
         assert_eq!(app.max_depth, 10);
         assert_eq!(app.theme_preference, Some(Theme::Dark));
+        assert_eq!(app.locale, Locale::SimplifiedChinese);
+        assert!(!app.locale_follow_system);
     }
 
     #[test]
@@ -3603,6 +3584,69 @@ mod tests {
         assert!(!app.status.primary_text().contains("Rescan to refresh"));
 
         std::fs::remove_dir_all(root).expect("direct trash test root should be removed");
+    }
+
+    #[test]
+    fn cancelling_trash_confirmation_leaves_target_untouched() {
+        let mut app = app_with_search_matches();
+        let root = unique_temp_path("disk-map-cancel-trash");
+        let dir = root.join("match-dir");
+        let file = dir.join("match-file");
+        std::fs::create_dir_all(&dir).expect("trash cancellation test dir should be created");
+        std::fs::write(&file, b"x").expect("trash cancellation test file should be created");
+        app.tree.set_root_path(root.clone());
+
+        app.move_node_to_trash(2);
+        app.clear_trash_confirmation();
+
+        assert!(file.exists());
+        assert!(app.trash_confirm_target_id.is_none());
+        assert!(app.trash_confirm_path.is_none());
+
+        std::fs::remove_dir_all(root).expect("trash cancellation test root should be removed");
+    }
+
+    #[test]
+    fn trash_confirmation_keeps_escape_from_clearing_selection() {
+        let mut app = app_with_search_matches();
+        app.navigation.set_selected_id(Some(2));
+        app.trash_confirm_target_id = Some(2);
+        app.trash_confirm_path = Some(PathBuf::from("/root/match-dir/match-file"));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_ui| app.handle_keyboard(&ctx),
+        );
+
+        assert_eq!(app.navigation.selected_id(), Some(2));
+        assert_eq!(app.trash_confirm_target_id, Some(2));
+    }
+
+    #[test]
+    fn localized_status_text_translates_dynamic_status_prefixes() {
+        let mut app = DiskMapApp {
+            locale: Locale::SimplifiedChinese,
+            ..Default::default()
+        };
+        app.set_status(StatusSource::Scan, StatusLevel::Success, "Finished: 1 KiB");
+        assert_eq!(app.localized_status_text(), "扫描完成: 1 KiB");
+
+        app.status.set_watch_failure("backend failed");
+        assert_eq!(
+            app.localized_status_text(),
+            "扫描完成: 1 KiB · 实时监视失败: backend failed"
+        );
     }
 
     #[test]

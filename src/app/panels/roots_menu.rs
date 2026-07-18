@@ -3,6 +3,7 @@
 
 use super::super::DiskMapApp;
 use crate::app::{palette, truncate_middle};
+use crate::i18n::TextKey;
 use eframe::egui::{self, RichText};
 use std::path::PathBuf;
 
@@ -12,13 +13,13 @@ pub fn show_roots_menu(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         .as_deref()
         .is_some_and(|path| app.is_root_pinned(path));
 
-    ui.menu_button("Roots", |ui| {
+    ui.menu_button(app.text(TextKey::Roots), |ui| {
         ui.set_min_width(280.0);
         let can_pin = pin_candidate.is_some();
         let pin_label = if is_pinned {
-            "Unpin Current"
+            app.text(TextKey::UnpinCurrent)
         } else {
-            "Pin Current"
+            app.text(TextKey::PinCurrent)
         };
         if ui
             .add_enabled(can_pin, egui::Button::new(pin_label))
@@ -31,11 +32,11 @@ pub fn show_roots_menu(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         }
 
         ui.separator();
-        show_root_menu_group(ui, app, "Pinned", app.pinned_roots.clone());
-        show_root_menu_group(ui, app, "Recent", app.recent_roots.clone());
+        show_root_menu_group(ui, app, app.text(TextKey::Pinned), app.pinned_roots.clone());
+        show_root_menu_group(ui, app, app.text(TextKey::Recent), app.recent_roots.clone());
     })
     .response
-    .on_hover_text("Open recent and pinned scan roots");
+    .on_hover_text(app.text(TextKey::RecentAndPinnedRoots));
 }
 
 fn show_root_menu_group(ui: &mut egui::Ui, app: &mut DiskMapApp, label: &str, roots: Vec<String>) {
@@ -47,7 +48,7 @@ fn show_root_menu_group(ui: &mut egui::Ui, app: &mut DiskMapApp, label: &str, ro
     );
     if roots.is_empty() {
         ui.label(
-            RichText::new("None")
+            RichText::new(app.text(TextKey::None))
                 .small()
                 .color(palette(ui.ctx()).text_faint),
         );

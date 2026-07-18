@@ -2,11 +2,10 @@
 
 use super::super::search_nav::SearchDirection;
 use super::super::DiskMapApp;
-use crate::app::{accent_button, describe_node_kind, palette, section_divider};
+use crate::app::{icon_text_button, palette, section_divider};
 use crate::format::format_bytes;
-use crate::platform::{
-    open_path, reveal_action_label, reveal_action_short_label, reveal_in_file_manager,
-};
+use crate::i18n::TextKey;
+use crate::platform::{open_path, reveal_in_file_manager};
 use crate::scanner::{size_basis_detail, size_basis_label};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 
@@ -14,7 +13,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     let p = palette(ui.ctx());
     ui.add_space(4.0);
     ui.label(
-        RichText::new("CONTROLS")
+        RichText::new(app.text(TextKey::Controls).to_uppercase())
             .size(11.0)
             .strong()
             .color(p.text_muted),
@@ -25,7 +24,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     show_controls_section(ui, app, p);
     ui.add_space(12.0);
     ui.label(
-        RichText::new("DETAILS")
+        RichText::new(app.text(TextKey::Details).to_uppercase())
             .size(11.0)
             .strong()
             .color(p.text_muted),
@@ -65,7 +64,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         )
     };
     let matched = app.search.state().is_match(node_id);
-    let kind_label = describe_node_kind(node_kind, child_count > 0);
+    let kind_label = app.locale.node_kind(node_kind, child_count > 0);
 
     egui::Frame::new()
         .fill(p.panel_elevated)
@@ -90,23 +89,23 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             .on_hover_text(size_basis_detail());
             ui.add_space(4.0);
             let meta = if child_count > 0 {
-                format!("{kind_label} · {} items", child_count)
+                format!("{kind_label} · {}", app.locale.item_count(child_count))
             } else {
                 kind_label.to_string()
             };
             ui.label(RichText::new(meta).small().color(p.text_muted));
             if !node_scanned {
                 ui.label(
-                    RichText::new("Scanning in progress…")
+                    RichText::new(app.text(TextKey::ScanningInProgress))
                         .small()
                         .color(p.accent),
                 );
             }
             if !app.search.query().is_empty() {
                 let (txt, color) = if matched {
-                    ("Matches search", p.accent)
+                    (app.text(TextKey::MatchesSearch), p.accent)
                 } else {
-                    ("No search match", p.text_faint)
+                    (app.text(TextKey::NoSearchMatch), p.text_faint)
                 };
                 ui.label(RichText::new(txt).small().color(color));
             }
@@ -136,13 +135,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
             .corner_radius(CornerRadius::same(6))
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
-                ui.label(RichText::new(format!("Error: {err}")).color(p.danger));
+                ui.label(
+                    RichText::new(format!("{}: {err}", app.text(TextKey::Error))).color(p.danger),
+                );
             });
     }
 
     ui.add_space(12.0);
     ui.label(
-        RichText::new("PRIMARY")
+        RichText::new(app.text(TextKey::Primary).to_uppercase())
             .size(10.0)
             .strong()
             .color(p.text_faint),
@@ -151,27 +152,42 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     let path_available = node_path.is_some();
     ui.columns(2, |cols| {
         let w0 = cols[0].available_width();
-        if accent_button(&mut cols[0], "Open", path_available, w0, p).clicked() {
+        if icon_text_button(
+            &mut cols[0],
+            path_available,
+            egui_phosphor::regular::FOLDER_OPEN,
+            app.text(TextKey::Open),
+            w0,
+        )
+        .clicked()
+        {
             if let Some(path) = &node_path {
-                app.apply_platform_result("Open", open_path(path));
+                let action = app.text(TextKey::Open);
+                app.apply_platform_result(action, open_path(path));
             }
         }
         let w1 = cols[1].available_width();
         let reveal_response = cols[1].add_enabled(
             path_available,
-            egui::Button::new(reveal_action_short_label()).min_size(Vec2::new(w1, 32.0)),
+            egui::Button::new(format!(
+                "{}  {}",
+                egui_phosphor::regular::FOLDER_OPEN,
+                app.text(TextKey::Reveal)
+            ))
+            .min_size(Vec2::new(w1, 32.0)),
         );
-        let reveal_response = reveal_response.on_hover_text(reveal_action_label());
+        let reveal_response = reveal_response.on_hover_text(app.reveal_action_text());
         if reveal_response.clicked() {
             if let Some(path) = &node_path {
-                app.apply_platform_result(reveal_action_label(), reveal_in_file_manager(path));
+                let action = app.reveal_action_text();
+                app.apply_platform_result(action, reveal_in_file_manager(path));
             }
         }
     });
 
     ui.add_space(10.0);
     ui.label(
-        RichText::new("UTILITY")
+        RichText::new(app.text(TextKey::Utility).to_uppercase())
             .size(10.0)
             .strong()
             .color(p.text_faint),
@@ -181,7 +197,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     if ui
         .add_enabled(
             path_available,
-            egui::Button::new("Copy Path").min_size(Vec2::new(copy_width, 28.0)),
+            egui::Button::new(format!(
+                "{}  {}",
+                egui_phosphor::regular::CLIPBOARD,
+                app.text(TextKey::CopyPath)
+            ))
+            .min_size(Vec2::new(copy_width, 30.0)),
         )
         .clicked()
     {
@@ -192,18 +213,25 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     ui.add_space(4.0);
     let trash_width = ui.available_width();
     let trash_label = if app.trash_confirm_target_id == Some(node_id) {
-        "Confirm Move to Trash"
+        app.text(TextKey::ConfirmMoveToTrash)
     } else {
-        "Move to Trash"
+        app.text(TextKey::MoveToTrash)
     };
     let trash_response = ui.add_enabled(
         path_available,
-        egui::Button::new(trash_label).min_size(Vec2::new(trash_width, 28.0)),
+        egui::Button::new(format!("{}  {trash_label}", egui_phosphor::regular::TRASH))
+            .min_size(Vec2::new(trash_width, 30.0))
+            .fill(Color32::from_rgba_unmultiplied(
+                p.danger.r(),
+                p.danger.g(),
+                p.danger.b(),
+                34,
+            )),
     );
     let trash_response = if !path_available {
-        trash_response.on_hover_text("Virtual nodes cannot be moved to Trash")
+        trash_response.on_hover_text(app.text(TextKey::VirtualNodeNoTrash))
     } else {
-        trash_response.on_hover_text("Move this item to Trash; click again to confirm")
+        trash_response.on_hover_text(app.text(TextKey::MoveToTrashHint))
     };
     if trash_response.clicked() {
         app.move_node_to_trash(node_id);
@@ -212,7 +240,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     if let Some(parent) = node_parent {
         ui.add_space(10.0);
         ui.label(
-            RichText::new("PARENT")
+            RichText::new(app.text(TextKey::Parent).to_uppercase())
                 .size(10.0)
                 .strong()
                 .color(p.text_faint),
@@ -221,9 +249,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
         let parent_name = app.tree.node(parent).name.clone();
         if ui
             .add(
-                egui::Button::new(RichText::new(format!("↑ {parent_name}")).color(p.text))
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::new(1.0, p.stroke_subtle)),
+                egui::Button::new(
+                    RichText::new(format!(
+                        "{}  {parent_name}",
+                        egui_phosphor::regular::ARROW_UP
+                    ))
+                    .color(p.text),
+                )
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(1.0, p.stroke_subtle)),
             )
             .clicked()
         {
@@ -237,15 +271,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
 
 fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app::Palette) {
     ui.label(
-        RichText::new("SEARCH")
+        RichText::new(app.text(TextKey::Search).to_uppercase())
             .size(10.0)
             .strong()
             .color(p.text_faint),
     );
     ui.add_space(4.0);
+    let search_hint = app.text(TextKey::SearchHint);
     let search_response = ui.add_sized(
         [ui.available_width(), 28.0],
-        egui::TextEdit::singleline(app.search.input_mut()).hint_text("Search files & folders"),
+        egui::TextEdit::singleline(app.search.input_mut()).hint_text(search_hint),
     );
     if search_response.changed() {
         app.mark_search_dirty();
@@ -263,9 +298,9 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
         if ui
             .add_enabled(
                 can_nav,
-                egui::Button::new("<").min_size(Vec2::new(30.0, 26.0)),
+                egui::Button::new(egui_phosphor::regular::ARROW_UP).min_size(Vec2::new(30.0, 26.0)),
             )
-            .on_hover_text("Previous search match")
+            .on_hover_text(app.text(TextKey::PreviousMatch))
             .clicked()
         {
             app.navigate_search_match(SearchDirection::Previous);
@@ -273,9 +308,10 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
         if ui
             .add_enabled(
                 can_nav,
-                egui::Button::new(">").min_size(Vec2::new(30.0, 26.0)),
+                egui::Button::new(egui_phosphor::regular::ARROW_DOWN)
+                    .min_size(Vec2::new(30.0, 26.0)),
             )
-            .on_hover_text("Next search match")
+            .on_hover_text(app.text(TextKey::NextMatch))
             .clicked()
         {
             app.navigate_search_match(SearchDirection::Next);
@@ -283,33 +319,50 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
         if ui
             .add_enabled(
                 !app.search.input().is_empty(),
-                egui::Button::new("Clear").min_size(Vec2::new(52.0, 26.0)),
+                egui::Button::new(format!(
+                    "{}  {}",
+                    egui_phosphor::regular::X,
+                    app.text(TextKey::ClearSearch)
+                ))
+                .min_size(Vec2::new(64.0, 26.0)),
             )
-            .on_hover_text("Clear search")
+            .on_hover_text(app.text(TextKey::ClearSearch))
             .clicked()
         {
             app.clear_search();
         }
+        let filter_label = app.text(TextKey::Filter);
+        let filter_hint = app.text(TextKey::FilterSearch);
         if ui
-            .checkbox(&mut app.search_filter_enabled, "Filter")
-            .on_hover_text("Show only search matches and their ancestor folders")
+            .checkbox(&mut app.search_filter_enabled, filter_label)
+            .on_hover_text(filter_hint)
             .changed()
         {
             app.mark_layout_dirty_now();
         }
     });
     let match_text = if app.search.query().is_empty() {
-        "No search query".to_string()
+        app.text(TextKey::NoSearchQuery).to_string()
     } else if app.search.is_dirty() {
-        format!("{} matches · Updating...", app.search.state().match_count())
+        format!(
+            "{} {} · {}",
+            app.search.state().match_count(),
+            app.text(TextKey::Matches),
+            app.text(TextKey::Updating)
+        )
     } else if let Some(index) = app.search.active_match() {
         format!(
-            "{} / {} matches",
+            "{} / {} {}",
             index + 1,
-            app.search.state().match_count()
+            app.search.state().match_count(),
+            app.text(TextKey::Matches)
         )
     } else {
-        format!("{} matches", app.search.state().match_count())
+        format!(
+            "{} {}",
+            app.search.state().match_count(),
+            app.text(TextKey::Matches)
+        )
     };
     ui.label(
         RichText::new(match_text)
@@ -323,15 +376,16 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
 
     ui.add_space(12.0);
     ui.label(
-        RichText::new("VIEW")
+        RichText::new(app.text(TextKey::View).to_uppercase())
             .size(10.0)
             .strong()
             .color(p.text_faint),
     );
     ui.add_space(4.0);
+    let color_label = app.text(TextKey::ColorByExtension);
     if ui
-        .checkbox(&mut app.color_by_extension, "Color by extension")
-        .on_hover_text("Color files by extension")
+        .checkbox(&mut app.color_by_extension, color_label)
+        .on_hover_text(color_label)
         .changed()
     {
         app.mark_layout_dirty_now();

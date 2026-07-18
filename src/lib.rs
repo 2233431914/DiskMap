@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod duplicates;
 pub mod export;
 pub mod format;
+pub mod i18n;
 pub mod insights;
 pub mod platform;
 pub mod profiles;
