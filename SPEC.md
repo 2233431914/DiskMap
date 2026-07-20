@@ -32,11 +32,11 @@
 - [x] Search result navigation with Previous/Next and Enter/Shift+Enter
 - [x] Search filter mode showing only matches and ancestor folders
 - [x] Display-only small-file aggregation in treemap (the underlying TreeStore keeps every file)
-- [ ] Manual filesystem rescan for the scan root or focused subtree
-- Deferred: the shipped refresh control only recomputes the treemap; filesystem refresh is driven by starting a new scan or the watcher.
+- [x] Manual filesystem rescan for the scan root
+- Deferred: focused-subtree rescans remain out of scope; the toolbar rescan always rebuilds the current scan root.
 - [x] Default-on filesystem watch with debounced full scan-root rescan
-- [ ] GUI CSV/JSON export and focused report panels (deferred; headless CLI export remains available)
-- [ ] GUI file age/type insight report (deferred; analysis module is retained as a library)
+- [x] GUI CSV/JSON export and focused report panels
+- [x] GUI file age/type insight report
 - [x] Active size basis display
 - [ ] GUI SQLite scan cache setting (deferred; cache implementation remains disabled)
 - [x] Extension-based color mode
@@ -212,8 +212,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
   - [x] Include or exclude hidden files
   - [x] Show symlinks without following them
 - Symlink traversal is intentionally disabled and legacy preference/CLI values are migrated or rejected. Hidden files are included by default and filesystem boundaries are not restricted until enabled.
-- [ ] Manual rescan for the current scan root and focused subtree without enabling real-time monitoring
-- Deferred: the shipped refresh control only recomputes the treemap; filesystem refresh is driven by starting a new scan or the watcher.
+- [x] Manual rescan for the current scan root without enabling real-time monitoring
+- Deferred: focused-subtree rescans remain out of scope; the toolbar rescan always rebuilds the current scan root.
 
 ### Phase 4: Reporting and Size Model
 - [x] Headless CLI export of scan rows as text/CSV/JSON with path, size, kind, and error fields
@@ -249,10 +249,12 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 ### Phase 8: Analysis Workflows
 - [x] Recent scan roots and pinned favorites for repeat analysis
 - The `Roots` menu keeps successful scan roots in a capped recent list and stores pinned favorites separately in local preferences. Selecting a root starts a new scan with the current scan options.
-- [ ] Snapshot comparison, duplicate candidates, and file age/type reports in the GUI
-- Deferred: pure read-only analysis modules remain in the crate, but no GUI action claims these workflows are currently delivered.
-- [ ] Focused report export from the GUI
-- Deferred: the headless CLI export is the supported production report surface.
+- [x] Snapshot comparison in the GUI
+- [x] Duplicate candidates and file age/type reports in the GUI
+- Reports are generated or updated from completed scans in the details panel; report paths can focus the matching treemap node.
+- [x] Focused report export from the GUI
+- [x] Snapshot diff export from the GUI
+- GUI export writes the current focused subtree or snapshot diff as CSV or JSON; the headless CLI remains available for scripted exports.
 
 ### Phase 9: Cleanup Workflow Safety
 - [ ] Add a review queue for cleanup candidates before any destructive action
@@ -265,8 +267,8 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 - Successful Move to Trash removes the node from the in-memory tree immediately; failed platform actions only report status and leave scan/search state unchanged.
 
 ### Phase 10: Accessibility and Packaging
-- [ ] Keyboard shortcuts for primary navigation, search navigation, rescan, and focused export
-- [ ] Accessible labels and focus order for toolbar, treemap selection, and context menu actions
+- [x] Keyboard shortcuts for primary navigation, search navigation, rescan, and focused export
+- [x] Accessible labels and focus order for toolbar, treemap selection, and context menu actions
 - [ ] Performance regression benchmarks for large trees, search rebuilds, and layout generation
 - [ ] macOS packaging, signing/notarization, and release checklist
   - Partial: `scripts/package-macos.sh` builds `target/dist/DiskMap.app` plus zip, supports ad-hoc or Developer ID signing, optional `notarytool` submission/stapling, and optional simple DMG. Public release still needs a real Developer ID notarization run and upgrade/rollback checklist.
@@ -335,7 +337,7 @@ Unchecked items below are accepted product backlog, not current behavior. Analys
 ### Phase 16: Visualization and Review Ergonomics
 - [ ] Category and age color modes that reuse the same category and modified-time model as the insight reports
 - [ ] Size histogram for the focused subtree, with buckets that can feed the quick filter controls
-- [ ] Report-row-to-treemap linking so selecting a duplicate, insight, comparison, or cleanup candidate row selects the corresponding node when it is still present
+- [x] Report-row-to-treemap linking for duplicate, insight, and comparison rows when the node is still present
 - [ ] Breadcrumb and minimap-style orientation aids for very deep focused subtrees, kept compact and optional
 - [ ] Empty-space and tiny-file explanations so aggregate nodes and skipped tiny rectangles are understandable without adding visual clutter
 

@@ -2,6 +2,7 @@
 //! readability. Each panel module owns the rendering of one logical
 //! region of the sidebar plus the helper methods it calls.
 
+pub mod analysis;
 pub mod details;
 pub mod roots_menu;
 pub mod sections;

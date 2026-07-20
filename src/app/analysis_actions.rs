@@ -1,18 +1,23 @@
-use super::{current_unix_secs, pluralize, DiskMapApp, StatusLevel, StatusSource};
+use super::{current_unix_secs, DiskMapApp, ReportView, StatusLevel, StatusSource};
 use crate::duplicates::find_duplicate_candidates;
+use crate::i18n::TextKey;
 use crate::insights::analyze_insights;
 
 const DUPLICATE_REPORT_LIMIT: usize = 8;
 
 impl DiskMapApp {
     pub(crate) fn analyze_duplicate_candidates(&mut self) {
-        self.last_report_mode = "duplicates".to_string();
+        self.active_report_view = ReportView::Duplicates;
+        #[cfg(test)]
+        {
+            self.last_report_mode = "duplicates".to_string();
+        }
         let Some(root_id) = self.navigation.focused_root() else {
             self.duplicate_report = None;
             self.set_status(
                 StatusSource::Analysis,
                 StatusLevel::Warning,
-                "Duplicate analysis unavailable: no focused directory",
+                self.text(TextKey::NoFocusedDirectory),
             );
             self.pending_repaint = true;
             return;
@@ -21,15 +26,12 @@ impl DiskMapApp {
         match find_duplicate_candidates(&mut self.tree, root_id, DUPLICATE_REPORT_LIMIT) {
             Some(report) => {
                 let status = if report.group_count == 0 {
-                    "Duplicate analysis found no candidates".to_string()
+                    self.text(TextKey::NoCandidates).to_string()
                 } else {
                     format!(
-                        "Duplicate analysis found {}",
-                        pluralize(
-                            report.group_count as u64,
-                            "candidate group",
-                            "candidate groups"
-                        )
+                        "{}: {}",
+                        self.text(TextKey::CandidateGroups),
+                        report.group_count
                     )
                 };
                 self.duplicate_report = Some(report);
@@ -40,7 +42,7 @@ impl DiskMapApp {
                 self.set_status(
                     StatusSource::Analysis,
                     StatusLevel::Warning,
-                    "Duplicate analysis unavailable for this view",
+                    self.text(TextKey::ReportUnavailable),
                 );
             }
         }
@@ -48,13 +50,17 @@ impl DiskMapApp {
     }
 
     pub(crate) fn analyze_file_insights(&mut self) {
-        self.last_report_mode = "insights".to_string();
+        self.active_report_view = ReportView::Insights;
+        #[cfg(test)]
+        {
+            self.last_report_mode = "insights".to_string();
+        }
         let Some(root_id) = self.navigation.focused_root() else {
             self.insight_report = None;
             self.set_status(
                 StatusSource::Analysis,
                 StatusLevel::Warning,
-                "Insights unavailable: no focused directory",
+                self.text(TextKey::NoFocusedDirectory),
             );
             self.pending_repaint = true;
             return;
@@ -70,10 +76,7 @@ impl DiskMapApp {
                 self.set_status(
                     StatusSource::Analysis,
                     StatusLevel::Success,
-                    format!(
-                        "Insights analyzed {}",
-                        pluralize(report.file_count as u64, "file", "files")
-                    ),
+                    format!("{}: {}", self.text(TextKey::FileCount), report.file_count),
                 );
                 self.insight_report = Some(report);
             }
@@ -82,7 +85,7 @@ impl DiskMapApp {
                 self.set_status(
                     StatusSource::Analysis,
                     StatusLevel::Warning,
-                    "Insights unavailable for this view",
+                    self.text(TextKey::ReportUnavailable),
                 );
             }
         }

@@ -1,6 +1,5 @@
 use crate::cleanup::CleanupQueue;
 use crate::duplicates::DuplicateReport;
-#[cfg(test)]
 use crate::export::ExportFormat;
 use crate::format::format_bytes;
 use crate::i18n::{Locale, TextKey};
@@ -8,18 +7,15 @@ use crate::insights::InsightReport;
 #[cfg(test)]
 use crate::scanner::ScanMessage;
 use crate::scanner::{parse_exclude_patterns, CacheMode, PerfStats, ScanBatch, ScanOptions};
-#[cfg(test)]
-use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot};
+use crate::snapshot::{capture_snapshot, compare_snapshots, ScanSnapshot, SnapshotDiff};
 use crate::storage::{app_data_dir, LocalState, Preferences, SafeStorage};
 #[cfg(test)]
 use crate::tree::node_id_from_index;
 use crate::tree::{NodeId, NodeKind, TreeStore};
 use crate::treemap::{VisualKind, VisualNode};
 
-#[cfg(test)]
 mod analysis_actions;
 mod cleanup_actions;
-#[cfg(test)]
 mod export_actions;
 mod navigation;
 mod panels;
@@ -70,7 +66,6 @@ const STORAGE_THEME: &str = "disk_map.theme";
 const STORAGE_LOCALE: &str = "disk_map.locale";
 const MAX_RECENT_ROOTS: usize = 10;
 const MAX_PINNED_ROOTS: usize = 12;
-#[cfg(test)]
 const SNAPSHOT_DIFF_LIMIT: usize = 5;
 
 #[derive(Clone, Copy)]
@@ -316,6 +311,15 @@ fn build_visuals(p: &Palette, dark: bool) -> egui::Visuals {
     visuals
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ReportView {
+    #[default]
+    None,
+    Duplicates,
+    Insights,
+    Changes,
+}
+
 pub struct DiskMapApp {
     path_input: String,
     exclude_input: String,
@@ -328,16 +332,16 @@ pub struct DiskMapApp {
     pub(super) tree: TreeStore,
     pub(super) navigation: NavigationState,
     pub(super) search: SearchController,
+    search_focus_requested: bool,
     pub(super) search_filter_enabled: bool,
     pub(super) color_by_extension: bool,
     pub(super) recent_roots: Vec<String>,
     pub(super) pinned_roots: Vec<String>,
-    #[cfg(test)]
     last_snapshot: Option<ScanSnapshot>,
-    #[cfg(test)]
-    pub(super) snapshot_diff: Option<crate::snapshot::SnapshotDiff>,
+    pub(super) snapshot_diff: Option<SnapshotDiff>,
     pub(super) duplicate_report: Option<DuplicateReport>,
     pub(super) insight_report: Option<InsightReport>,
+    pub(super) active_report_view: ReportView,
     pub(super) scan: ScanSession,
     pub(super) hovered_id: Option<NodeId>,
     pub(super) context_menu_target_id: Option<NodeId>,
@@ -405,16 +409,16 @@ impl Default for DiskMapApp {
             tree: TreeStore::new(),
             navigation: NavigationState::default(),
             search: SearchController::default(),
+            search_focus_requested: false,
             search_filter_enabled: false,
             color_by_extension: false,
             recent_roots: Vec::new(),
             pinned_roots: Vec::new(),
-            #[cfg(test)]
             last_snapshot: None,
-            #[cfg(test)]
             snapshot_diff: None,
             duplicate_report: None,
             insight_report: None,
+            active_report_view: ReportView::None,
             scan: ScanSession::default(),
             hovered_id: None,
             context_menu_target_id: None,
@@ -802,11 +806,15 @@ impl DiskMapApp {
                 self.return_to_scan_root();
             }
 
-            if icon_button(ui, true, ToolbarIcon::Refresh)
-                .on_hover_text(self.text(TextKey::RefreshLayout))
-                .clicked()
+            if icon_button(
+                ui,
+                self.tree.root.is_some() && !self.scan.is_scanning(),
+                ToolbarIcon::Refresh,
+            )
+            .on_hover_text(self.text(TextKey::Rescan))
+            .clicked()
             {
-                self.refresh_treemap_layout();
+                self.rescan_scan_root();
             }
 
             ui.add_space(4.0);
@@ -1177,15 +1185,30 @@ impl DiskMapApp {
             return;
         }
 
-        if !ctx.egui_wants_keyboard_input()
-            && ctx.input(|input| input.key_pressed(egui::Key::Enter))
-        {
+        let wants_keyboard = ctx.egui_wants_keyboard_input();
+        if !wants_keyboard {
+            let command = ctx.input(|input| input.modifiers.command);
+            if command && ctx.input(|input| input.key_pressed(egui::Key::R)) {
+                self.rescan_scan_root();
+            }
+            if command && ctx.input(|input| input.key_pressed(egui::Key::L)) {
+                self.search_focus_requested = true;
+            }
+            if command && ctx.input(|input| input.key_pressed(egui::Key::Comma)) {
+                self.settings_open = true;
+            }
+            if command
+                && ctx.input(|input| input.modifiers.shift && input.key_pressed(egui::Key::E))
+            {
+                self.export_focused_subtree(ExportFormat::Json);
+            }
+        }
+
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
             self.enter_selected_directory();
         }
 
-        if !ctx.egui_wants_keyboard_input()
-            && ctx.input(|input| input.key_pressed(egui::Key::Backspace))
-        {
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(egui::Key::Backspace)) {
             self.navigate_back();
         }
 
@@ -1197,15 +1220,11 @@ impl DiskMapApp {
             self.navigate_forward();
         }
 
-        if !ctx.egui_wants_keyboard_input()
-            && ctx.input(|input| input.key_pressed(egui::Key::CloseBracket))
-        {
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(egui::Key::CloseBracket)) {
             self.increase_depth();
         }
 
-        if !ctx.egui_wants_keyboard_input()
-            && ctx.input(|input| input.key_pressed(egui::Key::OpenBracket))
-        {
+        if !wants_keyboard && ctx.input(|input| input.key_pressed(egui::Key::OpenBracket)) {
             self.decrease_depth();
         }
 
@@ -1260,8 +1279,6 @@ impl DiskMapApp {
                     StatusLevel::Success,
                     self.finished_status(total_bytes),
                 );
-                #[cfg(test)]
-                self.update_snapshot_comparison();
                 if let Some(error) = watch_error {
                     self.record_error(format!("watch failed: {error}"));
                     self.status.set_watch_failure(error);
@@ -1269,7 +1286,7 @@ impl DiskMapApp {
                     self.status.clear_watch_failure();
                 }
                 if let Some(path) = follow_up_rescan {
-                    self.start_scan_path(path);
+                    self.start_scan_path_inner(path, true);
                 }
                 self.pending_repaint = true;
                 eprintln!("{}", format_perf_stats(self.scan.perf_stats()));
@@ -1366,9 +1383,11 @@ impl DiskMapApp {
         );
     }
 
-    #[cfg(test)]
     fn update_snapshot_comparison(&mut self) {
-        self.last_report_mode = "snapshot".to_string();
+        #[cfg(test)]
+        {
+            self.last_report_mode = "snapshot".to_string();
+        }
         let Some(root_id) = self.tree.root else {
             self.snapshot_diff = None;
             return;
@@ -1730,7 +1749,16 @@ impl DiskMapApp {
     }
 
     fn start_scan_path(&mut self, path: std::path::PathBuf) {
-        self.scan.start(path.clone(), self.scan_options());
+        self.start_scan_path_inner(path, false);
+    }
+
+    fn start_scan_path_inner(&mut self, path: std::path::PathBuf, watch_follow_up: bool) {
+        let options = self.scan_options();
+        if watch_follow_up {
+            self.scan.start_watch_follow_up(path.clone(), options);
+        } else {
+            self.scan.start(path.clone(), options);
+        }
 
         self.tree.clear();
         self.navigation.clear_for_new_scan();
@@ -1740,12 +1768,10 @@ impl DiskMapApp {
         self.trash_confirm_path = None;
         self.cleanup_queue.clear();
         self.hovered_visual_kind = None;
-        #[cfg(test)]
-        {
-            self.snapshot_diff = None;
-        }
+        self.snapshot_diff = None;
         self.duplicate_report = None;
         self.insight_report = None;
+        self.active_report_view = ReportView::None;
         self.search.clear(0);
         self.treemap.clear();
         self.path_input = path.display().to_string();
@@ -1789,6 +1815,38 @@ impl DiskMapApp {
             .and_then(|root_id| self.tree.node_real_path(root_id))
     }
 
+    pub(super) fn rescan_scan_root(&mut self) -> bool {
+        let Some(path) = self.scan_root_rescan_path() else {
+            return false;
+        };
+        if self.scan.is_scanning() {
+            return false;
+        }
+        self.start_scan_path(path);
+        self.set_status(
+            StatusSource::Scan,
+            StatusLevel::Progress,
+            self.text(TextKey::Rescanning),
+        );
+        true
+    }
+
+    pub(super) fn focus_report_path(&mut self, path: &std::path::Path) -> bool {
+        let Some(node_id) = self.tree.find_node_by_real_path(path) else {
+            self.set_status(
+                StatusSource::Analysis,
+                StatusLevel::Warning,
+                self.text(TextKey::PathUnavailable),
+            );
+            self.pending_repaint = true;
+            return false;
+        };
+        let outcome = self.navigation.focus_search_match(&self.tree, node_id);
+        self.apply_navigation_outcome(outcome);
+        self.pending_repaint = true;
+        true
+    }
+
     fn cancel_scan(&mut self) {
         if self.scan.cancel() {
             self.set_status(
@@ -1818,10 +1876,6 @@ impl DiskMapApp {
     fn navigate_forward(&mut self) {
         let outcome = self.navigation.navigate_forward();
         self.apply_navigation_outcome(outcome);
-    }
-
-    pub(super) fn refresh_treemap_layout(&mut self) {
-        self.mark_layout_dirty_now();
     }
 
     fn mark_layout_dirty_now(&mut self) {
@@ -2221,7 +2275,6 @@ fn cleanup_target_inaccessible_status(path: &Path, error: &str) -> String {
     )
 }
 
-#[cfg(test)]
 fn current_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3208,6 +3261,7 @@ mod tests {
             },
         });
         app.apply_scan_message_for_test(finished(1, 4));
+        app.update_snapshot_comparison();
         assert!(app.snapshot_diff.is_none());
 
         app.set_active_scan_id_for_test(2);
@@ -3247,6 +3301,7 @@ mod tests {
             },
         });
         app.apply_scan_message_for_test(finished(2, 12));
+        app.update_snapshot_comparison();
 
         let diff = app.snapshot_diff.as_ref().expect("snapshot diff");
         assert_eq!(diff.total_delta(), 8);
@@ -3265,10 +3320,12 @@ mod tests {
         let mut app = app_for_scan(1);
         app.apply_scan_message_for_test(root_started_at(1, "/root-a"));
         app.apply_scan_message_for_test(finished(1, 0));
+        app.update_snapshot_comparison();
 
         app.set_active_scan_id_for_test(2);
         app.apply_scan_message_for_test(root_started_at(2, "/root-b"));
         app.apply_scan_message_for_test(finished(2, 0));
+        app.update_snapshot_comparison();
 
         assert!(app.snapshot_diff.is_none());
         assert_eq!(
@@ -3350,7 +3407,7 @@ mod tests {
         assert_eq!(report.file_count, 2);
         assert_eq!(report.total_reclaimable_bytes, 5);
         assert_eq!(app.scan.active_id(), active_scan_id);
-        assert!(app.status.primary_text().contains("1 candidate group"));
+        assert!(app.status.primary_text().contains("Candidate groups: 1"));
     }
 
     #[test]
@@ -3360,10 +3417,7 @@ mod tests {
         app.analyze_duplicate_candidates();
 
         assert!(app.duplicate_report.is_none());
-        assert_eq!(
-            app.status.primary_text(),
-            "Duplicate analysis unavailable: no focused directory"
-        );
+        assert_eq!(app.status.primary_text(), "No focused directory");
     }
 
     #[test]
@@ -3418,7 +3472,7 @@ mod tests {
             .any(|summary| summary.category == "Archives" && summary.extension == "zip"));
         assert_eq!(app.scan.active_id(), active_scan_id);
         assert_eq!(app.treemap.is_dirty(), layout_dirty);
-        assert_eq!(app.status.primary_text(), "Insights analyzed 2 files");
+        assert_eq!(app.status.primary_text(), "Files: 2");
     }
 
     #[test]
@@ -3428,10 +3482,7 @@ mod tests {
         app.analyze_file_insights();
 
         assert!(app.insight_report.is_none());
-        assert_eq!(
-            app.status.primary_text(),
-            "Insights unavailable: no focused directory"
-        );
+        assert_eq!(app.status.primary_text(), "No focused directory");
     }
 
     #[test]
@@ -3783,6 +3834,36 @@ mod tests {
         app.tree.set_root_path("/root".into());
 
         assert_eq!(app.scan_root_rescan_path(), Some(PathBuf::from("/root")));
+    }
+
+    #[test]
+    fn rescan_scan_root_without_loaded_scan_is_noop() {
+        let mut app = DiskMapApp::default();
+
+        assert!(!app.rescan_scan_root());
+        assert!(!app.scan.is_scanning());
+    }
+
+    #[test]
+    fn focus_report_path_selects_file_and_focuses_parent_directory() {
+        let mut app = app_with_search_matches();
+
+        assert!(app.focus_report_path(Path::new("/root/match-dir/match-file")));
+        assert_eq!(app.navigation.focused_root(), Some(1));
+        assert_eq!(app.navigation.selected_id(), Some(2));
+    }
+
+    #[test]
+    fn focus_report_path_keeps_view_when_path_is_missing() {
+        let mut app = app_with_search_matches();
+
+        assert!(!app.focus_report_path(Path::new("/root/missing-file")));
+        assert_eq!(app.navigation.focused_root(), Some(0));
+        assert_eq!(app.navigation.selected_id(), None);
+        assert_eq!(
+            app.status.primary_text(),
+            "Path is no longer in the current scan"
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut DiskMapApp) {
     section_divider(ui, p);
     ui.add_space(8.0);
     show_controls_section(ui, app, p);
+    super::analysis::show(ui, app);
     ui.add_space(12.0);
     ui.label(
         RichText::new(app.text(TextKey::Details).to_uppercase())
@@ -282,6 +283,10 @@ fn show_controls_section(ui: &mut egui::Ui, app: &mut DiskMapApp, p: &crate::app
         [ui.available_width(), 28.0],
         egui::TextEdit::singleline(app.search.input_mut()).hint_text(search_hint),
     );
+    if app.search_focus_requested {
+        search_response.request_focus();
+        app.search_focus_requested = false;
+    }
     if search_response.changed() {
         app.mark_search_dirty();
     }

@@ -121,6 +121,8 @@ diskmap-cli scan /path/to/dir --sort-by size     # largest first
 
 所有行为都在本地完成。没有网络请求，没有 analytics，没有 remote cache。Crash-safe 的本地 preferences/state 存储在 DiskMap 的 app data directory。Linux 上，如果 `XDG_DATA_HOME` 是绝对路径，则 app data directory 是 `$XDG_DATA_HOME/disk-map`，否则是 `~/.local/share/disk-map`。
 
+macOS 会保护部分用户目录、应用数据和系统数据。DiskMap 的 Settings 始终提供 **Open Full Disk Access Settings**；扫描发现权限错误时也会显示该入口。完全磁盘访问必须由用户在系统设置中手动启用，启用后需要退出并重新打开 DiskMap 再扫描。通过 `cargo run` 启动时，macOS 可能要求为启动它的终端授予权限；打包后的 `DiskMap.app` 则应直接加入授权列表。
+
 ### 开源协议
 
 DiskMap 使用 [`GPL-3.0-or-later`](LICENSE) 授权。
@@ -154,7 +156,7 @@ Local-only by design: no network calls, no telemetry, no remote cache.
 
 ### Status
 
-**MVP feature-complete, UI simplified toward the SpaceSniffer core.** Current runtime targets are macOS and Linux desktop. Windows is not currently targeted or tested. The main app focuses on scan root selection, treemap browsing, search, and open/reveal actions:
+**MVP feature-complete, UI simplified toward the SpaceSniffer core.** Current runtime targets are macOS and Linux desktop. Windows is not currently targeted or tested. The main app focuses on scan root selection, treemap browsing, search, keyboard-first navigation, and open/reveal actions:
 
 - Parallel scanning with `jwalk`, batched UI refresh
 - Squarified treemap with hover, search, filter, depth control
@@ -163,9 +165,10 @@ Local-only by design: no network calls, no telemetry, no remote cache.
 - Safe scan options: hidden files and stay-on-filesystem; symlinks are shown but not followed
 - Exclude rules (`.git`, `node_modules`, custom patterns)
 - Real-time filesystem watch with debounced full-root rescans
+- Manual full-root rescans from the toolbar or Cmd/Ctrl+R
 - Recent + pinned scan roots, persisted user-facing options
 
-The headless CLI and local macOS `.app` packaging path are available. The codebase still contains read-only analysis/export modules and guarded cleanup logic, but the analysis/export modules are not exposed in the main GUI.
+The headless CLI and local macOS `.app` packaging path are available. The main GUI now exposes read-only duplicate, file age/type, and scan-change reports in the details panel, with clickable paths and focused-subtree or snapshot-diff CSV/JSON export. Guarded cleanup logic remains separate and still requires explicit Trash confirmation.
 
 ### Build & Run
 
@@ -249,6 +252,8 @@ Symlinks are listed but not followed; the legacy `--follow-symlinks` flag is rej
 ### Privacy
 
 Everything is local. No network calls, no analytics, no remote cache. Crash-safe local preferences/state live in DiskMap's app data directory. On Linux, the app data directory is `$XDG_DATA_HOME/disk-map` when `XDG_DATA_HOME` is an absolute path, otherwise `~/.local/share/disk-map`.
+
+macOS protects some user folders, application data, and system data. DiskMap always provides **Open Full Disk Access Settings** in Settings and repeats the action when a scan reports permission errors. Full Disk Access must be enabled manually in System Settings; quit and reopen DiskMap before rescanning. When launched through `cargo run`, macOS may require access for the launching terminal instead; packaged `DiskMap.app` builds should be added directly.
 
 ### License
 

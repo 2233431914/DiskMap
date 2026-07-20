@@ -106,6 +106,7 @@ pub struct ScanSession {
     watch_enabled: bool,
     watcher: Option<WatchSession>,
     watch_rescan_pending: bool,
+    allow_watch_follow_up: bool,
     last_successful_root: Option<PathBuf>,
 }
 
@@ -126,6 +127,7 @@ impl Default for ScanSession {
             watch_enabled: true,
             watcher: None,
             watch_rescan_pending: false,
+            allow_watch_follow_up: true,
             last_successful_root: None,
         }
     }
@@ -133,6 +135,19 @@ impl Default for ScanSession {
 
 impl ScanSession {
     pub fn start(&mut self, path: PathBuf, options: ScanOptions) -> u64 {
+        self.start_inner(path, options, true)
+    }
+
+    pub(super) fn start_watch_follow_up(&mut self, path: PathBuf, options: ScanOptions) -> u64 {
+        self.start_inner(path, options, false)
+    }
+
+    fn start_inner(
+        &mut self,
+        path: PathBuf,
+        options: ScanOptions,
+        allow_watch_follow_up: bool,
+    ) -> u64 {
         if let Some(active) = &self.active_scan {
             if let Some(handle) = &active.handle {
                 handle.cancel();
@@ -156,6 +171,7 @@ impl ScanSession {
         self.terminal_perf_stats_available = false;
         self.phase = ScanPhase::Running;
         self.watch_rescan_pending = false;
+        self.allow_watch_follow_up = allow_watch_follow_up;
         self.active_root = Some(normalized_path);
         let handle = scanner::start_scan(path, scan_id, options, self.tx.clone());
         self.active_scan = Some(ActiveScan {
@@ -229,7 +245,9 @@ impl ScanSession {
                 self.last_successful_root = self.active_root.take();
                 let watch_rescan_pending = std::mem::take(&mut self.watch_rescan_pending);
                 let watch_error = self.sync_watcher().err();
-                let follow_up_rescan = (self.watch_enabled && watch_rescan_pending)
+                let follow_up_rescan = (self.watch_enabled
+                    && self.allow_watch_follow_up
+                    && watch_rescan_pending)
                     .then(|| self.last_successful_root.clone())
                     .flatten();
                 Some(ScanSessionEvent::Finished {
@@ -699,6 +717,34 @@ mod tests {
             } if path == root
         ));
         assert_eq!(session.phase(), &ScanPhase::Finished);
+        session.pause_watching();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_follow_up_scan_does_not_schedule_another_follow_up() {
+        let mut session = ScanSession::default();
+        let root = watch_fixture("watch-follow-up-guard");
+        session.set_active_id_for_test(1);
+        session.process_message_for_test(started_at(1, root.clone()));
+        session.allow_watch_follow_up = false;
+        session.handle_ready_watch_change(1);
+
+        let event = session
+            .process_message_for_test(ScanMessage::Finished {
+                scan_id: 1,
+                total_bytes: 8,
+                perf_stats: PerfStats::default(),
+            })
+            .expect("scan should finish");
+
+        assert!(matches!(
+            event,
+            ScanSessionEvent::Finished {
+                follow_up_rescan: None,
+                ..
+            }
+        ));
         session.pause_watching();
         let _ = std::fs::remove_dir_all(root);
     }

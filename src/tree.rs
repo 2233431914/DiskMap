@@ -1,6 +1,6 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub type NodeId = u32;
 
@@ -344,6 +344,18 @@ impl TreeStore {
         }
     }
 
+    pub fn find_node_by_real_path(&mut self, target: &Path) -> Option<NodeId> {
+        let root_id = self.root?;
+        let mut pending = vec![root_id];
+        while let Some(node_id) = pending.pop() {
+            if self.node_real_path(node_id).as_deref() == Some(target) {
+                return Some(node_id);
+            }
+            pending.extend(self.node(node_id).children.iter().copied());
+        }
+        None
+    }
+
     pub fn is_descendant_or_same(&self, node_id: NodeId, ancestor_id: NodeId) -> bool {
         let mut current = Some(node_id);
         while let Some(id) = current {
@@ -428,6 +440,23 @@ mod tests {
         );
 
         assert!(tree.node_real_path(aggregate).is_none());
+    }
+
+    #[test]
+    fn find_node_by_real_path_returns_file_and_ignores_missing_paths() {
+        let mut tree = TreeStore::new();
+        let root = tree.add_node(None, "root".into(), NodeKind::Dir, 1);
+        tree.set_root_path("/root".into());
+        let file = tree.add_node(Some(root), "report.txt".into(), NodeKind::File, 1);
+
+        assert_eq!(
+            tree.find_node_by_real_path(Path::new("/root/report.txt")),
+            Some(file)
+        );
+        assert_eq!(
+            tree.find_node_by_real_path(Path::new("/root/missing.txt")),
+            None
+        );
     }
 
     #[test]

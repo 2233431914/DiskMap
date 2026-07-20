@@ -1,3 +1,4 @@
+use crate::snapshot::{SnapshotDiff, SnapshotKind};
 use crate::tree::{NodeId, NodeKind, TreeStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,86 @@ pub fn export_focused_report(
     let mut records = Vec::new();
     collect_records(tree, root_id, &mut records);
     report_to_json(metadata, &records)
+}
+
+pub fn export_snapshot_diff(diff: &SnapshotDiff, format: ExportFormat) -> String {
+    let changes = [
+        ("added", &diff.added),
+        ("grown", &diff.grown),
+        ("shrunk", &diff.shrunk),
+        ("removed", &diff.removed),
+    ];
+
+    match format {
+        ExportFormat::Csv => {
+            let mut out = String::from("change,path,previous_size,current_size,delta,kind\n");
+            for (change_name, entries) in changes {
+                for entry in entries {
+                    out.push_str(&csv_cell(change_name));
+                    out.push(',');
+                    out.push_str(&csv_cell(&entry.path));
+                    out.push(',');
+                    out.push_str(&entry.previous_size.to_string());
+                    out.push(',');
+                    out.push_str(&entry.current_size.to_string());
+                    out.push(',');
+                    out.push_str(&entry.delta.to_string());
+                    out.push(',');
+                    out.push_str(snapshot_kind_label(entry.kind));
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        ExportFormat::Json => {
+            let mut out = String::from("{\n  \"root_path\":\"");
+            out.push_str(&json_escape(&diff.root_path.display().to_string()));
+            out.push_str("\",\"previous_total\":");
+            out.push_str(&diff.previous_total.to_string());
+            out.push_str(",\"current_total\":");
+            out.push_str(&diff.current_total.to_string());
+            out.push_str(",\"total_delta\":");
+            out.push_str(&diff.total_delta().to_string());
+
+            for (change_name, entries) in changes {
+                out.push_str(",\"");
+                out.push_str(change_name);
+                out.push_str("\":[");
+                for (index, entry) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    push_snapshot_change_json(&mut out, entry);
+                }
+                out.push(']');
+            }
+            out.push_str("\n}\n");
+            out
+        }
+    }
+}
+
+fn push_snapshot_change_json(out: &mut String, entry: &crate::snapshot::SnapshotChange) {
+    out.push_str("{\"path\":\"");
+    out.push_str(&json_escape(&entry.path));
+    out.push_str("\",\"previous_size\":");
+    out.push_str(&entry.previous_size.to_string());
+    out.push_str(",\"current_size\":");
+    out.push_str(&entry.current_size.to_string());
+    out.push_str(",\"delta\":");
+    out.push_str(&entry.delta.to_string());
+    out.push_str(",\"kind\":\"");
+    out.push_str(snapshot_kind_label(entry.kind));
+    out.push_str("\"}");
+}
+
+fn snapshot_kind_label(kind: SnapshotKind) -> &'static str {
+    match kind {
+        SnapshotKind::File => "file",
+        SnapshotKind::Directory => "directory",
+        SnapshotKind::Symlink => "symlink",
+        SnapshotKind::Error => "error",
+    }
 }
 
 fn collect_records(tree: &mut TreeStore, node_id: NodeId, records: &mut Vec<ExportRecord>) {
@@ -312,5 +393,32 @@ mod tests {
             "\"path\":\"/root/dir/a,file.txt\",\"size\":10,\"kind\":\"File\",\"error\":null"
         ));
         assert!(!report.contains("\"path\":\"/root/bad\""));
+    }
+
+    #[test]
+    fn snapshot_diff_export_includes_change_groups_and_sizes() {
+        let diff = crate::snapshot::SnapshotDiff {
+            root_path: "/root".into(),
+            previous_total: 4,
+            current_total: 9,
+            added: vec![crate::snapshot::SnapshotChange {
+                path: "/root/new.txt".into(),
+                previous_size: 0,
+                current_size: 5,
+                delta: 5,
+                kind: crate::snapshot::SnapshotKind::File,
+            }],
+            grown: Vec::new(),
+            shrunk: Vec::new(),
+            removed: Vec::new(),
+        };
+
+        let csv = export_snapshot_diff(&diff, ExportFormat::Csv);
+        assert!(csv.contains("change,path,previous_size,current_size,delta,kind"));
+        assert!(csv.contains("added,/root/new.txt,0,5,5,file"));
+
+        let json = export_snapshot_diff(&diff, ExportFormat::Json);
+        assert!(json.contains("\"total_delta\":5"));
+        assert!(json.contains("\"added\":[{\"path\":\"/root/new.txt\""));
     }
 }

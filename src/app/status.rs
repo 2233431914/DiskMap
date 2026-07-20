@@ -8,10 +8,8 @@ pub(super) enum StatusSource {
     Roots,
     Cleanup,
     Platform,
-    #[cfg(test)]
-    Analysis,
-    #[cfg(test)]
     Export,
+    Analysis,
     #[cfg(test)]
     Persistence,
     #[cfg(test)]

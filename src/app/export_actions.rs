@@ -1,5 +1,9 @@
 use super::{current_unix_secs, DiskMapApp, StatusLevel, StatusSource};
-use crate::export::{export_subtree, ExportFormat, FocusedReportMetadata};
+#[cfg(test)]
+use crate::export::FocusedReportMetadata;
+use crate::export::{export_snapshot_diff, export_subtree, ExportFormat};
+use crate::i18n::TextKey;
+#[cfg(test)]
 use crate::scanner::{parse_exclude_patterns, size_basis_label};
 use crate::tree::NodeId;
 use std::path::PathBuf;
@@ -10,7 +14,7 @@ impl DiskMapApp {
             self.set_status(
                 StatusSource::Export,
                 StatusLevel::Warning,
-                "Export unavailable: no focused directory",
+                self.text(TextKey::ExportUnavailable),
             );
             self.pending_repaint = true;
             return;
@@ -21,16 +25,53 @@ impl DiskMapApp {
                 self.set_status(
                     StatusSource::Export,
                     StatusLevel::Success,
-                    format!("Exported {} to {}", format.label(), path.display()),
+                    format!(
+                        "{} {} to {}",
+                        self.text(TextKey::Exported),
+                        format.label(),
+                        path.display()
+                    ),
                 );
             }
             Err(error) => {
                 self.set_status(
                     StatusSource::Export,
                     StatusLevel::Error,
-                    format!("Export failed: {error}"),
+                    format!("{}: {error}", self.text(TextKey::ExportFailed)),
                 );
             }
+        }
+        self.pending_repaint = true;
+    }
+
+    pub(super) fn export_snapshot_diff(&mut self, format: ExportFormat) {
+        let Some(diff) = self.snapshot_diff.clone() else {
+            self.set_status(
+                StatusSource::Export,
+                StatusLevel::Warning,
+                self.text(TextKey::NoSnapshotBaseline),
+            );
+            self.pending_repaint = true;
+            return;
+        };
+
+        let output_path = default_export_path(format);
+        match std::fs::write(&output_path, export_snapshot_diff(&diff, format)) {
+            Ok(()) => self.set_status(
+                StatusSource::Export,
+                StatusLevel::Success,
+                format!(
+                    "{} {} to {}",
+                    self.text(TextKey::Exported),
+                    format.label(),
+                    output_path.display()
+                ),
+            ),
+            Err(error) => self.set_status(
+                StatusSource::Export,
+                StatusLevel::Error,
+                format!("{}: {error}", self.text(TextKey::ExportFailed)),
+            ),
         }
         self.pending_repaint = true;
     }
@@ -50,6 +91,7 @@ impl DiskMapApp {
         Ok(output_path)
     }
 
+    #[cfg(test)]
     pub(super) fn focused_report_metadata(
         &mut self,
         root_id: NodeId,
